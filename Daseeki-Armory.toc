@@ -1,0 +1,27 @@
+## Interface: 11507, 11508
+## Title: Daseeki Armory
+## Notes: Equipment set manager for the Daseeki suite (ItemRack-style gear sets)
+## Author: Daseeki
+## X-License: All Rights Reserved
+## SavedVariablesPerCharacter: DaseekiArmoryDB
+## OptionalDeps: Daseeki-Core, Daseeki-Bags, ItemRack, OPie
+## Version: 1.0.0
+
+core.lua
+itemDB.lua
+pvpItems.lua
+iconData.lua
+sets.lua
+equip.lua
+keybind.lua
+flyout.lua
+setFlyout.lua
+opie.lua
+slotpopout.lua
+paperdoll.lua
+tooltip.lua
+iconPicker.lua
+goalPicker.lua
+widget.lua
+options.lua
+slash.lua
