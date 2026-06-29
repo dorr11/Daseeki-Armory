@@ -3,6 +3,7 @@
 ## Notes: Equipment set manager for the Daseeki suite (ItemRack-style gear sets)
 ## Author: Daseeki
 ## X-License: All Rights Reserved
+## X-Curse-Project-ID: 1592412
 ## SavedVariablesPerCharacter: DaseekiArmoryDB
 ## OptionalDeps: Daseeki-Core, Daseeki-Bags, ItemRack, OPie
 ## Version: 1.0.0
