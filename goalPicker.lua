@@ -38,11 +38,20 @@ local scanTip
 local CLASS_PREFIX = ((ITEM_CLASSES_ALLOWED or "Classes: %s"):gsub("%%s.*$", ""))
 local playerClass, playerClassLoc
 
+-- Class token -> allowable-class bit (matches Addon.ItemClassMask in itemDB.lua).
+local CLASS_BIT = { WARRIOR = 1, PALADIN = 2, HUNTER = 4, ROGUE = 8, PRIEST = 16,
+                    SHAMAN = 64, MAGE = 128, WARLOCK = 256, DRUID = 1024 }
+
 -- True if the logged-in class can use this item (proficiency + explicit "Classes:"
--- restriction). The restriction scan only bites once the item is cached.
+-- restriction). Class-set pieces are filtered offline via the bundled mask; the
+-- tooltip-scan fallback only bites once the item is cached.
 function Addon:ItemUsableByClass(e)
     playerClass    = playerClass    or select(2, UnitClass("player"))
     playerClassLoc = playerClassLoc or UnitClass("player")
+    local mask = Addon.ItemClassMask and Addon.ItemClassMask[e.id]
+    if mask and CLASS_BIT[playerClass] and bit.band(mask, CLASS_BIT[playerClass]) == 0 then
+        return false
+    end
     local prof = PROF[playerClass]
     if prof and e.classID then
         if e.classID == 2 and not prof.weapon[e.subclassID] then return false end

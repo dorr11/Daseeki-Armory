@@ -17,8 +17,9 @@ local MAX_ROWS = 8
 local UNEQUIP_TEX = "Interface\\Buttons\\UI-GroupLoot-Pass-Up"  -- red X = take off / remove
 local flyout
 
--- Default flyout direction per slot (weapons drop down, everything else to the right).
-local DEFAULT_DIR = { [16] = "down", [17] = "down", [18] = "down" }
+-- Default flyout direction/perRow per slot (weapons drop down 1-wide; everything else right 5-wide).
+local DEFAULT_DIR    = { [16] = "down", [17] = "down", [18] = "down" }
+local DEFAULT_PERROW = { [16] = 1,      [17] = 1,      [18] = 1      }
 
 -- Per-slot flyout config { dir = "right"|"left"|"down"|"up", perRow = 1..12 }, lazily
 -- seeded (perRow seeds from the legacy global flyoutPerRow if present).
@@ -27,7 +28,7 @@ function Addon:GetFlyoutConfig(slotId)
     s.flyout = s.flyout or {}
     local c = s.flyout[slotId]
     if not c then
-        c = { dir = DEFAULT_DIR[slotId] or "right", perRow = s.flyoutPerRow or 5 }
+        c = { dir = DEFAULT_DIR[slotId] or "right", perRow = DEFAULT_PERROW[slotId] or s.flyoutPerRow or 5 }
         s.flyout[slotId] = c
     end
     return c

@@ -196,7 +196,9 @@ function Addon:BuildSetsTab(f)
     local DS = _G.DaseekiSuite
     local panel = Addon.panel
 
-    -- Hover a slot → open the item flyout to choose what goes in it.
+    -- Hover a slot → open the item flyout to choose what goes in it. If the slot
+    -- already has an item chosen, also show its tooltip to the right of the icon
+    -- (may overlap the flyout — deliberate, reads better next to the slot).
     local function slotEnter(self)
         local name = panel.selectedSet
         if not name then return end
@@ -206,6 +208,12 @@ function Addon:BuildSetsTab(f)
         if set and set.equip[slotId] then
             uneq = { fn = function() Addon:ClearSlot(name, slotId); Addon:RefreshBuilder() end,
                      label = "Remove from set" }
+            local link = Addon:EntryLink(set.equip[slotId])
+            if link then
+                GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+                GameTooltip:SetHyperlink(link)
+                GameTooltip:Show()
+            end
         end
         Addon:ShowItemFlyout(self, slotId, function(item)
             Addon:SetSlotFromLink(name, slotId, item.link)
@@ -582,12 +590,20 @@ function Addon:BuildCharWindowTab(f)
     DS.MakeLabel(f, "Per row",   nil, 282, 70)
     DS.MakeSeparator(f, 4, 88, 460)
 
-    local Y0, RH = 96, 28
+    local RH = 28
+    local sf = CreateFrame("ScrollFrame", nil, f, "UIPanelScrollFrameTemplate")
+    sf:SetPoint("TOPLEFT",     f, "TOPLEFT",     8,   -96)
+    sf:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -26,   4)
+
+    local child = CreateFrame("Frame", nil, sf)
+    child:SetSize(426, #Addon.SLOTS * RH)
+    sf:SetScrollChild(child)
+
     for i, s in ipairs(Addon.SLOTS) do
         local sid = s.id
-        local r = CreateFrame("Frame", nil, f)
-        r:SetSize(456, RH)
-        r:SetPoint("TOPLEFT", f, "TOPLEFT", 8, -(Y0 + (i - 1) * RH))
+        local r = CreateFrame("Frame", nil, child)
+        r:SetSize(426, RH)
+        r:SetPoint("TOPLEFT", child, "TOPLEFT", 0, -(i - 1) * RH)
         r.bg = r:CreateTexture(nil, "BACKGROUND"); r.bg:SetAllPoints()
         r.bg:SetColorTexture(i % 2 == 0 and 0.12 or 0.08, 0.1, 0.12, 0.6)
         r.icon = r:CreateTexture(nil, "ARTWORK"); r.icon:SetSize(22, 22); r.icon:SetPoint("LEFT", 4, 0)
