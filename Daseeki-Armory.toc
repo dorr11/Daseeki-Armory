@@ -1,4 +1,4 @@
-## Interface: 11507, 11508
+## Interface: 11507, 11508, 11509
 ## Title: Daseeki Armory
 ## Notes: Equipment set manager for the Daseeki suite (ItemRack-style gear sets)
 ## Author: Daseeki
