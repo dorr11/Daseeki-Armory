@@ -55,6 +55,7 @@ local SPLIT_LEFT  = 300  -- set-list column width in two-pane mode
 local SPLIT_GAP   = 16   -- gap between the two Sets columns
 local MGMT_BTN    = 142  -- management/CRUD button width (two per row in the ~300px column)
 local MGMT_GRID   = MGMT_BTN * 2 + 8  -- full management-grid width (two buttons + ITEM_GAP=8) = 292
+local SWAP_DD     = (MGMT_GRID - 2 * 8) / 3  -- three Set-Swapper dropdowns sharing the management-grid edges (2×ITEM_GAP=16) = 92
 
 -- Shared re-tinting FontObjects created by DaseekiUI (theme.lua). Referencing the
 -- global names keeps custom FontStrings themed — they re-color on ThemeChanged.
@@ -162,27 +163,63 @@ function Addon:BuildSetSwapperTab(flow)
 
     flow:AddSection("Set Swapper")
     flow:Hint("On-screen widget that lets you equip a set with one click.")
-    flow:AddChecklist({
-        { label = "Enable",
-          get = function() return Addon.db.settings.widget.show end,
-          set = function(v) Addon:SetWidgetShown(v) end },
-        { label = "Lock",
-          get = function() return Addon.db.settings.widget.locked end,
-          set = function(v) Addon.db.settings.widget.locked = v and true or false end },
+
+    -- Row 1 — Enable / Lock / Chat Messages on ONE aligned row. A default row lays
+    -- them left-to-right at their intrinsic widths (compact run, ~246px < the 292 grid),
+    -- so "Chat Messages" (too wide for a 92px grid column) never overflows. The old
+    -- "Print a message…" hint that stood under Chat Messages no longer has a row of its
+    -- own in the compact layout, so it becomes the checkbox's hover tooltip.
+    local cbRow = flow:AddRow()
+    cbRow:Checkbox({
+        label = "Enable",
+        get = function() return Addon.db.settings.widget.show end,
+        set = function(v) Addon:SetWidgetShown(v) end,
     })
-    flow:AddRow():Dropdown({
-        label = "Open On", width = 140, choices = { "Click", "Hover" },
+    cbRow:Checkbox({
+        label = "Lock",
+        get = function() return Addon.db.settings.widget.locked end,
+        set = function(v) Addon.db.settings.widget.locked = v and true or false end,
+    })
+    cbRow:Checkbox({
+        label = "Chat Messages",
+        get = function() return Addon.db.settings.chatMessages end,
+        set = function(v) Addon.db.settings.chatMessages = v and true or false end,
+        tooltip = "Print a message when a set or item swap is queued for after combat.",
+    })
+
+    -- Row 2 — Open On / Display Mode / Tooltips as three equal ~92px columns sharing
+    -- the management grid's edges: a muted-small header row over a row of unlabeled
+    -- dropdowns. Header labels are sized to the column width so each sits over its own
+    -- dropdown (same pattern as the char-window flyout column headers).
+    local ddHdr = flow:AddRow()
+    local function ddHcell(text)
+        local lb = ddHdr:Label(text, { muted = true })
+        lb._label:SetFontObject(F_SMALL)
+        lb.uiWidth = SWAP_DD; lb:SetWidth(SWAP_DD)
+        return lb
+    end
+    ddHcell("Open On"); ddHcell("Display Mode"); ddHcell("Tooltips")
+
+    local ddRow = flow:AddRow()
+    -- Tighten the header→dropdown gap so each label reads as attached to its column.
+    flow.pane.blocks[#flow.pane.blocks].topGap = 2
+    ddRow:Dropdown({
+        width = SWAP_DD, choices = { "Click", "Hover" },
         get = function() return w.openTrigger == "hover" and "Hover" or "Click" end,
         set = function(v) w.openTrigger = v:lower() end,
     })
-
-    flow:AddRow():Dropdown({
-        label = "Display Mode", width = 140, choices = { "Radial", "Dropdown" },
+    ddRow:Dropdown({
+        width = SWAP_DD, choices = { "Radial", "Dropdown" },
         get = function() return w.mode == "dropdown" and "Dropdown" or "Radial" end,
         set = function(v)
             w.mode = (v == "Dropdown") and "dropdown" or "radial"
             Addon:RefreshSwapperTab(); Addon:RefreshWidget()
         end,
+    })
+    ddRow:Dropdown({
+        width = SWAP_DD, choices = { "On Ctrl", "Always" },
+        get = function() return Addon.db.settings.flyoutTooltip == "always" and "Always" or "On Ctrl" end,
+        set = function(v) Addon.db.settings.flyoutTooltip = (v == "Always") and "always" or "ctrl" end,
     })
 
     local typeRow = condRow(flow)
@@ -216,19 +253,6 @@ function Addon:BuildSetSwapperTab(flow)
         end,
     })
     flow._condRows = { type = typeRow, dir = dirRow, per = perRow, always = alwaysRow }
-
-    flow:AddSeparator()
-    flow:Checkbox({
-        label = "Chat Messages",
-        get = function() return Addon.db.settings.chatMessages end,
-        set = function(v) Addon.db.settings.chatMessages = v and true or false end,
-    })
-    flow:Hint("Print a message when a set or item swap is queued for after combat.")
-    flow:AddRow():Dropdown({
-        label = "Flyout item tooltips", width = 140, choices = { "On Ctrl", "Always" },
-        get = function() return Addon.db.settings.flyoutTooltip == "always" and "Always" or "On Ctrl" end,
-        set = function(v) Addon.db.settings.flyoutTooltip = (v == "Always") and "always" or "ctrl" end,
-    })
 
     Addon:RefreshSwapperTab()
 end
