@@ -49,8 +49,8 @@ local WPN_GAP     = 12   -- vertical gap above the weapons row
 local WPN_XGAP    = 8    -- horizontal gap between weapon slots
 local GOAL_SZ     = 22   -- goal "chase list" button size
 local W_ROW_H     = 30   -- item-slot-widget list row height
-local PD_W        = 560  -- fixed paper-doll builder band width (centered in content)
-local SPLIT_MIN   = 860  -- effective content width to switch Sets to two-pane layout
+local PD_W        = 512  -- fixed paper-doll builder band width (centered in content)
+local SPLIT_MIN   = 828  -- content width to switch Sets to two-pane (SPLIT_LEFT+GAP+PD_W)
 local SPLIT_LEFT  = 300  -- set-list column width in two-pane mode
 local SPLIT_GAP   = 16   -- gap between the two Sets columns
 
@@ -355,6 +355,11 @@ local function buildSetList(flow, panel)
 
     host.arrange = function(width)
         host:SetWidth(width)
+        host:SetHeight(SETLIST_H)   -- ROUND-3 BUG FIX: without an explicit height the
+        -- FlatFrame defaults to 0px tall, so its backdrop, the /daseekiui debug outline
+        -- (SetAllPoints host), the scroll viewport (anchored to host) and every set row
+        -- inside it are culled — the ~250px blank band the owner saw. The cursor still
+        -- advances by the returned SETLIST_H, which is why the space was reserved.
         child:SetWidth(math.max(1, width - 2 * LIST_INSET))
         return SETLIST_H
     end
@@ -623,10 +628,10 @@ function Addon:BuildSetsTab(flow)
 
     -- ── Right column: set builder ─────────────────────────────────────────────
     R:AddSection("Set Builder")
-    R:Label("Set name", { muted = true })
+    R:AddRow({ align = "center" }):Label("Set name", { muted = true })
 
-    -- icon button + name edit box on one row
-    local headRow = R:AddRow()
+    -- icon button + name edit box on one row (centered in the builder column)
+    local headRow = R:AddRow({ align = "center" })
     local iconBtn = CreateFrame("Button", nil, headRow, "BackdropTemplate")
     iconBtn:SetSize(46, 46)
     UI.Skin(iconBtn, function(self)
@@ -659,6 +664,7 @@ function Addon:BuildSetsTab(flow)
     panel.iconBtn = iconBtn
 
     panel.nameEB = headRow:EditBox({
+        width = 240,   -- fixed so the icon+name pair has an intrinsic width to center
         get = function() return panel.selectedSet or "" end,
         set = function(v)
             v = strtrim(v or "")
@@ -670,8 +676,8 @@ function Addon:BuildSetsTab(flow)
         end,
     })
 
-    -- keybind + goals row
-    local kbRow = R:AddRow()
+    -- keybind + goals row (centered in the builder column)
+    local kbRow = R:AddRow({ align = "center" })
     local kbBtn = kbRow:Button({ text = "Keybind: \194\183", width = 170 })
     kbBtn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
     kbBtn:SetScript("OnClick", function(self, button)
@@ -709,7 +715,7 @@ function Addon:BuildSetsTab(flow)
     kbBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
     panel.kbBtn = kbBtn
 
-    panel.goalsBtn = kbRow:Button({ text = "Set Goals", width = 140, pin = "right", onClick = function()
+    panel.goalsBtn = kbRow:Button({ text = "Set Goals", width = 140, onClick = function()
         panel.goalMode = not panel.goalMode
         Addon:RefreshBuilder()
     end })
@@ -726,8 +732,8 @@ function Addon:BuildSetsTab(flow)
     local pd = buildPaperdoll(R, panel)
     addBlock(R, pd, pd.arrange, rowGap())
 
-    -- action buttons
-    local actRow = R:AddRow()
+    -- action buttons (centered in the builder column)
+    local actRow = R:AddRow({ align = "center" })
     panel.saveBtn = actRow:Button({ text = "Populate Current Gear", width = 150, onClick = function()
         if panel.selectedSet then Addon:SaveCurrentGear(panel.selectedSet); Addon:RefreshBuilder() end
     end })
@@ -742,7 +748,11 @@ function Addon:BuildSetsTab(flow)
 
     R:Hint("Hover a slot to choose  \194\183  Right-click: disable  \194\183  Shift+Right: clear")
 
-    -- ── Split arrange: side-by-side at >= SPLIT_MIN, stacked below ─────────────
+    -- ── Split arrange: side-by-side at >= SPLIT_MIN ───────────────────────────
+    -- The hub minimum window width (Core MIN_W=1140) guarantees the composed content
+    -- width (avail) is always >= SPLIT_MIN, so the two-pane branch is the only reachable
+    -- one; the stacked branch below is kept as a defensive fallback (unreachable in
+    -- practice) in case token/geometry changes ever shrink avail below SPLIT_MIN.
     split.arrange = function(width)
         split:SetWidth(width)
         if width >= SPLIT_MIN then
