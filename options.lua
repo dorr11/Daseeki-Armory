@@ -12,9 +12,9 @@
     layout, reflow on resize, and scroll with the pane. They read theme tokens at
     render and re-skin live on ThemeChanged (DaseekiUI.Skin / DaseekiUI.Color).
 
-    Four sections (Core sub-tabs):
-      • Sets            — set list + CRUD + paper-doll set builder + goal chase list
-      • Set Swapper     — on-screen radial/dropdown switcher + global options
+    Three sections (Core sub-tabs); round-5 folded the Set Swapper config into the
+    Sets tab's left column, so it is no longer a top-level sidebar entry:
+      • Sets            — set list + CRUD + management + Set Swapper + paper-doll builder
       • Character Window — per-slot flyout config (Blizzard character pane)
       • Item Slot Widgets — live list of detached gear-slot popouts
 --]]
@@ -53,6 +53,8 @@ local PD_W        = 512  -- fixed paper-doll builder band width (centered in con
 local SPLIT_MIN   = 828  -- content width to switch Sets to two-pane (SPLIT_LEFT+GAP+PD_W)
 local SPLIT_LEFT  = 300  -- set-list column width in two-pane mode
 local SPLIT_GAP   = 16   -- gap between the two Sets columns
+local MGMT_BTN    = 142  -- management/CRUD button width (two per row in the ~300px column)
+local MGMT_GRID   = MGMT_BTN * 2 + 8  -- full management-grid width (two buttons + ITEM_GAP=8) = 292
 
 -- Shared re-tinting FontObjects created by DaseekiUI (theme.lua). Referencing the
 -- global names keeps custom FontStrings themed — they re-color on ThemeChanged.
@@ -139,11 +141,6 @@ function Addon:BuildSetsSection(flow)
     Addon:BuildSetsTab(flow)
 end
 
-function Addon:BuildSwapperSection(flow)
-    Addon.frames.swapper = flow
-    Addon:BuildSetSwapperTab(flow)
-end
-
 function Addon:BuildCharWindowSection(flow)
     Addon.frames.charwin = flow
     Addon:BuildCharWindowTab(flow)
@@ -155,7 +152,12 @@ function Addon:BuildWidgetsSection(flow)
 end
 
 -- ══ Set Swapper (on-screen radial/dropdown switcher + global options) ═════════
+-- Round-5: folded into the Sets tab's left column. build(flow) lays the whole
+-- swapper config under ONE in-pane "Set Swapper" section header (the pre-migration
+-- "Display"/"General" sub-headers are dropped so it stays compact in the ~300px
+-- column). Every control + conditional collapse is preserved.
 function Addon:BuildSetSwapperTab(flow)
+    Addon.frames.swapper = flow
     local w = Addon.db.settings.widget
 
     flow:AddSection("Set Swapper")
@@ -174,9 +176,8 @@ function Addon:BuildSetSwapperTab(flow)
         set = function(v) w.openTrigger = v:lower() end,
     })
 
-    flow:AddSection("Display")
     flow:AddRow():Dropdown({
-        label = "Mode", width = 140, choices = { "Radial", "Dropdown" },
+        label = "Display Mode", width = 140, choices = { "Radial", "Dropdown" },
         get = function() return w.mode == "dropdown" and "Dropdown" or "Radial" end,
         set = function(v)
             w.mode = (v == "Dropdown") and "dropdown" or "radial"
@@ -216,7 +217,7 @@ function Addon:BuildSetSwapperTab(flow)
     })
     flow._condRows = { type = typeRow, dir = dirRow, per = perRow, always = alwaysRow }
 
-    flow:AddSection("General")
+    flow:AddSeparator()
     flow:Checkbox({
         label = "Chat Messages",
         get = function() return Addon.db.settings.chatMessages end,
@@ -245,7 +246,10 @@ function Addon:RefreshSwapperTab()
     flow._condRows.dir:SetApplicable(isIcon)
     flow._condRows.per:SetApplicable(isIcon)
     flow._condRows.always:SetApplicable(isIcon)
-    flow.pane:Layout()
+    -- The swapper now lives in the Sets tab's left column, so reflow the OUTER Sets
+    -- scroll pane (re-runs the split arrange → re-lays both columns + scroll range)
+    -- rather than the column, which has no width to lay itself standalone.
+    if Addon.panel and Addon.panel.pane then Addon.panel.pane:Layout() end
 end
 
 -- ══ Sets — set list + paper-doll set builder ══════════════════════════════════
@@ -580,21 +584,21 @@ function Addon:BuildSetsTab(flow)
 
     -- New / Duplicate / Rename / Delete — two rows of two so they fit the ~300px column.
     local crud1 = L:AddRow()
-    crud1:Button({ text = "New", width = 142, onClick = function()
+    crud1:Button({ text = "New", width = MGMT_BTN, onClick = function()
         _G.DaseekiSuite.ShowNameInputDialog("New Set", "", function(v)
             local ok, err = Addon:CreateSet(v)
             if ok then panel.selectedSet = v; Addon:RefreshOptions(); Addon:RefreshWidget()
             else print("|cff66ccffArmory|r " .. tostring(err)) end
         end)
     end })
-    crud1:Button({ text = "Duplicate", width = 142, onClick = function()
+    crud1:Button({ text = "Duplicate", width = MGMT_BTN, onClick = function()
         if not panel.selectedSet then return end
         local ok, res = Addon:DuplicateSet(panel.selectedSet)
         if ok then panel.selectedSet = res; Addon:RefreshOptions(); Addon:RefreshWidget()
         else print("|cff66ccffArmory|r " .. tostring(res)) end
     end })
     local crud2 = L:AddRow()
-    crud2:Button({ text = "Rename", width = 142, onClick = function()
+    crud2:Button({ text = "Rename", width = MGMT_BTN, onClick = function()
         if not panel.selectedSet then return end
         _G.DaseekiSuite.ShowNameInputDialog("Rename Set", panel.selectedSet, function(v)
             local ok, err = Addon:RenameSet(panel.selectedSet, v)
@@ -602,17 +606,19 @@ function Addon:BuildSetsTab(flow)
             else print("|cff66ccffArmory|r " .. tostring(err)) end
         end)
     end })
-    crud2:Button({ text = "Delete", width = 142, onClick = function()
+    crud2:Button({ text = "Delete", width = MGMT_BTN, onClick = function()
         if panel.selectedSet then StaticPopup_Show("DASEEKI_ARMORY_DELETE", panel.selectedSet, nil, panel.selectedSet) end
     end })
 
     L:AddSeparator()
     L:Hint("Clone to another character")
+    -- Export / Import as a matching 2-up row (same button width + edges as the CRUD
+    -- grid above), and "Import from ItemRack" spanning the full grid width below it.
     local io1 = L:AddRow()
-    io1:Button({ text = "Export Sets", width = 110, onClick = function()
+    io1:Button({ text = "Export Sets", width = MGMT_BTN, onClick = function()
         _G.DaseekiSuite.ShowTextDialog("Export Armory Sets", Addon:ExportSets(), true)
     end })
-    io1:Button({ text = "Import Sets", width = 110, onClick = function()
+    io1:Button({ text = "Import Sets", width = MGMT_BTN, onClick = function()
         _G.DaseekiSuite.ShowTextDialog("Import Armory Sets", "", false, function(text)
             local ok, res = Addon:ImportSets(text)
             if ok then print("|cff66ccffArmory|r imported " .. res .. " set(s).")
@@ -620,15 +626,21 @@ function Addon:BuildSetsTab(flow)
             else print("|cff66ccffArmory|r " .. tostring(res)) end
         end)
     end })
-    L:AddRow():Button({ text = "Import from ItemRack", width = 230, onClick = function()
+    L:AddRow():Button({ text = "Import from ItemRack", width = MGMT_GRID, onClick = function()
         local n = Addon:CountItemRackSets()
         if n == 0 then print("|cff66ccffArmory|r no ItemRack sets found — make sure ItemRack is enabled."); return end
         StaticPopup_Show("DASEEKI_ARMORY_IRIMPORT", n)
     end })
 
+    -- Set Swapper config folded into this left column (round-5) — below the
+    -- management buttons, under its own "Set Swapper" section header. The whole
+    -- pane scrolls, so the added height stays reachable.
+    Addon:BuildSetSwapperTab(L)
+
     -- ── Right column: set builder ─────────────────────────────────────────────
+    -- Round-5 item B: the "Set name" caption row was removed — it was the blank band
+    -- under the "Set Builder" header. The icon/name row now sits one rowGap below it.
     R:AddSection("Set Builder")
-    R:AddRow({ align = "center" }):Label("Set name", { muted = true })
 
     -- icon button + name edit box on one row (centered in the builder column, and
     -- vertically centered against each other so the 24px EditBox sits mid-height of
@@ -793,12 +805,20 @@ local CW_SLOT_W, CW_DIR_W, CW_PER_W = 150, 110, 70
 local CW_COL_W = CW_SLOT_W + CW_DIR_W + CW_PER_W + 30   -- row content + inter-item gaps
 local CW_COL_GAP = 24                                    -- gap between the two columns
 
--- Header row (Slot / Direction / Per row) for a column flow.
+-- Header row (Slot / Direction / Per row) for a column flow. Muted SMALL font; each
+-- label is given its column's exact width so it sits directly over that dropdown
+-- column (round-5 item A — the third label previously had no width and could cull).
 local function charWinHeader(cflow)
     local hdr = cflow:AddRow()
-    local h1 = hdr:Label("Slot", { muted = true });      h1.uiWidth = CW_SLOT_W; h1:SetWidth(CW_SLOT_W)
-    local h2 = hdr:Label("Direction", { muted = true }); h2.uiWidth = CW_DIR_W;  h2:SetWidth(CW_DIR_W)
-    hdr:Label("Per row", { muted = true })
+    local function hcell(text, w)
+        local lb = hdr:Label(text, { muted = true })
+        lb._label:SetFontObject(F_SMALL)
+        lb.uiWidth = w; lb:SetWidth(w)
+        return lb
+    end
+    hcell("Slot", CW_SLOT_W)
+    hcell("Direction", CW_DIR_W)
+    hcell("Per row", CW_PER_W)
     cflow:AddSeparator()
 end
 
@@ -852,6 +872,7 @@ function Addon:BuildCharWindowTab(flow)
     flow:AddSection("Weapons")
     local wSplit = CreateFrame("Frame", nil, flow.pane.child)
     local wCol = UI.CreateColumn(wSplit)
+    charWinHeader(wCol.flow)   -- round-5 item A: weapons group now has the same column headers
     for _, s in ipairs(Addon.SLOTS) do
         if s.col == "W" then charWinRow(wCol.flow, s.id) end
     end
@@ -1189,9 +1210,6 @@ function Addon:RegisterOptions()
             { id = "sets",    title = "Sets",
               build = function(flow) Addon:BuildSetsSection(flow) end,
               refresh = function() Addon:RefreshOptions() end },
-            { id = "swapper", title = "Set Swapper",
-              build = function(flow) Addon:BuildSwapperSection(flow) end,
-              refresh = function() Addon:RefreshSwapperTab() end },
             { id = "charwin", title = "Character Window",
               build = function(flow) Addon:BuildCharWindowSection(flow) end },
             { id = "widgets", title = "Item Slot Widgets",
