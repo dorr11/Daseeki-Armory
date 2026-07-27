@@ -1,13 +1,22 @@
 --[[
-    Daseeki Armory — options section for the Daseeki-Core hub (id "armory").
+    Daseeki Armory — options sections for the Daseeki-Core hub (id "armory").
 
-    Left tab strip selects between three panels:
-      • Sets            — set list + CRUD + paper-doll set builder + radial-widget toggles
-      • Character Window — per-slot config for the flyout shown when hovering an equipped
-                           slot on the Blizzard character pane
-      • Item Slot Widgets — live list of the detached gear-slot popouts (alt+click a slot),
-                            each with its own flyout direction + items-per-row, plus a remove
-                            button and a global Lock toggle
+    Migrated to the DaseekiUI flow API (Core commit 1d7d942). Each section's
+    build(flow) receives the flow object; every control is appended through the
+    flow (AddSection / AddRow / widget constructors) so vertical position is a
+    computed running cursor — there are NO caller-supplied y-offsets and the pane
+    scroll+clips, so nothing can render outside the window.
+
+    The two spatially-rich pieces (the set list and the paper-doll set builder)
+    are custom token-skinned frames added as flow blocks so they participate in
+    layout, reflow on resize, and scroll with the pane. They read theme tokens at
+    render and re-skin live on ThemeChanged (DaseekiUI.Skin / DaseekiUI.Color).
+
+    Four sections (Core sub-tabs):
+      • Sets            — set list + CRUD + paper-doll set builder + goal chase list
+      • Set Swapper     — on-screen radial/dropdown switcher + global options
+      • Character Window — per-slot flyout config (Blizzard character pane)
+      • Item Slot Widgets — live list of detached gear-slot popouts
 --]]
 
 local _, Addon = ...
@@ -24,6 +33,54 @@ local function slotEmptyTex(slotId)
 end
 
 local PERROW = { "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12" }
+
+-- ── Named layout metrics (single source; no magic literals in the code below) ──
+local IB          = 2    -- art inset within an icon button
+local LIST_INSET  = 4    -- scroll viewport inset in the set list
+local CHECK_INSET = 3    -- goal-obtained check inset within a slot
+local SET_ROW_H   = 28   -- set-list row height
+local SETLIST_H   = 200  -- set-list viewport height
+local SLOT_SZ     = 36   -- equip-slot button size
+local SLOT_STEP   = 40   -- vertical pitch between equip slots
+local COL_ROWS    = 8    -- equip slots per column
+local MODEL_W     = 200  -- paper-doll model width
+local MODEL_H     = 300  -- paper-doll model height
+local WPN_GAP     = 12   -- vertical gap above the weapons row
+local WPN_XGAP    = 8    -- horizontal gap between weapon slots
+local GOAL_SZ     = 22   -- goal "chase list" button size
+local W_ROW_H     = 30   -- item-slot-widget list row height
+
+-- Shared re-tinting FontObjects created by DaseekiUI (theme.lua). Referencing the
+-- global names keeps custom FontStrings themed — they re-color on ThemeChanged.
+local F_BODY, F_SMALL = "DaseekiUIFontBody", "DaseekiUIFontSmall"
+
+local function rowGap() return (DaseekiUI.Token and DaseekiUI.Token("rowGap")) or 10 end
+
+-- Add a caller-built custom frame to a flow's pane as one block. `arrange(avail)`
+-- sizes/positions the frame's children and returns its height; the flow places it
+-- at the running cursor (top-level indent 0 — these blocks span the full pane).
+local function addBlock(flow, frame, arrange, topGap)
+    flow.pane:AddBlock(frame, arrange, topGap or rowGap(), 0)
+end
+
+-- A flow row that can collapse to zero height (and swallow its top gap) when not
+-- applicable, so the Set Swapper's mode-dependent controls leave no gap once
+-- hidden. Reflow by setting applicability then calling flow.pane:Layout().
+local function condRow(flow)
+    local row = flow:AddRow()
+    local blk = flow.pane.blocks[#flow.pane.blocks]
+    row._blk, row._baseGap = blk, blk.topGap
+    local origArrange = blk.arrange
+    blk.arrange = function(width)
+        if row._applicable == false then row:Hide(); return 0 end
+        row:Show(); return origArrange(width)
+    end
+    function row:SetApplicable(on)
+        self._applicable = on and true or false
+        self._blk.topGap = self._applicable and self._baseGap or 0
+    end
+    return row
+end
 
 -- ── Confirmation dialogs ──────────────────────────────────────────────────────
 StaticPopupDialogs["DASEEKI_ARMORY_DELETE"] = {
@@ -59,146 +116,264 @@ StaticPopupDialogs["DASEEKI_ARMORY_IRIMPORT"] = {
 }
 
 -- ── Section builders (registered with Core as the Armory sub-tabs) ────────────
--- Each Core section gets its own full-width frame, built lazily on first selection.
--- The Sets section also owns the shared builder state on Addon.panel (rows /
--- slotButtons / selectedSet / listChild) that the Refresh* helpers read.
+-- Each Core section's build(flow) receives the DaseekiUI flow. The Sets section
+-- owns the shared builder state on Addon.panel (== its flow; extra fields hung on
+-- it) that the Refresh* helpers read.
 Addon.frames = Addon.frames or {}
 
-function Addon:BuildSetsSection(f)
-    Addon.frames.sets = f
-    Addon.panel = f
-    f.rows = {}
-    f.slotButtons = {}
+function Addon:BuildSetsSection(flow)
+    Addon.frames.sets = flow
+    Addon.panel = flow
+    flow.rows = {}
+    flow.slotButtons = {}
     -- async item-info refresh (textures/model fill in once the client caches items)
-    f.evt = CreateFrame("Frame")
-    f.evt:RegisterEvent("GET_ITEM_INFO_RECEIVED")
-    f.evt:SetScript("OnEvent", function()
-        if f:IsVisible() then Addon:RefreshBuilder() end
+    flow.evt = CreateFrame("Frame")
+    flow.evt:RegisterEvent("GET_ITEM_INFO_RECEIVED")
+    flow.evt:SetScript("OnEvent", function()
+        if flow.pane:IsVisible() then Addon:RefreshBuilder() end
     end)
-    Addon:BuildSetsTab(f)
+    Addon:BuildSetsTab(flow)
 end
 
-function Addon:BuildSwapperSection(f)
-    Addon.frames.swapper = f
-    Addon:BuildSetSwapperTab(f)
+function Addon:BuildSwapperSection(flow)
+    Addon.frames.swapper = flow
+    Addon:BuildSetSwapperTab(flow)
 end
 
-function Addon:BuildCharWindowSection(f)
-    Addon.frames.charwin = f
-    Addon:BuildCharWindowTab(f)
+function Addon:BuildCharWindowSection(flow)
+    Addon.frames.charwin = flow
+    Addon:BuildCharWindowTab(flow)
 end
 
-function Addon:BuildWidgetsSection(f)
-    Addon.frames.widgets = f
-    Addon:BuildWidgetsTab(f)
+function Addon:BuildWidgetsSection(flow)
+    Addon.frames.widgets = flow
+    Addon:BuildWidgetsTab(flow)
 end
 
--- ══ Tab: Set Swapper (on-screen radial/dropdown switcher + global options) ════
-function Addon:BuildSetSwapperTab(f)
-    local DS = _G.DaseekiSuite
-    DS.MakeSectionHeader(f, "Set Swapper", 4, 8, 460)
-    DS.MakeLabel(f, "On-screen widget that lets you equip a set with one click.", nil, 4, 40)
-    DS.MakeCheckbox(f, "Enable", 6, 72,
-        function() return Addon.db.settings.widget.show end,
-        function(v) Addon:SetWidgetShown(v) end)
-    DS.MakeCheckbox(f, "Lock", 6, 100,
-        function() return Addon.db.settings.widget.locked end,
-        function(v) Addon.db.settings.widget.locked = v and true or false end)
+-- ══ Set Swapper (on-screen radial/dropdown switcher + global options) ═════════
+function Addon:BuildSetSwapperTab(flow)
+    local w = Addon.db.settings.widget
 
-    f.triggerLbl = DS.MakeLabel(f, "Open On", nil, 6, 134)
-    f.triggerDD = DS.MakeSimpleDropdown(f, 170, 130, 120, { "Click", "Hover" }, function(c)
-        Addon.db.settings.widget.openTrigger = c:lower()
-    end)
+    flow:AddSection("Set Swapper")
+    flow:Hint("On-screen widget that lets you equip a set with one click.")
+    flow:AddChecklist({
+        { label = "Enable",
+          get = function() return Addon.db.settings.widget.show end,
+          set = function(v) Addon:SetWidgetShown(v) end },
+        { label = "Lock",
+          get = function() return Addon.db.settings.widget.locked end,
+          set = function(v) Addon.db.settings.widget.locked = v and true or false end },
+    })
+    flow:AddRow():Dropdown({
+        label = "Open On", width = 140, choices = { "Click", "Hover" },
+        get = function() return w.openTrigger == "hover" and "Hover" or "Click" end,
+        set = function(v) w.openTrigger = v:lower() end,
+    })
 
-    DS.MakeSeparator(f, 4, 168, 460)
-    DS.MakeLabel(f, "Display", nil, 4, 178)
+    flow:AddSection("Display")
+    flow:AddRow():Dropdown({
+        label = "Mode", width = 140, choices = { "Radial", "Dropdown" },
+        get = function() return w.mode == "dropdown" and "Dropdown" or "Radial" end,
+        set = function(v)
+            w.mode = (v == "Dropdown") and "dropdown" or "radial"
+            Addon:RefreshSwapperTab(); Addon:RefreshWidget()
+        end,
+    })
 
-    f.modeLbl = DS.MakeLabel(f, "Mode", nil, 6, 210)
-    f.modeDD = DS.MakeSimpleDropdown(f, 170, 206, 120, { "Radial", "Dropdown" }, function(c)
-        Addon.db.settings.widget.mode = (c == "Dropdown") and "dropdown" or "radial"
-        Addon:RefreshSwapperTab(); Addon:RefreshWidget()
-    end)
-
-    f.typeLbl = DS.MakeLabel(f, "Type", nil, 6, 238)
-    f.typeDD = DS.MakeSimpleDropdown(f, 170, 234, 120, { "Icon", "List" }, function(c)
-        Addon.db.settings.widget.dropdownType = c:lower()
-        Addon:RefreshSwapperTab(); Addon:RefreshWidget()
-    end)
-
-    f.dirLbl = DS.MakeLabel(f, "Direction", nil, 6, 266)
-    f.dirDD = DS.MakeSimpleDropdown(f, 170, 262, 120, { "Right", "Left", "Down", "Up" }, function(c)
-        Addon.db.settings.widget.dropdownDir = c:lower()
-        Addon:RefreshWidget()
-    end)
-
-    f.perLbl = DS.MakeLabel(f, "Sets Per Row", nil, 6, 294)
-    f.perDD = DS.MakeSimpleDropdown(f, 170, 290, 120, PERROW, function(c)
-        Addon.db.settings.widget.dropdownPerRow = tonumber(c)
-        Addon:RefreshWidget()
-    end)
-
-    f.alwaysCB = DS.MakeCheckbox(f, "Always Open", 6, 322,
-        function() return Addon.db.settings.widget.dropdownAlwaysOpen end,
-        function(v)
-            Addon.db.settings.widget.dropdownAlwaysOpen = v and true or false
+    local typeRow = condRow(flow)
+    typeRow:Dropdown({
+        label = "Type", width = 140, choices = { "Icon", "List" },
+        get = function() return w.dropdownType == "list" and "List" or "Icon" end,
+        set = function(v)
+            w.dropdownType = v:lower()
+            Addon:RefreshSwapperTab(); Addon:RefreshWidget()
+        end,
+    })
+    local dirRow = condRow(flow)
+    dirRow:Dropdown({
+        label = "Direction", width = 140, choices = { "Right", "Left", "Down", "Up" },
+        get = function() return cap(w.dropdownDir or "right") end,
+        set = function(v) w.dropdownDir = v:lower(); Addon:RefreshWidget() end,
+    })
+    local perRow = condRow(flow)
+    perRow:Dropdown({
+        label = "Sets Per Row", width = 140, choices = PERROW,
+        get = function() return tostring(w.dropdownPerRow or 5) end,
+        set = function(v) w.dropdownPerRow = tonumber(v); Addon:RefreshWidget() end,
+    })
+    local alwaysRow = condRow(flow)
+    alwaysRow:Checkbox({
+        label = "Always Open",
+        get = function() return w.dropdownAlwaysOpen end,
+        set = function(v)
+            w.dropdownAlwaysOpen = v and true or false
             Addon:RefreshWidget()
-        end)
+        end,
+    })
+    flow._condRows = { type = typeRow, dir = dirRow, per = perRow, always = alwaysRow }
 
-    DS.MakeSeparator(f, 4, 358, 460)
-    DS.MakeLabel(f, "General", nil, 4, 368)
-    DS.MakeCheckbox(f, "Chat Messages", 6, 396,
-        function() return Addon.db.settings.chatMessages end,
-        function(v) Addon.db.settings.chatMessages = v and true or false end)
-    DS.MakeLabel(f, "Print a message when a set or item swap is queued for after combat.", nil, 30, 424)
-
-    DS.MakeLabel(f, "Flyout item tooltips", nil, 6, 460)
-    local ttDD = DS.MakeSimpleDropdown(f, 170, 456, 120, { "On Ctrl", "Always" }, function(c)
-        Addon.db.settings.flyoutTooltip = (c == "Always") and "always" or "ctrl"
-    end)
-    ttDD:SetValue(Addon.db.settings.flyoutTooltip == "always" and "Always" or "On Ctrl")
+    flow:AddSection("General")
+    flow:Checkbox({
+        label = "Chat Messages",
+        get = function() return Addon.db.settings.chatMessages end,
+        set = function(v) Addon.db.settings.chatMessages = v and true or false end,
+    })
+    flow:Hint("Print a message when a set or item swap is queued for after combat.")
+    flow:AddRow():Dropdown({
+        label = "Flyout item tooltips", width = 140, choices = { "On Ctrl", "Always" },
+        get = function() return Addon.db.settings.flyoutTooltip == "always" and "Always" or "On Ctrl" end,
+        set = function(v) Addon.db.settings.flyoutTooltip = (v == "Always") and "always" or "ctrl" end,
+    })
 
     Addon:RefreshSwapperTab()
 end
 
--- Sync the Mode/Type/Direction/Per-Row controls to the saved settings, and show
--- only the rows relevant to the current Mode/Type (Type+Direction+PerRow are
--- meaningless in Radial mode; Direction/PerRow only apply to the Icon type).
+-- Show only the rows relevant to the current Mode/Type (Type+Direction+PerRow are
+-- meaningless in Radial mode; Direction/PerRow/AlwaysOpen only apply to Icon type),
+-- then reflow so hidden rows leave no gap.
 function Addon:RefreshSwapperTab()
-    local f = Addon.frames and Addon.frames.swapper
-    if not (f and f.modeDD) then return end
+    local flow = Addon.frames and Addon.frames.swapper
+    if not (flow and flow._condRows) then return end
     local w = Addon.db.settings.widget
     local isDropdown = w.mode == "dropdown"
     local isIcon     = isDropdown and w.dropdownType ~= "list"
-
-    f.triggerDD:SetValue(w.openTrigger == "hover" and "Hover" or "Click")
-    f.modeDD:SetValue(isDropdown and "Dropdown" or "Radial")
-    f.typeDD:SetValue(w.dropdownType == "list" and "List" or "Icon")
-    f.dirDD:SetValue(cap(w.dropdownDir or "right"))
-    f.perDD:SetValue(tostring(w.dropdownPerRow or 5))
-
-    f.typeLbl:SetShown(isDropdown); f.typeDD:SetShown(isDropdown)
-    f.dirLbl:SetShown(isIcon);      f.dirDD:SetShown(isIcon)
-    f.perLbl:SetShown(isIcon);      f.perDD:SetShown(isIcon)
-    f.alwaysCB:SetShown(isIcon)
+    flow._condRows.type:SetApplicable(isDropdown)
+    flow._condRows.dir:SetApplicable(isIcon)
+    flow._condRows.per:SetApplicable(isIcon)
+    flow._condRows.always:SetApplicable(isIcon)
+    flow.pane:Layout()
 end
 
--- ══ Tab 1: Sets ═══════════════════════════════════════════════════════════════
-local L_X, L_W = 4, 190
-local SEP_X    = 200
-local R_X      = 212
-local LEFT_COL_X, RIGHT_COL_X = 218, 560
-local SLOT_Y0, SLOT_STEP = 150, 40
-local MODEL_X, MODEL_W, MODEL_Y, MODEL_H = 318, 200, 150, 300
-local WPN_Y    = 462
-local WPN_X    = { [16] = 360, [17] = 404, [18] = 448 }
+-- ══ Sets — set list + paper-doll set builder ══════════════════════════════════
 
-function Addon:BuildSetsTab(f)
-    local DS = _G.DaseekiSuite
-    local panel = Addon.panel
+-- Custom leading widget: slot/item icon + name label, sized to a fixed column
+-- width so the flyout table's columns line up under their headers.
+local function slotLead(parent, sid, width)
+    local f = CreateFrame("Frame", nil, parent)
+    f:SetSize(width, 24)
+    f.icon = f:CreateTexture(nil, "ARTWORK")
+    f.icon:SetSize(20, 20)
+    f.icon:SetPoint("LEFT", f, "LEFT", 0, 0)
+    f.icon:SetTexCoord(0.07, 0.93, 0.07, 0.93)
+    f.icon:SetTexture(GetInventoryItemTexture("player", sid) or slotEmptyTex(sid))
+    f.label = f:CreateFontString(nil, "OVERLAY")
+    f.label:SetFontObject(F_BODY)
+    f.label:SetPoint("LEFT", f.icon, "RIGHT", 6, 0)
+    f.label:SetPoint("RIGHT", f, "RIGHT", 0, 0)
+    f.label:SetJustifyH("LEFT"); f.label:SetWordWrap(false)
+    f.label:SetText(slotName(sid))
+    f.uiWidth, f.uiHeight = width, 24
+    return f
+end
+
+-- The scrolling set list (icons + name + keybind, selection highlight, and the
+-- cursor-poll drag-to-reorder). Token-skinned; added as one flow block.
+local function buildSetList(flow, panel)
+    local UI = DaseekiUI
+    local host = UI.FlatFrame(flow.pane.child, "inset", "border")
+    host.uiHeight, host._fillWidth = SETLIST_H, true
+
+    local scroll = CreateFrame("ScrollFrame", "DaseekiArmorySetScroll", host)
+    scroll:SetPoint("TOPLEFT", host, "TOPLEFT", LIST_INSET, -LIST_INSET)
+    scroll:SetPoint("BOTTOMRIGHT", host, "BOTTOMRIGHT", -LIST_INSET, LIST_INSET)
+    scroll:SetClipsChildren(true)
+    scroll:EnableMouseWheel(true)
+    local child = CreateFrame("Frame", nil, scroll)
+    child:SetSize(1, 1)
+    scroll:SetScrollChild(child)
+    scroll:SetScript("OnMouseWheel", function(self, delta)
+        local cur = self:GetVerticalScroll()
+        local maxs = math.max(0, child:GetHeight() - self:GetHeight())
+        self:SetVerticalScroll(math.max(0, math.min(maxs, cur - delta * 24)))
+    end)
+    panel.listChild, panel.listScroll = child, scroll
+
+    -- Drag-to-reorder: a plain drag/release between two Buttons never fires
+    -- OnReceiveDrag (that only fires for cursor-item drops) and GetMouseFocus is
+    -- unreliable here, so poll cursor position instead — same pattern as
+    -- Daseeki-Buff-Tracker's working item-list reorder.
+    local dropBar = child:CreateTexture(nil, "OVERLAY")
+    dropBar:SetHeight(2); dropBar:Hide()
+    UI.Skin(dropBar, function(self) self:SetColorTexture(UI.Color("accent")) end)
+    panel.dropBar = dropBar
+
+    local dragTick = CreateFrame("Frame"); dragTick:Hide()
+    dragTick:SetScript("OnUpdate", function()
+        local srcName = panel._dragSourceName
+        if not srcName then dragTick:Hide(); return end
+        local mx, my = GetCursorPosition()
+        local scale = UIParent:GetEffectiveScale()
+        mx, my = mx / scale, my / scale
+
+        if not IsMouseButtonDown("LeftButton") then
+            dragTick:Hide(); dropBar:Hide()
+            if panel._dragging and panel._dragDropLine then
+                local sets = Addon:GetSetsSorted()
+                local target = sets[panel._dragDropLine]
+                Addon:ReorderSet(srcName, target and target.name or nil)
+                Addon:RefreshOptions(); Addon:RefreshWidget()
+            end
+            panel._dragSourceName, panel._dragging, panel._dragDropLine = nil, false, nil
+            return
+        end
+
+        if not panel._dragging then
+            local dx, dy = mx - (panel._dragClickX or mx), my - (panel._dragClickY or my)
+            if dx * dx + dy * dy < 25 then return end
+            panel._dragging = true
+        end
+
+        local childTop = child:GetTop()
+        if not childTop then return end
+        local n = #Addon:GetSetsSorted()
+        if n == 0 then return end
+        local relY = childTop - my
+        local hRow = math.floor(relY / SET_ROW_H)
+        local frac = relY - hRow * SET_ROW_H
+        local line = (frac < SET_ROW_H / 2) and (hRow + 1) or (hRow + 2)
+        line = math.max(1, math.min(n + 1, line))
+        panel._dragDropLine = line
+
+        dropBar:ClearAllPoints()
+        dropBar:SetPoint("TOPLEFT",  child, "TOPLEFT",  0, -(line - 1) * SET_ROW_H)
+        dropBar:SetPoint("TOPRIGHT", child, "TOPRIGHT", 0, -(line - 1) * SET_ROW_H)
+        dropBar:Show()
+    end)
+    panel._dragTick = dragTick
+
+    host.arrange = function(width)
+        host:SetWidth(width)
+        child:SetWidth(math.max(1, width - 2 * LIST_INSET))
+        return SETLIST_H
+    end
+    return host
+end
+
+-- The paper-doll set builder: two columns of equip slots flanking a 3D model,
+-- weapons across the bottom. Custom token-skinned frame; width-relative layout
+-- (centered model, right column pinned to the right edge) so it reflows.
+local function buildPaperdoll(flow, panel)
+    local UI = DaseekiUI
+    local pd = CreateFrame("Frame", nil, flow.pane.child)
+    pd._fillWidth = true
+
+    local model = CreateFrame("DressUpModel", nil, pd)
+    model:SetSize(MODEL_W, MODEL_H)
+    model:SetUnit("player"); model:EnableMouse(true)
+    model:SetScript("OnMouseDown", function(self) self._rot = true; self._mx = GetCursorPosition() end)
+    model:SetScript("OnMouseUp",   function(self) self._rot = false end)
+    model:SetScript("OnUpdate", function(self)
+        if self._rot then
+            local x = GetCursorPosition()
+            self._facing = (self._facing or 0) + (x - (self._mx or x)) * 0.02
+            self._mx = x; self:SetFacing(self._facing)
+        end
+    end)
+    panel.model = model
 
     -- Hover a slot → open the item flyout to choose what goes in it. If the slot
-    -- already has an item chosen, also show its tooltip to the right of the icon
-    -- (may overlap the flyout — deliberate, reads better next to the slot).
+    -- already has an item, also show its tooltip to the right (may overlap the
+    -- flyout — deliberate; reads better next to the slot).
     local function slotEnter(self)
         local name = panel.selectedSet
         if not name then return end
@@ -240,25 +415,29 @@ function Addon:BuildSetsTab(f)
             ClearCursor(); Addon:RefreshBuilder()
         end
     end
-    local function makeSlot(slotDef, x, y)
+    local function makeSlot(slotDef)
         local slotId = slotDef.id
-        local b = CreateFrame("Button", nil, f)
-        b:SetSize(36, 36)
-        b:SetPoint("TOPLEFT", f, "TOPLEFT", x, -y)
+        local b = CreateFrame("Button", nil, pd)
+        b:SetSize(SLOT_SZ, SLOT_SZ)
+        b:SetFrameLevel(model:GetFrameLevel() + 4)
         b:RegisterForClicks("LeftButtonUp", "RightButtonUp")
         b._emptyTex = Addon:GetSlotEmptyTexture(slotDef)
-        b.bg = b:CreateTexture(nil, "BACKGROUND"); b.bg:SetAllPoints(); b.bg:SetColorTexture(0, 0, 0, 0.5)
+        b.bg = b:CreateTexture(nil, "BACKGROUND"); b.bg:SetAllPoints()
+        UI.Skin(b.bg, function(self) self:SetColorTexture(UI.Color("inset", 0.85)) end)
         b.icon = b:CreateTexture(nil, "ARTWORK"); b.icon:SetAllPoints(); b.icon:SetTexCoord(0.07, 0.93, 0.07, 0.93)
         b.glow = b:CreateTexture(nil, "OVERLAY")
         b.glow:SetTexture("Interface\\Buttons\\UI-ActionButton-Border")
-        b.glow:SetBlendMode("ADD"); b.glow:SetVertexColor(1, 0, 0, 1)
+        b.glow:SetBlendMode("ADD")
         b.glow:SetPoint("CENTER"); b.glow:SetSize(54, 54); b.glow:Hide()
-        b.off = b:CreateTexture(nil, "OVERLAY"); b.off:SetAllPoints(); b.off:SetColorTexture(0, 0, 0, 0.55); b.off:Hide()
+        UI.Skin(b.glow, function(self) self:SetVertexColor(UI.Color("danger")) end)
+        b.off = b:CreateTexture(nil, "OVERLAY"); b.off:SetAllPoints(); b.off:Hide()
+        UI.Skin(b.off, function(self) self:SetColorTexture(UI.Color("ground", 0.65)) end)
         -- goal obtained check (bottom-right)
         b.check = b:CreateTexture(nil, "OVERLAY", nil, 7)
         b.check:SetTexture("Interface\\RaidFrame\\ReadyCheck-Ready")
-        b.check:SetSize(16, 16); b.check:SetPoint("BOTTOMRIGHT", 3, -3); b.check:Hide()
-        local hl = b:CreateTexture(nil, "HIGHLIGHT"); hl:SetAllPoints(); hl:SetColorTexture(1, 0.82, 0, 0.25)
+        b.check:SetSize(16, 16); b.check:SetPoint("BOTTOMRIGHT", CHECK_INSET, -CHECK_INSET); b.check:Hide()
+        local hl = b:CreateTexture(nil, "HIGHLIGHT"); hl:SetAllPoints()
+        UI.Skin(hl, function(self) self:SetColorTexture(UI.Color("accent", 0.25)) end)
         b._slotId, b._slotName = slotDef.id, slotDef.name
         b:SetScript("OnClick", slotClick)
         b:SetScript("OnReceiveDrag", slotReceiveDrag)
@@ -268,17 +447,21 @@ function Addon:BuildSetsTab(f)
 
         -- goal "chase list" button on the inside edge (toward the model)
         local g = CreateFrame("Button", nil, b)
-        g:SetSize(22, 22)
+        g:SetSize(GOAL_SZ, GOAL_SZ)
         g:SetFrameLevel(b:GetFrameLevel() + 3)
         if slotDef.col == "L" then     g:SetPoint("LEFT",   b, "RIGHT", 3, 0)
         elseif slotDef.col == "R" then g:SetPoint("RIGHT",  b, "LEFT", -3, 0)
         else                            g:SetPoint("BOTTOM", b, "TOP",   0, 3) end
         g:RegisterForClicks("LeftButtonUp", "RightButtonUp")
-        g.bg = g:CreateTexture(nil, "BACKGROUND"); g.bg:SetAllPoints(); g.bg:SetColorTexture(0, 0, 0, 0.6)
+        g.bg = g:CreateTexture(nil, "BACKGROUND"); g.bg:SetAllPoints()
+        UI.Skin(g.bg, function(self) self:SetColorTexture(UI.Color("inset", 0.9)) end)
         g.icon = g:CreateTexture(nil, "ARTWORK"); g.icon:SetAllPoints(); g.icon:SetTexCoord(0.07, 0.93, 0.07, 0.93)
-        g.plus = g:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-        g.plus:SetPoint("CENTER"); g.plus:SetText("+"); g.plus:SetTextColor(0.6, 0.9, 0.6)
-        local ghl = g:CreateTexture(nil, "HIGHLIGHT"); ghl:SetAllPoints(); ghl:SetColorTexture(0.2, 0.8, 0.2, 0.3)
+        g.plus = g:CreateFontString(nil, "OVERLAY")
+        g.plus:SetFontObject(F_BODY)
+        g.plus:SetPoint("CENTER"); g.plus:SetText("+")
+        UI.Skin(g.plus, function(self) self:SetTextColor(UI.Color("ok")) end)
+        local ghl = g:CreateTexture(nil, "HIGHLIGHT"); ghl:SetAllPoints()
+        UI.Skin(ghl, function(self) self:SetColorTexture(UI.Color("ok", 0.3)) end)
         g:SetScript("OnClick", function(self, button)
             local name = panel.selectedSet
             if not name then return end
@@ -309,135 +492,128 @@ function Addon:BuildSetsTab(f)
         b.goalBtn = g
     end
 
-    -- left: set list + management
-    DS.MakeSectionHeader(f, "Armory Sets", L_X, 8, L_W)
-    local listSF = CreateFrame("ScrollFrame", "DaseekiArmorySetScroll", f, "UIPanelScrollFrameTemplate")
-    listSF:SetPoint("TOPLEFT", f, "TOPLEFT", L_X, -44)
-    listSF:SetSize(L_W - 24, 330)
-    local listChild = CreateFrame("Frame", nil, listSF); listChild:SetSize(L_W - 24, 1)
-    listSF:SetScrollChild(listChild)
-    panel.listChild = listChild
+    for _, slotDef in ipairs(Addon.SLOTS) do
+        if slotDef.col == "L" or slotDef.col == "R" or slotDef.col == "W" then makeSlot(slotDef) end
+    end
 
-    -- Drag-to-reorder for the set list. A plain mouse drag-and-release between two
-    -- Buttons never fires OnReceiveDrag (that only fires for cursor-item drops, e.g.
-    -- dragging a spell off the spellbook) and GetMouseFocus is unreliable here, so
-    -- poll cursor position instead — same pattern as Daseeki-Buff-Tracker's working
-    -- item-list reorder (options.lua "Drag-to-reorder" section there).
-    local ROWH = 28
-    local dropBar = listChild:CreateTexture(nil, "OVERLAY")
-    dropBar:SetColorTexture(1, 0.82, 0, 1); dropBar:SetHeight(2); dropBar:Hide()
+    -- Width-relative arrange: left column at the left edge, right column pinned to
+    -- the right edge, model centered between; weapons centered across the bottom.
+    pd.arrange = function(width)
+        pd:SetWidth(width)
+        local colH = COL_ROWS * SLOT_STEP
+        local bodyH = math.max(colH, MODEL_H)
 
-    local dragTick = CreateFrame("Frame"); dragTick:Hide()
-    dragTick:SetScript("OnUpdate", function()
-        local srcName = panel._dragSourceName
-        if not srcName then dragTick:Hide(); return end
-        local mx, my = GetCursorPosition()
-        local scale = UIParent:GetEffectiveScale()
-        mx, my = mx / scale, my / scale
+        model:ClearAllPoints()
+        model:SetPoint("TOP", pd, "TOP", 0, 0)
 
-        if not IsMouseButtonDown("LeftButton") then
-            dragTick:Hide(); dropBar:Hide()
-            if panel._dragging and panel._dragDropLine then
-                local sets = Addon:GetSetsSorted()
-                local target = sets[panel._dragDropLine]
-                Addon:ReorderSet(srcName, target and target.name or nil)
-                Addon:RefreshOptions(); Addon:RefreshWidget()
+        local li, ri = 0, 0
+        for _, slotDef in ipairs(Addon.SLOTS) do
+            local b = panel.slotButtons[slotDef.id]
+            if b then
+                b:ClearAllPoints()
+                if slotDef.col == "L" then
+                    b:SetPoint("TOPLEFT", pd, "TOPLEFT", 0, -(li * SLOT_STEP)); li = li + 1
+                elseif slotDef.col == "R" then
+                    b:SetPoint("TOPRIGHT", pd, "TOPRIGHT", 0, -(ri * SLOT_STEP)); ri = ri + 1
+                end
             end
-            panel._dragSourceName, panel._dragging, panel._dragDropLine = nil, false, nil
-            return
         end
 
-        if not panel._dragging then
-            local dx, dy = mx - (panel._dragClickX or mx), my - (panel._dragClickY or my)
-            if dx * dx + dy * dy < 25 then return end
-            panel._dragging = true
+        local weapons = { 16, 17, 18 }
+        local totalW = #weapons * SLOT_SZ + (#weapons - 1) * WPN_XGAP
+        local startX = math.max(0, (width - totalW) / 2)
+        local wy = bodyH + WPN_GAP
+        for idx, sid in ipairs(weapons) do
+            local b = panel.slotButtons[sid]
+            if b then
+                b:ClearAllPoints()
+                b:SetPoint("TOPLEFT", pd, "TOPLEFT", startX + (idx - 1) * (SLOT_SZ + WPN_XGAP), -wy)
+            end
         end
 
-        local childTop = listChild:GetTop()
-        if not childTop then return end
-        local n = #Addon:GetSetsSorted()
-        if n == 0 then return end
-        local relY = childTop - my
-        local hRow = math.floor(relY / ROWH)
-        local frac = relY - hRow * ROWH
-        local line = (frac < ROWH / 2) and (hRow + 1) or (hRow + 2)
-        line = math.max(1, math.min(n + 1, line))
-        panel._dragDropLine = line
+        local total = wy + SLOT_SZ
+        pd:SetHeight(total)
+        return total
+    end
+    return pd
+end
 
-        dropBar:ClearAllPoints()
-        dropBar:SetPoint("TOPLEFT",  listChild, "TOPLEFT",  0, -(line - 1) * ROWH)
-        dropBar:SetPoint("TOPRIGHT", listChild, "TOPRIGHT", 0, -(line - 1) * ROWH)
-        dropBar:Show()
-    end)
-    panel._dragTick = dragTick
+function Addon:BuildSetsTab(flow)
+    local UI = DaseekiUI
+    local panel = Addon.panel
 
-    DS.MakeButton(f, "New",       L_X,        384, 91, 22, function()
-        DS.ShowNameInputDialog("New Set", "", function(v)
+    -- ── Left half: set list + management ──────────────────────────────────────
+    flow:AddSection("Armory Sets")
+    local listHost = buildSetList(flow, panel)
+    addBlock(flow, listHost, listHost.arrange, rowGap())
+
+    -- New / Duplicate / Rename / Delete
+    local crud = flow:AddRow()
+    crud:Button({ text = "New", width = 91, onClick = function()
+        _G.DaseekiSuite.ShowNameInputDialog("New Set", "", function(v)
             local ok, err = Addon:CreateSet(v)
             if ok then panel.selectedSet = v; Addon:RefreshOptions(); Addon:RefreshWidget()
             else print("|cff66ccffArmory|r " .. tostring(err)) end
         end)
-    end)
-    DS.MakeButton(f, "Duplicate", L_X + 95,   384, 91, 22, function()
+    end })
+    crud:Button({ text = "Duplicate", width = 91, onClick = function()
         if not panel.selectedSet then return end
         local ok, res = Addon:DuplicateSet(panel.selectedSet)
         if ok then panel.selectedSet = res; Addon:RefreshOptions(); Addon:RefreshWidget()
         else print("|cff66ccffArmory|r " .. tostring(res)) end
-    end)
-    DS.MakeButton(f, "Rename",    L_X,        412, 91, 22, function()
+    end })
+    crud:Button({ text = "Rename", width = 91, onClick = function()
         if not panel.selectedSet then return end
-        DS.ShowNameInputDialog("Rename Set", panel.selectedSet, function(v)
+        _G.DaseekiSuite.ShowNameInputDialog("Rename Set", panel.selectedSet, function(v)
             local ok, err = Addon:RenameSet(panel.selectedSet, v)
             if ok then panel.selectedSet = v; Addon:RefreshOptions(); Addon:RefreshWidget()
             else print("|cff66ccffArmory|r " .. tostring(err)) end
         end)
-    end)
-    DS.MakeButton(f, "Delete",    L_X + 95,   412, 91, 22, function()
+    end })
+    crud:Button({ text = "Delete", width = 91, onClick = function()
         if panel.selectedSet then StaticPopup_Show("DASEEKI_ARMORY_DELETE", panel.selectedSet, nil, panel.selectedSet) end
-    end)
+    end })
 
-    DS.MakeSeparator(f, L_X, 444, L_W)
-    DS.MakeLabel(f, "Clone to another character", nil, L_X, 452)
-    DS.MakeButton(f, "Export Sets", L_X,      472, 91, 22, function()
-        DS.ShowTextDialog("Export Armory Sets", Addon:ExportSets(), true)
-    end)
-    DS.MakeButton(f, "Import Sets", L_X + 95, 472, 91, 22, function()
-        DS.ShowTextDialog("Import Armory Sets", "", false, function(text)
+    flow:AddSeparator()
+    flow:Hint("Clone to another character")
+    local io1 = flow:AddRow()
+    io1:Button({ text = "Export Sets", width = 110, onClick = function()
+        _G.DaseekiSuite.ShowTextDialog("Export Armory Sets", Addon:ExportSets(), true)
+    end })
+    io1:Button({ text = "Import Sets", width = 110, onClick = function()
+        _G.DaseekiSuite.ShowTextDialog("Import Armory Sets", "", false, function(text)
             local ok, res = Addon:ImportSets(text)
             if ok then print("|cff66ccffArmory|r imported " .. res .. " set(s).")
                 Addon:RefreshOptions(); Addon:RefreshWidget()
             else print("|cff66ccffArmory|r " .. tostring(res)) end
         end)
-    end)
-    DS.MakeButton(f, "Import from ItemRack", L_X, 500, L_W, 22, function()
+    end })
+    flow:AddRow():Button({ text = "Import from ItemRack", width = 230, onClick = function()
         local n = Addon:CountItemRackSets()
         if n == 0 then print("|cff66ccffArmory|r no ItemRack sets found — make sure ItemRack is enabled."); return end
         StaticPopup_Show("DASEEKI_ARMORY_IRIMPORT", n)
+    end })
+
+    -- ── Right half: set builder ───────────────────────────────────────────────
+    flow:AddSection("Set Builder")
+    flow:Label("Set name", { muted = true })
+
+    -- icon button + name edit box on one row
+    local headRow = flow:AddRow()
+    local iconBtn = CreateFrame("Button", nil, headRow, "BackdropTemplate")
+    iconBtn:SetSize(46, 46)
+    UI.Skin(iconBtn, function(self)
+        self:SetBackdrop(UI.FLAT_BACKDROP)
+        self:SetBackdropColor(UI.Color("inset"))
+        self:SetBackdropBorderColor(UI.Color("borderLite"))
     end)
-
-    -- separator between list and builder
-    local vsep = f:CreateTexture(nil, "ARTWORK")
-    vsep:SetColorTexture(0.3, 0.3, 0.3, 0.8); vsep:SetWidth(1)
-    vsep:SetPoint("TOPLEFT", f, "TOPLEFT", SEP_X, -8)
-    vsep:SetPoint("BOTTOMLEFT", f, "TOPLEFT", SEP_X, -600)
-
-    -- right: set builder — centered icon + name header
-    local BUILDER_CX = 410
-    local ICON_SZ, NAME_W = 46, 210
-    local groupW = ICON_SZ + 12 + NAME_W
-    local gx = BUILDER_CX - groupW / 2
-
-    local iconBtn = CreateFrame("Button", nil, f)
-    iconBtn:SetSize(ICON_SZ, ICON_SZ)
-    iconBtn:SetPoint("TOPLEFT", f, "TOPLEFT", gx, -30)
-    iconBtn.bg = iconBtn:CreateTexture(nil, "BACKGROUND"); iconBtn.bg:SetAllPoints(); iconBtn.bg:SetColorTexture(0, 0, 0, 0.5)
     iconBtn.icon = iconBtn:CreateTexture(nil, "ARTWORK")
-    iconBtn.icon:SetPoint("TOPLEFT", 2, -2); iconBtn.icon:SetPoint("BOTTOMRIGHT", -2, 2); iconBtn.icon:SetTexCoord(0.07, 0.93, 0.07, 0.93)
-    local ibord = CreateFrame("Frame", nil, iconBtn, "BackdropTemplate")
-    ibord:SetPoint("TOPLEFT", -2, 2); ibord:SetPoint("BOTTOMRIGHT", 2, -2)
-    ibord:SetBackdrop({ edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border", edgeSize = 12 })
-    ibord:SetBackdropBorderColor(1, 0.82, 0, 0.5)
-    local ihl = iconBtn:CreateTexture(nil, "HIGHLIGHT"); ihl:SetAllPoints(); ihl:SetColorTexture(1, 0.82, 0, 0.25)
+    iconBtn.icon:SetPoint("TOPLEFT", IB, -IB)
+    iconBtn.icon:SetPoint("BOTTOMRIGHT", -IB, IB)
+    iconBtn.icon:SetTexCoord(0.07, 0.93, 0.07, 0.93)
+    local ihl = iconBtn:CreateTexture(nil, "HIGHLIGHT"); ihl:SetAllPoints()
+    UI.Skin(ihl, function(self) self:SetColorTexture(UI.Color("accent", 0.25)) end)
+    iconBtn.uiWidth, iconBtn.uiHeight = 46, 46
     iconBtn:SetScript("OnClick", function()
         local set = panel.selectedSet and Addon.db.sets[panel.selectedSet]
         if not set then return end
@@ -452,37 +628,24 @@ function Addon:BuildSetsTab(f)
         GameTooltip:AddLine("Click to choose an icon", 0.7, 0.7, 0.7); GameTooltip:Show()
     end)
     iconBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+    headRow._items[#headRow._items + 1] = { w = iconBtn }
     panel.iconBtn = iconBtn
 
-    local nameCap = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    nameCap:SetText("SET NAME"); nameCap:SetTextColor(0.55, 0.55, 0.55)
+    panel.nameEB = headRow:EditBox({
+        get = function() return panel.selectedSet or "" end,
+        set = function(v)
+            v = strtrim(v or "")
+            if panel.selectedSet and v ~= "" and v ~= panel.selectedSet then
+                local ok, err = Addon:RenameSet(panel.selectedSet, v)
+                if ok then panel.selectedSet = v; Addon:RefreshOptions(); Addon:RefreshWidget()
+                else print("|cff66ccffArmory|r " .. tostring(err)) end
+            end
+        end,
+    })
 
-    local nameEB = DS.MakeEditBox(f, 0, 0, NAME_W)
-    nameEB:ClearAllPoints()
-    nameEB:SetPoint("LEFT", iconBtn, "RIGHT", 12, 0)
-    nameEB:SetHeight(26)
-    nameEB:SetFontObject(GameFontHighlightLarge)
-    nameEB:SetJustifyH("CENTER")
-    nameEB:SetTextColor(1, 0.9, 0.55)
-    nameCap:SetPoint("BOTTOM", nameEB, "TOP", 0, 3)
-    local nameLine = f:CreateTexture(nil, "ARTWORK")
-    nameLine:SetColorTexture(1, 0.82, 0, 0.4); nameLine:SetHeight(1)
-    nameLine:SetPoint("TOPLEFT", nameEB, "BOTTOMLEFT", 2, -1)
-    nameLine:SetPoint("TOPRIGHT", nameEB, "BOTTOMRIGHT", -2, -1)
-    nameEB:SetScript("OnEnterPressed", function(self)
-        local v = strtrim(self:GetText())
-        if panel.selectedSet and v ~= "" and v ~= panel.selectedSet then
-            local ok, err = Addon:RenameSet(panel.selectedSet, v)
-            if ok then panel.selectedSet = v; Addon:RefreshOptions(); Addon:RefreshWidget()
-            else print("|cff66ccffArmory|r " .. tostring(err)) end
-        end
-        self:ClearFocus()
-    end)
-    panel.nameEB = nameEB
-
-    -- keybind control (centered under the name)
-    local kbBtn = DS.MakeButton(f, "Keybind: \194\183", 0, 0, 170, 20, nil)
-    kbBtn:ClearAllPoints(); kbBtn:SetPoint("TOP", nameLine, "BOTTOM", 0, -10)
+    -- keybind + goals row
+    local kbRow = flow:AddRow()
+    local kbBtn = kbRow:Button({ text = "Keybind: \194\183", width = 170 })
     kbBtn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
     kbBtn:SetScript("OnClick", function(self, button)
         local name = panel.selectedSet
@@ -519,11 +682,10 @@ function Addon:BuildSetsTab(f)
     kbBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
     panel.kbBtn = kbBtn
 
-    -- Set Goals mode toggle (centered, above the action row)
-    panel.goalsBtn = DS.MakeButton(f, "Set Goals", BUILDER_CX - 70, 548, 140, 22, function()
+    panel.goalsBtn = kbRow:Button({ text = "Set Goals", width = 140, pin = "right", onClick = function()
         panel.goalMode = not panel.goalMode
         Addon:RefreshBuilder()
-    end)
+    end })
     panel.goalsBtn:SetScript("OnEnter", function(self)
         GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
         GameTooltip:AddLine("Set Goals (chase list)", 1, 1, 1)
@@ -533,219 +695,234 @@ function Addon:BuildSetsTab(f)
     end)
     panel.goalsBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
-    -- action buttons, centered along the bottom of the builder
-    local BTN_Y = 582
-    local b1, b2, b3 = 150, 90, 90
-    local totalW = b1 + b2 + b3 + 16
-    local bx = BUILDER_CX - totalW / 2
-    panel.saveBtn  = DS.MakeButton(f, "Populate Current Gear", bx, BTN_Y, b1, 24, function()
+    -- paper-doll slot grid + model
+    local pd = buildPaperdoll(flow, panel)
+    addBlock(flow, pd, pd.arrange, rowGap())
+
+    -- action buttons
+    local actRow = flow:AddRow()
+    panel.saveBtn = actRow:Button({ text = "Populate Current Gear", width = 150, onClick = function()
         if panel.selectedSet then Addon:SaveCurrentGear(panel.selectedSet); Addon:RefreshBuilder() end
-    end)
-    panel.equipBtn = DS.MakeButton(f, "Equip Set", bx + b1 + 8, BTN_Y, b2, 24, function()
+    end })
+    panel.equipBtn = actRow:Button({ text = "Equip Set", width = 90, onClick = function()
         if panel.selectedSet then Addon:EquipSet(panel.selectedSet) end
-    end)
-    panel.macroBtn = DS.MakeButton(f, "Show Macro", bx + b1 + b2 + 16, BTN_Y, b3, 24, function()
+    end })
+    panel.macroBtn = actRow:Button({ text = "Show Macro", width = 90, onClick = function()
         if panel.selectedSet then
-            DS.ShowTextDialog("Equip Macro — " .. panel.selectedSet, Addon:GetEquipMacro(panel.selectedSet), true)
+            _G.DaseekiSuite.ShowTextDialog("Equip Macro — " .. panel.selectedSet, Addon:GetEquipMacro(panel.selectedSet), true)
         end
-    end)
+    end })
 
-    local help = f:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-    help:SetPoint("TOP", f, "TOPLEFT", BUILDER_CX, -(BTN_Y + 32))
-    help:SetText("Hover a slot to choose  \194\183  Right-click: disable  \194\183  Shift+Right: clear")
-
-    local model = CreateFrame("DressUpModel", nil, f)
-    model:SetPoint("TOPLEFT", f, "TOPLEFT", MODEL_X, -MODEL_Y)
-    model:SetSize(MODEL_W, MODEL_H)
-    model:SetUnit("player"); model:EnableMouse(true)
-    model:SetScript("OnMouseDown", function(self) self._rot = true; self._mx = GetCursorPosition() end)
-    model:SetScript("OnMouseUp",   function(self) self._rot = false end)
-    model:SetScript("OnUpdate", function(self)
-        if self._rot then
-            local x = GetCursorPosition()
-            self._facing = (self._facing or 0) + (x - (self._mx or x)) * 0.02
-            self._mx = x; self:SetFacing(self._facing)
-        end
-    end)
-    panel.model = model
-
-    local li, ri = 0, 0
-    for _, slotDef in ipairs(Addon.SLOTS) do
-        if slotDef.col == "L" then makeSlot(slotDef, LEFT_COL_X, SLOT_Y0 + li * SLOT_STEP); li = li + 1
-        elseif slotDef.col == "R" then makeSlot(slotDef, RIGHT_COL_X, SLOT_Y0 + ri * SLOT_STEP); ri = ri + 1 end
-    end
-    for _, slotDef in ipairs(Addon.SLOTS) do
-        if slotDef.col == "W" then makeSlot(slotDef, WPN_X[slotDef.id], WPN_Y) end
-    end
+    flow:Hint("Hover a slot to choose  \194\183  Right-click: disable  \194\183  Shift+Right: clear")
 end
 
--- ══ Tab 2: Character Window flyouts (per slot) ════════════════════════════════
-function Addon:BuildCharWindowTab(f)
-    local DS = _G.DaseekiSuite
-    DS.MakeSectionHeader(f, "Character Window Flyouts", 4, 8, 460)
-    DS.MakeLabel(f, "Item flyout shown when you hover an equipped slot on the character pane.", nil, 4, 40)
+-- ══ Character Window flyouts (per slot) ═══════════════════════════════════════
+function Addon:BuildCharWindowTab(flow)
+    flow:AddSection("Character Window Flyouts")
+    flow:Hint("Item flyout shown when you hover an equipped slot on the character pane.")
 
-    DS.MakeLabel(f, "Slot",      nil, 12,  70)
-    DS.MakeLabel(f, "Direction", nil, 170, 70)
-    DS.MakeLabel(f, "Per row",   nil, 282, 70)
-    DS.MakeSeparator(f, 4, 88, 460)
+    local SLOT_W, DIR_W, PER_W = 150, 110, 70
+    local hdr = flow:AddRow()
+    local h1 = hdr:Label("Slot", { muted = true });      h1.uiWidth = SLOT_W; h1:SetWidth(SLOT_W)
+    local h2 = hdr:Label("Direction", { muted = true }); h2.uiWidth = DIR_W;  h2:SetWidth(DIR_W)
+    hdr:Label("Per row", { muted = true })
+    flow:AddSeparator()
 
-    local RH = 28
-    local sf = CreateFrame("ScrollFrame", nil, f, "UIPanelScrollFrameTemplate")
-    sf:SetPoint("TOPLEFT",     f, "TOPLEFT",     8,   -96)
-    sf:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -26,   4)
-
-    local child = CreateFrame("Frame", nil, sf)
-    child:SetSize(426, #Addon.SLOTS * RH)
-    sf:SetScrollChild(child)
-
-    for i, s in ipairs(Addon.SLOTS) do
+    for _, s in ipairs(Addon.SLOTS) do
         local sid = s.id
-        local r = CreateFrame("Frame", nil, child)
-        r:SetSize(426, RH)
-        r:SetPoint("TOPLEFT", child, "TOPLEFT", 0, -(i - 1) * RH)
-        r.bg = r:CreateTexture(nil, "BACKGROUND"); r.bg:SetAllPoints()
-        r.bg:SetColorTexture(i % 2 == 0 and 0.12 or 0.08, 0.1, 0.12, 0.6)
-        r.icon = r:CreateTexture(nil, "ARTWORK"); r.icon:SetSize(22, 22); r.icon:SetPoint("LEFT", 4, 0)
-        r.icon:SetTexCoord(0.07, 0.93, 0.07, 0.93)
-        r.icon:SetTexture(GetInventoryItemTexture("player", sid) or slotEmptyTex(sid))
-        r.label = r:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-        r.label:SetPoint("LEFT", r.icon, "RIGHT", 6, 0); r.label:SetWidth(120); r.label:SetJustifyH("LEFT")
-        r.label:SetText(slotName(sid))
-
-        local cfg = Addon:GetFlyoutConfig(sid)
-        local dd = DS.MakeSimpleDropdown(r, 162, 3, 100, { "Right", "Left", "Down", "Up" },
-            function(c) Addon:GetFlyoutConfig(sid).dir = c:lower() end)
-        dd:SetValue(cap(cfg.dir))
-        local pd = DS.MakeSimpleDropdown(r, 272, 3, 60, PERROW,
-            function(c) Addon:GetFlyoutConfig(sid).perRow = tonumber(c) end)
-        pd:SetValue(tostring(cfg.perRow))
+        local row = flow:AddRow()
+        local lead = slotLead(row, sid, SLOT_W)
+        row._items[#row._items + 1] = { w = lead }
+        row:Dropdown({
+            width = DIR_W, choices = { "Right", "Left", "Down", "Up" },
+            get = function() return cap(Addon:GetFlyoutConfig(sid).dir) end,
+            set = function(v) Addon:GetFlyoutConfig(sid).dir = v:lower() end,
+        })
+        row:Dropdown({
+            width = PER_W, choices = PERROW,
+            get = function() return tostring(Addon:GetFlyoutConfig(sid).perRow) end,
+            set = function(v) Addon:GetFlyoutConfig(sid).perRow = tonumber(v) end,
+        })
     end
 end
 
--- ══ Tab 3: Item Slot Widgets (detached popouts) ═══════════════════════════════
-local W_ROW_H, W_ROW_Y0 = 32, 158
+-- ══ Item Slot Widgets (detached popouts) ══════════════════════════════════════
+local WW_SLOT_X = 34    -- widget row: icon left inset -> name column start
+local WW_DIR_X  = 140   -- widget row: direction dropdown x
+local WW_PER_X  = 240   -- widget row: per-row dropdown x
 
-local function makeWidgetRow(f, i)
-    local DS = _G.DaseekiSuite
-    local r = CreateFrame("Frame", nil, f)
-    r:SetSize(460, W_ROW_H)
-    r:SetPoint("TOPLEFT", f, "TOPLEFT", 8, -(W_ROW_Y0 + (i - 1) * W_ROW_H))
+local function makeWidgetRow(host)
+    local UI = DaseekiUI
+    local r = CreateFrame("Frame", nil, host)
+    r:SetHeight(W_ROW_H)
     r.bg = r:CreateTexture(nil, "BACKGROUND"); r.bg:SetAllPoints()
-    r.bg:SetColorTexture(i % 2 == 0 and 0.12 or 0.08, 0.1, 0.12, 0.6)
-    r.icon = r:CreateTexture(nil, "ARTWORK"); r.icon:SetSize(24, 24); r.icon:SetPoint("LEFT", 4, 0)
-    r.icon:SetTexCoord(0.07, 0.93, 0.07, 0.93)
-    r.label = r:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    r.label:SetPoint("LEFT", r.icon, "RIGHT", 6, 0); r.label:SetWidth(100); r.label:SetJustifyH("LEFT")
+    r.icon = r:CreateTexture(nil, "ARTWORK"); r.icon:SetSize(24, 24)
+    r.icon:SetPoint("LEFT", r, "LEFT", 4, 0); r.icon:SetTexCoord(0.07, 0.93, 0.07, 0.93)
+    r.label = r:CreateFontString(nil, "OVERLAY"); r.label:SetFontObject(F_BODY)
+    r.label:SetPoint("LEFT", r, "LEFT", WW_SLOT_X, 0); r.label:SetWidth(100); r.label:SetJustifyH("LEFT")
+    r._cfg = function() return r._slotId and Addon.db.settings.slotPopouts.buttons[r._slotId] end
 
-    r.dirDD = DS.MakeSimpleDropdown(r, 144, 5, 92, { "Right", "Left", "Down", "Up" },
-        function(c) local sid = r._slotId; if sid and Addon.db.settings.slotPopouts.buttons[sid] then
-            Addon.db.settings.slotPopouts.buttons[sid].dir = c:lower() end end)
-    r.perDD = DS.MakeSimpleDropdown(r, 242, 5, 50, PERROW,
-        function(c) local sid = r._slotId; if sid and Addon.db.settings.slotPopouts.buttons[sid] then
-            Addon.db.settings.slotPopouts.buttons[sid].perRow = tonumber(c) end end)
-    r.unlink = DS.MakeButton(r, "Unlink", 298, 6, 72, 20, function()
+    r.dirDD = UI.MakeDropdown(r, {
+        width = 92, choices = { "Right", "Left", "Down", "Up" },
+        get = function() local c = r._cfg(); return c and cap(c.dir or "right") or "Right" end,
+        set = function(v) local c = r._cfg(); if c then c.dir = v:lower() end end,
+    })
+    r.dirDD:ClearAllPoints(); r.dirDD:SetPoint("LEFT", r, "LEFT", WW_DIR_X, 0)
+    r.perDD = UI.MakeDropdown(r, {
+        width = 50, choices = PERROW,
+        get = function() local c = r._cfg(); return c and tostring(c.perRow or 5) or "5" end,
+        set = function(v) local c = r._cfg(); if c then c.perRow = tonumber(v) end end,
+    })
+    r.perDD:ClearAllPoints(); r.perDD:SetPoint("LEFT", r, "LEFT", WW_PER_X, 0)
+
+    r.remove = UI.MakeButton(r, { text = "Remove", width = 78, variant = "danger", onClick = function()
+        if r._slotId then Addon:RemoveSlotPopout(r._slotId) end
+    end })
+    r.remove:ClearAllPoints(); r.remove:SetPoint("RIGHT", r, "RIGHT", -4, 0)
+    r.unlink = UI.MakeButton(r, { text = "Unlink", width = 72, variant = "quiet", onClick = function()
         if r._slotId then Addon:ReleasePopoutAnchor(r._slotId) end
-    end)
+    end })
+    r.unlink:ClearAllPoints(); r.unlink:SetPoint("RIGHT", r.remove, "LEFT", -6, 0)
     r.unlink:SetScript("OnEnter", function(self)
         GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
         GameTooltip:AddLine("Release this widget's anchor", 1, 1, 1); GameTooltip:Show()
     end)
     r.unlink:SetScript("OnLeave", function() GameTooltip:Hide() end)
-    r.remove = DS.MakeButton(r, "Remove", 376, 6, 78, 20, function()
-        if r._slotId then Addon:RemoveSlotPopout(r._slotId) end
-    end)
+
+    UI.Skin(r, function() r.bg:SetColorTexture(UI.Color(r._even and "raised" or "panel", 0.6)) end)
     return r
 end
 
-function Addon:BuildWidgetsTab(f)
-    local DS = _G.DaseekiSuite
-    DS.MakeSectionHeader(f, "Item Slot Widgets", 4, 8, 460)
-    DS.MakeLabel(f, "Alt+left-click a slot on the character pane, or add one below. Drag a", nil, 4, 36)
-    DS.MakeLabel(f, "widget next to another to anchor it (the dock side glows).", nil, 4, 54)
-    DS.MakeCheckbox(f, "Lock all widget positions", 6, 78,
-        function() return Addon.db.settings.slotPopouts.locked end,
-        function(v) Addon.db.settings.slotPopouts.locked = v and true or false end)
-    DS.MakeLabel(f, "Widget scale", nil, 250, 74)
-    local sc = DS.MakeSlider(f, 332, 80, 112, nil, 0.5, 2, 0.05,
-        function() return Addon.db.settings.slotPopouts.scale or 1 end,
-        function(v) Addon:SetPopoutScale(v) end,
-        function(v) return string.format("%.2f", v) end)
-    if sc._valLbl then sc._valLbl:ClearAllPoints(); sc._valLbl:SetPoint("TOP", sc, "BOTTOM", 0, -1) end
+function Addon:BuildWidgetsTab(flow)
+    local UI = DaseekiUI
+    flow:AddSection("Item Slot Widgets")
+    flow:Hint("Alt+left-click a slot on the character pane, or add one below. Drag a widget next to another to anchor it (the dock side glows).")
+
+    flow:Checkbox({
+        label = "Lock all widget positions",
+        get = function() return Addon.db.settings.slotPopouts.locked end,
+        set = function(v) Addon.db.settings.slotPopouts.locked = v and true or false end,
+    })
+    flow:AddRow():Slider({
+        label = "Widget scale", width = 200, min = 0.5, max = 2, step = 0.05,
+        get = function() return Addon.db.settings.slotPopouts.scale or 1 end,
+        set = function(v) Addon:SetPopoutScale(v) end,
+        format = function(v) return string.format("%.2f", v) end,
+    })
 
     local slotNames, nameToId = {}, {}
     for _, s in ipairs(Addon.SLOTS) do slotNames[#slotNames + 1] = s.name; nameToId[s.name] = s.id end
-    DS.MakeLabel(f, "Add widget for slot:", nil, 6, 116)
-    local addDD = DS.MakeSimpleDropdown(f, 150, 112, 150, slotNames, nil)
-    addDD:SetValue(Addon.SLOTS[1].name)
-    DS.MakeButton(f, "Add", 308, 112, 60, 22, function()
-        local sid = nameToId[addDD:GetValue()]
+    flow._addSel = Addon.SLOTS[1].name
+    local addRow = flow:AddRow()
+    local addLbl = addRow:Label("Add widget for slot:"); addLbl.uiWidth = 130; addLbl:SetWidth(130)
+    addRow:Dropdown({
+        width = 160, choices = slotNames,
+        get = function() return flow._addSel or Addon.SLOTS[1].name end,
+        set = function(v) flow._addSel = v end,
+    })
+    addRow:Button({ text = "Add", width = 64, onClick = function()
+        local sid = nameToId[flow._addSel or Addon.SLOTS[1].name]
         if sid and not Addon.db.settings.slotPopouts.buttons[sid] then Addon:ShowSlotPopout(sid) end
         Addon:RefreshWidgetsTab()
-    end)
+    end })
 
-    DS.MakeLabel(f, "Slot",      nil, 12,  142)
-    DS.MakeLabel(f, "Direction", nil, 150, 142)
-    DS.MakeLabel(f, "Per row",   nil, 250, 142)
-    DS.MakeSeparator(f, 4, 152, 460)
+    -- column header + rule (full width, aligned with the list rows below)
+    local hdr = flow:AddRow()
+    local hh1 = hdr:Label("Slot", { muted = true });      hh1.uiWidth = WW_DIR_X - 8; hh1:SetWidth(WW_DIR_X - 8)
+    local hh2 = hdr:Label("Direction", { muted = true }); hh2.uiWidth = WW_PER_X - WW_DIR_X; hh2:SetWidth(WW_PER_X - WW_DIR_X)
+    hdr:Label("Per row", { muted = true })
+    flow:AddSeparator()
 
-    f.empty = f:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-    f.empty:SetPoint("TOPLEFT", f, "TOPLEFT", 12, -(W_ROW_Y0 + 8))
-    f.empty:SetText("No widgets yet — add one above or alt+left-click a slot.")
-    f.empty:Hide()
-    f.rows = {}
+    -- dynamic list host — its arrange stacks the rows and returns total height;
+    -- RefreshWidgetsTab repopulates the row data then calls flow.pane:Layout().
+    local host = CreateFrame("Frame", nil, flow.pane.child)
+    host._fillWidth = true
+    host._rows = {}
+    host._list = {}
+    host.empty = host:CreateFontString(nil, "OVERLAY")
+    host.empty:SetFontObject(F_SMALL)
+    host.empty:SetPoint("TOPLEFT", host, "TOPLEFT", 0, 0)
+    host.empty:SetText("No widgets yet — add one above or alt+left-click a slot.")
+    host.empty:Hide()
+    host.arrange = function(width)
+        host:SetWidth(width)
+        local list = host._list
+        if #list == 0 then
+            host.empty:Show()
+            return 18
+        end
+        host.empty:Hide()
+        for i, r in ipairs(host._rows) do
+            if i <= #list then
+                r:ClearAllPoints()
+                r:SetPoint("TOPLEFT",  host, "TOPLEFT",  0, -(i - 1) * W_ROW_H)
+                r:SetPoint("TOPRIGHT", host, "TOPRIGHT", 0, -(i - 1) * W_ROW_H)
+                r:Show()
+            else
+                r:Hide()
+            end
+        end
+        return #list * W_ROW_H
+    end
+    addBlock(flow, host, host.arrange, rowGap())
+    flow._listHost = host
+
+    Addon:RefreshWidgetsTab()
 end
 
 function Addon:RefreshWidgetsTab()
-    local f = Addon.frames and Addon.frames.widgets
-    if not f or not f.rows then return end
+    local flow = Addon.frames and Addon.frames.widgets
+    if not (flow and flow._listHost) then return end
+    local UI = DaseekiUI
+    local host = flow._listHost
     local list = {}
     for _, sid in ipairs(Addon.SLOT_IDS) do
         if Addon.db.settings.slotPopouts.buttons[sid] then list[#list + 1] = sid end
     end
-    for _, r in ipairs(f.rows) do r:Hide() end
+    host._list = list
     for i, sid in ipairs(list) do
-        local r = f.rows[i] or makeWidgetRow(f, i)
-        f.rows[i] = r
+        local r = host._rows[i] or makeWidgetRow(host)
+        host._rows[i] = r
         r._slotId = sid
+        r._even = (i % 2 == 0)
+        r.bg:SetColorTexture(UI.Color(r._even and "raised" or "panel", 0.6))
         r.icon:SetTexture(GetInventoryItemTexture("player", sid) or slotEmptyTex(sid))
         r.label:SetText(slotName(sid))
         local cfg = Addon.db.settings.slotPopouts.buttons[sid]
-        r.dirDD:SetValue(cap(cfg.dir or "right"))
-        r.perDD:SetValue(tostring(cfg.perRow or 5))
+        r.dirDD.Refresh(); r.perDD.Refresh()
         r.unlink:SetEnabled(cfg.anchor ~= nil)
-        r:Show()
     end
-    f.empty:SetShown(#list == 0)
+    flow.pane:Layout()
 end
 
 -- ── Refresh (Sets tab) ────────────────────────────────────────────────────────
 function Addon:RefreshSetList()
     local panel = Addon.panel
     if not panel or not panel.listChild then return end
+    local UI = DaseekiUI
     local sets = Addon:GetSetsSorted()
     if not panel.selectedSet or not Addon.db.sets[panel.selectedSet] then
         panel.selectedSet = sets[1] and sets[1].name or nil
     end
+    panel.rows = panel.rows or {}
     for _, r in ipairs(panel.rows) do r:Hide() end
     for i, set in ipairs(sets) do
         local r = panel.rows[i]
         if not r then
             r = CreateFrame("Button", nil, panel.listChild)
-            r:SetSize(L_W - 24, 28)
+            r:SetHeight(SET_ROW_H)
             r.bg = r:CreateTexture(nil, "BACKGROUND"); r.bg:SetAllPoints()
-            r.sel = r:CreateTexture(nil, "BACKGROUND"); r.sel:SetAllPoints()
-            r.sel:SetColorTexture(0.2, 0.4, 0.8, 0.5); r.sel:Hide()
+            r.sel = r:CreateTexture(nil, "BACKGROUND"); r.sel:SetAllPoints(); r.sel:Hide()
             r.icon = r:CreateTexture(nil, "ARTWORK"); r.icon:SetSize(22, 22)
-            r.icon:SetPoint("LEFT", 4, 0); r.icon:SetTexCoord(0.07, 0.93, 0.07, 0.93)
-            r.label = r:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+            r.icon:SetPoint("LEFT", r, "LEFT", 4, 0); r.icon:SetTexCoord(0.07, 0.93, 0.07, 0.93)
+            r.label = r:CreateFontString(nil, "OVERLAY"); r.label:SetFontObject(F_BODY)
             r.label:SetPoint("LEFT", r.icon, "RIGHT", 6, 0); r.label:SetWidth(96); r.label:SetJustifyH("LEFT")
-            r.keyText = r:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-            r.keyText:SetPoint("RIGHT", r, "RIGHT", -4, 0); r.keyText:SetJustifyH("RIGHT")
-            r.keyText:SetTextColor(0.7, 0.85, 1)
-            local hl = r:CreateTexture(nil, "HIGHLIGHT"); hl:SetAllPoints(); hl:SetColorTexture(1, 1, 1, 0.1)
+            r.keyText = r:CreateFontString(nil, "OVERLAY"); r.keyText:SetFontObject(F_SMALL)
+            r.keyText:SetPoint("RIGHT", r, "RIGHT", -6, 0); r.keyText:SetJustifyH("RIGHT")
+            local hl = r:CreateTexture(nil, "HIGHLIGHT"); hl:SetAllPoints()
+            UI.Skin(hl, function(self) self:SetColorTexture(UI.Color("accent", 0.10)) end)
             r:SetScript("OnClick", function(self) panel.selectedSet = self._name; Addon:RefreshOptions() end)
-            -- drag to reorder (cursor-position polling — see setup above)
+            -- drag to reorder (cursor-position polling — see buildSetList)
             r:SetScript("OnMouseDown", function(self, btn)
                 if btn ~= "LeftButton" then return end
                 panel._dragSourceName = self._name
@@ -757,16 +934,21 @@ function Addon:RefreshSetList()
             end)
             panel.rows[i] = r
         end
-        r:SetPoint("TOPLEFT", panel.listChild, "TOPLEFT", 0, -(i - 1) * 28)
-        local shade = (i % 2 == 0) and 0.12 or 0.08
-        r.bg:SetColorTexture(shade, shade, shade, 0.7)
+        r:ClearAllPoints()
+        r:SetPoint("TOPLEFT",  panel.listChild, "TOPLEFT",  0, -(i - 1) * SET_ROW_H)
+        r:SetPoint("TOPRIGHT", panel.listChild, "TOPRIGHT", 0, -(i - 1) * SET_ROW_H)
+        r._even = (i % 2 == 0)
+        r.bg:SetColorTexture(UI.Color(r._even and "raised" or "panel", 0.7))
+        r.sel:SetColorTexture(UI.Color("accent", 0.28))
         r.icon:SetTexture(set.icon or Addon.DEFAULT_ICON)
         r.label:SetText(set.name); r._name = set.name
+        r.label:SetTextColor(UI.Color(panel.selectedSet == set.name and "accent" or "text"))
         r.keyText:SetText(set.key or "")
+        r.keyText:SetTextColor(UI.Color("muted"))
         r.sel:SetShown(panel.selectedSet == set.name)
         r:Show()
     end
-    panel.listChild:SetHeight(math.max(1, #sets * 28))
+    panel.listChild:SetHeight(math.max(1, #sets * SET_ROW_H))
 end
 
 function Addon:RefreshSetModel()
@@ -803,11 +985,17 @@ function Addon:RefreshBuilder()
     local set = panel.selectedSet and Addon.db.sets[panel.selectedSet]
 
     if panel.iconBtn then panel.iconBtn.icon:SetTexture((set and set.icon) or Addon.DEFAULT_ICON) end
-    if panel.nameEB and not panel.nameEB:HasFocus() then panel.nameEB:SetText(panel.selectedSet or "") end
-    if panel.kbBtn then panel.kbBtn:SetText("Keybind: " .. ((set and set.key) or "\194\183")) end
+    if panel.nameEB and panel.nameEB.editBox and not panel.nameEB.editBox:HasFocus() then
+        panel.nameEB.Refresh()
+    end
+    if panel.kbBtn and panel.kbBtn._label then
+        panel.kbBtn._label:SetText("Keybind: " .. ((set and set.key) or "\194\183"))
+    end
 
     local goalMode = panel.goalMode and set ~= nil
-    if panel.goalsBtn then panel.goalsBtn:SetText(goalMode and "Done (Goals)" or "Set Goals") end
+    if panel.goalsBtn and panel.goalsBtn._label then
+        panel.goalsBtn._label:SetText(goalMode and "Done (Goals)" or "Set Goals")
+    end
 
     for slotId, b in pairs(panel.slotButtons) do
         local entry    = set and set.equip[slotId]
@@ -875,14 +1063,15 @@ function Addon:RegisterOptions()
         order   = 40,
         sections = {
             { id = "sets",    title = "Sets",
-              build = function(f) Addon:BuildSetsSection(f) end,
+              build = function(flow) Addon:BuildSetsSection(flow) end,
               refresh = function() Addon:RefreshOptions() end },
             { id = "swapper", title = "Set Swapper",
-              build = function(f) Addon:BuildSwapperSection(f) end },
+              build = function(flow) Addon:BuildSwapperSection(flow) end,
+              refresh = function() Addon:RefreshSwapperTab() end },
             { id = "charwin", title = "Character Window",
-              build = function(f) Addon:BuildCharWindowSection(f) end },
+              build = function(flow) Addon:BuildCharWindowSection(flow) end },
             { id = "widgets", title = "Item Slot Widgets",
-              build = function(f) Addon:BuildWidgetsSection(f) end,
+              build = function(flow) Addon:BuildWidgetsSection(flow) end,
               refresh = function() Addon:RefreshWidgetsTab() end },
         },
     })
