@@ -49,6 +49,10 @@ local WPN_GAP     = 12   -- vertical gap above the weapons row
 local WPN_XGAP    = 8    -- horizontal gap between weapon slots
 local GOAL_SZ     = 22   -- goal "chase list" button size
 local W_ROW_H     = 30   -- item-slot-widget list row height
+local PD_W        = 560  -- fixed paper-doll builder band width (centered in content)
+local SPLIT_MIN   = 860  -- effective content width to switch Sets to two-pane layout
+local SPLIT_LEFT  = 300  -- set-list column width in two-pane mode
+local SPLIT_GAP   = 16   -- gap between the two Sets columns
 
 -- Shared re-tinting FontObjects created by DaseekiUI (theme.lua). Referencing the
 -- global names keeps custom FontStrings themed — they re-color on ThemeChanged.
@@ -288,6 +292,14 @@ local function buildSetList(flow, panel)
     end)
     panel.listChild, panel.listScroll = child, scroll
 
+    -- Empty-state line (shown by RefreshSetList when there are no sets).
+    host.empty = host:CreateFontString(nil, "OVERLAY")
+    host.empty:SetFontObject(F_SMALL)
+    host.empty:SetPoint("TOPLEFT", host, "TOPLEFT", LIST_INSET + 4, -(LIST_INSET + 6))
+    host.empty:SetText("No sets yet — click New")
+    host.empty:Hide()
+    panel.listEmpty = host.empty
+
     -- Drag-to-reorder: a plain drag/release between two Buttons never fires
     -- OnReceiveDrag (that only fires for cursor-item drops) and GetMouseFocus is
     -- unreliable here, so poll cursor position instead — same pattern as
@@ -496,15 +508,18 @@ local function buildPaperdoll(flow, panel)
         if slotDef.col == "L" or slotDef.col == "R" or slotDef.col == "W" then makeSlot(slotDef) end
     end
 
-    -- Width-relative arrange: left column at the left edge, right column pinned to
-    -- the right edge, model centered between; weapons centered across the bottom.
+    -- Composed arrange: a fixed-width builder band (PD_W) centered within the content
+    -- width. Columns anchor to the band edges (never the pane edges); model centered
+    -- in the band; weapons centered across the bottom. Reflows with the content width.
     pd.arrange = function(width)
         pd:SetWidth(width)
-        local colH = COL_ROWS * SLOT_STEP
+        local inner = math.min(PD_W, width)          -- fixed band, clamped to available
+        local ox    = math.max(0, (width - inner) / 2)   -- left offset that centers it
+        local colH  = COL_ROWS * SLOT_STEP
         local bodyH = math.max(colH, MODEL_H)
 
         model:ClearAllPoints()
-        model:SetPoint("TOP", pd, "TOP", 0, 0)
+        model:SetPoint("TOP", pd, "TOPLEFT", ox + inner / 2, 0)   -- centered in the band
 
         local li, ri = 0, 0
         for _, slotDef in ipairs(Addon.SLOTS) do
@@ -512,16 +527,16 @@ local function buildPaperdoll(flow, panel)
             if b then
                 b:ClearAllPoints()
                 if slotDef.col == "L" then
-                    b:SetPoint("TOPLEFT", pd, "TOPLEFT", 0, -(li * SLOT_STEP)); li = li + 1
+                    b:SetPoint("TOPLEFT", pd, "TOPLEFT", ox, -(li * SLOT_STEP)); li = li + 1
                 elseif slotDef.col == "R" then
-                    b:SetPoint("TOPRIGHT", pd, "TOPRIGHT", 0, -(ri * SLOT_STEP)); ri = ri + 1
+                    b:SetPoint("TOPLEFT", pd, "TOPLEFT", ox + inner - SLOT_SZ, -(ri * SLOT_STEP)); ri = ri + 1
                 end
             end
         end
 
         local weapons = { 16, 17, 18 }
         local totalW = #weapons * SLOT_SZ + (#weapons - 1) * WPN_XGAP
-        local startX = math.max(0, (width - totalW) / 2)
+        local startX = ox + math.max(0, (inner - totalW) / 2)
         local wy = bodyH + WPN_GAP
         for idx, sid in ipairs(weapons) do
             local b = panel.slotButtons[sid]
@@ -542,27 +557,39 @@ function Addon:BuildSetsTab(flow)
     local UI = DaseekiUI
     local panel = Addon.panel
 
-    -- ── Left half: set list + management ──────────────────────────────────────
-    flow:AddSection("Armory Sets")
-    local listHost = buildSetList(flow, panel)
-    addBlock(flow, listHost, listHost.arrange, rowGap())
+    -- Two-pane composition: one split block hosts a left column (the set list +
+    -- management) and a right column (the set builder). They render side-by-side when
+    -- the effective content width >= SPLIT_MIN, and stack vertically below that. The
+    -- split re-arranges automatically on pane resize (the outer pane re-runs its
+    -- arrange), and each column sizes itself to its content (the outer pane scrolls).
+    local split = CreateFrame("Frame", nil, flow.pane.child)
+    local leftCol  = UI.CreateColumn(split)
+    local rightCol = UI.CreateColumn(split)
+    panel.leftCol, panel.rightCol = leftCol, rightCol
+    local L, R = leftCol.flow, rightCol.flow
 
-    -- New / Duplicate / Rename / Delete
-    local crud = flow:AddRow()
-    crud:Button({ text = "New", width = 91, onClick = function()
+    -- ── Left column: set list (own scroll + empty state) + management ─────────
+    L:AddSection("Armory Sets")
+    local listHost = buildSetList(L, panel)
+    addBlock(L, listHost, listHost.arrange, rowGap())
+
+    -- New / Duplicate / Rename / Delete — two rows of two so they fit the ~300px column.
+    local crud1 = L:AddRow()
+    crud1:Button({ text = "New", width = 142, onClick = function()
         _G.DaseekiSuite.ShowNameInputDialog("New Set", "", function(v)
             local ok, err = Addon:CreateSet(v)
             if ok then panel.selectedSet = v; Addon:RefreshOptions(); Addon:RefreshWidget()
             else print("|cff66ccffArmory|r " .. tostring(err)) end
         end)
     end })
-    crud:Button({ text = "Duplicate", width = 91, onClick = function()
+    crud1:Button({ text = "Duplicate", width = 142, onClick = function()
         if not panel.selectedSet then return end
         local ok, res = Addon:DuplicateSet(panel.selectedSet)
         if ok then panel.selectedSet = res; Addon:RefreshOptions(); Addon:RefreshWidget()
         else print("|cff66ccffArmory|r " .. tostring(res)) end
     end })
-    crud:Button({ text = "Rename", width = 91, onClick = function()
+    local crud2 = L:AddRow()
+    crud2:Button({ text = "Rename", width = 142, onClick = function()
         if not panel.selectedSet then return end
         _G.DaseekiSuite.ShowNameInputDialog("Rename Set", panel.selectedSet, function(v)
             local ok, err = Addon:RenameSet(panel.selectedSet, v)
@@ -570,13 +597,13 @@ function Addon:BuildSetsTab(flow)
             else print("|cff66ccffArmory|r " .. tostring(err)) end
         end)
     end })
-    crud:Button({ text = "Delete", width = 91, onClick = function()
+    crud2:Button({ text = "Delete", width = 142, onClick = function()
         if panel.selectedSet then StaticPopup_Show("DASEEKI_ARMORY_DELETE", panel.selectedSet, nil, panel.selectedSet) end
     end })
 
-    flow:AddSeparator()
-    flow:Hint("Clone to another character")
-    local io1 = flow:AddRow()
+    L:AddSeparator()
+    L:Hint("Clone to another character")
+    local io1 = L:AddRow()
     io1:Button({ text = "Export Sets", width = 110, onClick = function()
         _G.DaseekiSuite.ShowTextDialog("Export Armory Sets", Addon:ExportSets(), true)
     end })
@@ -588,24 +615,24 @@ function Addon:BuildSetsTab(flow)
             else print("|cff66ccffArmory|r " .. tostring(res)) end
         end)
     end })
-    flow:AddRow():Button({ text = "Import from ItemRack", width = 230, onClick = function()
+    L:AddRow():Button({ text = "Import from ItemRack", width = 230, onClick = function()
         local n = Addon:CountItemRackSets()
         if n == 0 then print("|cff66ccffArmory|r no ItemRack sets found — make sure ItemRack is enabled."); return end
         StaticPopup_Show("DASEEKI_ARMORY_IRIMPORT", n)
     end })
 
-    -- ── Right half: set builder ───────────────────────────────────────────────
-    flow:AddSection("Set Builder")
-    flow:Label("Set name", { muted = true })
+    -- ── Right column: set builder ─────────────────────────────────────────────
+    R:AddSection("Set Builder")
+    R:Label("Set name", { muted = true })
 
     -- icon button + name edit box on one row
-    local headRow = flow:AddRow()
+    local headRow = R:AddRow()
     local iconBtn = CreateFrame("Button", nil, headRow, "BackdropTemplate")
     iconBtn:SetSize(46, 46)
     UI.Skin(iconBtn, function(self)
         self:SetBackdrop(UI.FLAT_BACKDROP)
         self:SetBackdropColor(UI.Color("inset"))
-        self:SetBackdropBorderColor(UI.Color("borderLite"))
+        self:SetBackdropBorderColor(UI.Color("controlBorder"))
     end)
     iconBtn.icon = iconBtn:CreateTexture(nil, "ARTWORK")
     iconBtn.icon:SetPoint("TOPLEFT", IB, -IB)
@@ -644,7 +671,7 @@ function Addon:BuildSetsTab(flow)
     })
 
     -- keybind + goals row
-    local kbRow = flow:AddRow()
+    local kbRow = R:AddRow()
     local kbBtn = kbRow:Button({ text = "Keybind: \194\183", width = 170 })
     kbBtn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
     kbBtn:SetScript("OnClick", function(self, button)
@@ -696,11 +723,11 @@ function Addon:BuildSetsTab(flow)
     panel.goalsBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
     -- paper-doll slot grid + model
-    local pd = buildPaperdoll(flow, panel)
-    addBlock(flow, pd, pd.arrange, rowGap())
+    local pd = buildPaperdoll(R, panel)
+    addBlock(R, pd, pd.arrange, rowGap())
 
     -- action buttons
-    local actRow = flow:AddRow()
+    local actRow = R:AddRow()
     panel.saveBtn = actRow:Button({ text = "Populate Current Gear", width = 150, onClick = function()
         if panel.selectedSet then Addon:SaveCurrentGear(panel.selectedSet); Addon:RefreshBuilder() end
     end })
@@ -713,7 +740,36 @@ function Addon:BuildSetsTab(flow)
         end
     end })
 
-    flow:Hint("Hover a slot to choose  \194\183  Right-click: disable  \194\183  Shift+Right: clear")
+    R:Hint("Hover a slot to choose  \194\183  Right-click: disable  \194\183  Shift+Right: clear")
+
+    -- ── Split arrange: side-by-side at >= SPLIT_MIN, stacked below ─────────────
+    split.arrange = function(width)
+        split:SetWidth(width)
+        if width >= SPLIT_MIN then
+            local lw = SPLIT_LEFT
+            local rw = math.max(1, width - lw - SPLIT_GAP)
+            local lh = leftCol:Layout(lw)
+            local rh = rightCol:Layout(rw)
+            leftCol.frame:ClearAllPoints()
+            leftCol.frame:SetPoint("TOPLEFT", split, "TOPLEFT", 0, 0)
+            rightCol.frame:ClearAllPoints()
+            rightCol.frame:SetPoint("TOPLEFT", split, "TOPLEFT", lw + SPLIT_GAP, 0)
+            local total = math.max(lh, rh)
+            split:SetHeight(math.max(total, 1))
+            return total
+        else
+            local lh = leftCol:Layout(width)
+            local rh = rightCol:Layout(width)
+            leftCol.frame:ClearAllPoints()
+            leftCol.frame:SetPoint("TOPLEFT", split, "TOPLEFT", 0, 0)
+            rightCol.frame:ClearAllPoints()
+            rightCol.frame:SetPoint("TOPLEFT", split, "TOPLEFT", 0, -(lh + SPLIT_GAP))
+            local total = lh + SPLIT_GAP + rh
+            split:SetHeight(math.max(total, 1))
+            return total
+        end
+    end
+    addBlock(flow, split, split.arrange, rowGap())
 end
 
 -- ══ Character Window flyouts (per slot) ═══════════════════════════════════════
@@ -905,6 +961,7 @@ function Addon:RefreshSetList()
         panel.selectedSet = sets[1] and sets[1].name or nil
     end
     panel.rows = panel.rows or {}
+    if panel.listEmpty then panel.listEmpty:SetShown(#sets == 0) end
     for _, r in ipairs(panel.rows) do r:Hide() end
     for i, set in ipairs(sets) do
         local r = panel.rows[i]
