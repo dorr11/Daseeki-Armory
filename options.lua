@@ -630,8 +630,10 @@ function Addon:BuildSetsTab(flow)
     R:AddSection("Set Builder")
     R:AddRow({ align = "center" }):Label("Set name", { muted = true })
 
-    -- icon button + name edit box on one row (centered in the builder column)
-    local headRow = R:AddRow({ align = "center" })
+    -- icon button + name edit box on one row (centered in the builder column, and
+    -- vertically centered against each other so the 24px EditBox sits mid-height of
+    -- the 46px icon button instead of tops-aligned).
+    local headRow = R:AddRow({ align = "center", vAlign = "center" })
     local iconBtn = CreateFrame("Button", nil, headRow, "BackdropTemplate")
     iconBtn:SetSize(46, 46)
     UI.Skin(iconBtn, function(self)
@@ -783,33 +785,87 @@ function Addon:BuildSetsTab(flow)
 end
 
 -- ══ Character Window flyouts (per slot) ═══════════════════════════════════════
+-- Two columns mirroring the in-game character pane (Head..Wrist left, Hands..Trinket 2
+-- right, per Addon.SLOTS col "L"/"R"), with the weapons (col "W") as a centered group
+-- beneath. Built from UI.CreateColumn (the round-3 two-column primitive); the pane
+-- still scrolls if the rows are taller than the window.
+local CW_SLOT_W, CW_DIR_W, CW_PER_W = 150, 110, 70
+local CW_COL_W = CW_SLOT_W + CW_DIR_W + CW_PER_W + 30   -- row content + inter-item gaps
+local CW_COL_GAP = 24                                    -- gap between the two columns
+
+-- Header row (Slot / Direction / Per row) for a column flow.
+local function charWinHeader(cflow)
+    local hdr = cflow:AddRow()
+    local h1 = hdr:Label("Slot", { muted = true });      h1.uiWidth = CW_SLOT_W; h1:SetWidth(CW_SLOT_W)
+    local h2 = hdr:Label("Direction", { muted = true }); h2.uiWidth = CW_DIR_W;  h2:SetWidth(CW_DIR_W)
+    hdr:Label("Per row", { muted = true })
+    cflow:AddSeparator()
+end
+
+-- One flyout config row (icon+name lead, Direction dropdown, Per-row dropdown).
+local function charWinRow(cflow, sid)
+    local row = cflow:AddRow()
+    local lead = slotLead(row, sid, CW_SLOT_W)
+    row._items[#row._items + 1] = { w = lead }
+    row:Dropdown({
+        width = CW_DIR_W, choices = { "Right", "Left", "Down", "Up" },
+        get = function() return cap(Addon:GetFlyoutConfig(sid).dir) end,
+        set = function(v) Addon:GetFlyoutConfig(sid).dir = v:lower() end,
+    })
+    row:Dropdown({
+        width = CW_PER_W, choices = PERROW,
+        get = function() return tostring(Addon:GetFlyoutConfig(sid).perRow) end,
+        set = function(v) Addon:GetFlyoutConfig(sid).perRow = tonumber(v) end,
+    })
+end
+
 function Addon:BuildCharWindowTab(flow)
+    local UI = DaseekiUI
     flow:AddSection("Character Window Flyouts")
     flow:Hint("Item flyout shown when you hover an equipped slot on the character pane.")
 
-    local SLOT_W, DIR_W, PER_W = 150, 110, 70
-    local hdr = flow:AddRow()
-    local h1 = hdr:Label("Slot", { muted = true });      h1.uiWidth = SLOT_W; h1:SetWidth(SLOT_W)
-    local h2 = hdr:Label("Direction", { muted = true }); h2.uiWidth = DIR_W;  h2:SetWidth(DIR_W)
-    hdr:Label("Per row", { muted = true })
-    flow:AddSeparator()
-
+    -- Two side-by-side columns (armor), one split block so they share an arrange.
+    local split = CreateFrame("Frame", nil, flow.pane.child)
+    local leftCol  = UI.CreateColumn(split)
+    local rightCol = UI.CreateColumn(split)
+    charWinHeader(leftCol.flow); charWinHeader(rightCol.flow)
     for _, s in ipairs(Addon.SLOTS) do
-        local sid = s.id
-        local row = flow:AddRow()
-        local lead = slotLead(row, sid, SLOT_W)
-        row._items[#row._items + 1] = { w = lead }
-        row:Dropdown({
-            width = DIR_W, choices = { "Right", "Left", "Down", "Up" },
-            get = function() return cap(Addon:GetFlyoutConfig(sid).dir) end,
-            set = function(v) Addon:GetFlyoutConfig(sid).dir = v:lower() end,
-        })
-        row:Dropdown({
-            width = PER_W, choices = PERROW,
-            get = function() return tostring(Addon:GetFlyoutConfig(sid).perRow) end,
-            set = function(v) Addon:GetFlyoutConfig(sid).perRow = tonumber(v) end,
-        })
+        if     s.col == "L" then charWinRow(leftCol.flow,  s.id)
+        elseif s.col == "R" then charWinRow(rightCol.flow, s.id) end
     end
+    split.arrange = function(width)
+        split:SetWidth(width)
+        local colW = math.max(1, math.min(CW_COL_W, (width - CW_COL_GAP) / 2))
+        local lh = leftCol:Layout(colW)
+        local rh = rightCol:Layout(colW)
+        leftCol.frame:ClearAllPoints()
+        leftCol.frame:SetPoint("TOPLEFT", split, "TOPLEFT", 0, 0)
+        rightCol.frame:ClearAllPoints()
+        rightCol.frame:SetPoint("TOPLEFT", split, "TOPLEFT", colW + CW_COL_GAP, 0)
+        local total = math.max(lh, rh)
+        split:SetHeight(math.max(total, 1))
+        return total
+    end
+    addBlock(flow, split, split.arrange, rowGap())
+
+    -- Weapons (Main Hand / Off Hand / Ranged) as a centered group beneath the columns.
+    flow:AddSection("Weapons")
+    local wSplit = CreateFrame("Frame", nil, flow.pane.child)
+    local wCol = UI.CreateColumn(wSplit)
+    for _, s in ipairs(Addon.SLOTS) do
+        if s.col == "W" then charWinRow(wCol.flow, s.id) end
+    end
+    wSplit.arrange = function(width)
+        wSplit:SetWidth(width)
+        local colW = math.max(1, math.min(CW_COL_W, width))
+        local wh = wCol:Layout(colW)
+        local ox = math.max(0, (width - colW) / 2)   -- center the group horizontally
+        wCol.frame:ClearAllPoints()
+        wCol.frame:SetPoint("TOPLEFT", wSplit, "TOPLEFT", ox, 0)
+        wSplit:SetHeight(math.max(wh, 1))
+        return wh
+    end
+    addBlock(flow, wSplit, wSplit.arrange, rowGap())
 end
 
 -- ══ Item Slot Widgets (detached popouts) ══════════════════════════════════════
