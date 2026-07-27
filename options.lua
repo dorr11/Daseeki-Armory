@@ -1061,6 +1061,7 @@ function Addon:RegisterOptions()
         title   = "Armory",
         icon    = "Interface\\Icons\\INV_Shield_26",  -- Face of Death
         order   = 40,
+        flow    = true,  -- sections use the DaseekiUI flow API (build(flow)).
         sections = {
             { id = "sets",    title = "Sets",
               build = function(flow) Addon:BuildSetsSection(flow) end,
