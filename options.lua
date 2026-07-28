@@ -1256,6 +1256,10 @@ end
 -- ── Register the section with the Daseeki-Core hub ────────────────────────────
 function Addon:RegisterOptions()
     if not _G.DaseekiSuite then return end
+    if not (_G.DaseekiUI and _G.DaseekiUI.Token) then
+        print("|cff66ccffArmory|r requires Daseeki Core v2.0.0 or newer — please update Daseeki Core.")
+        return
+    end
     DaseekiSuite:RegisterAddon({
         id      = "armory",
         title   = "Armory",
