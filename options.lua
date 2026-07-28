@@ -162,39 +162,69 @@ function Addon:BuildSetSwapperTab(flow)
     local w = Addon.db.settings.widget
 
     flow:AddSection("Set Swapper")
-    flow:Hint("On-screen widget that lets you equip a set with one click.")
+    flow:Hint("One-click set-swap widget.")
 
-    -- Row 1 — Enable / Lock / Chat Messages on ONE aligned row. A default row lays
-    -- them left-to-right at their intrinsic widths (compact run, ~246px < the 292 grid),
-    -- so "Chat Messages" (too wide for a 92px grid column) never overflows. The old
-    -- "Print a message…" hint that stood under Chat Messages no longer has a row of its
-    -- own in the compact layout, so it becomes the checkbox's hover tooltip.
+    -- Row 1 — Enable / Lock / Chat Messages distributed space-between across the
+    -- MGMT_GRID (292): first flush left, last flush right, the middle evenly gapped, so
+    -- the three checkbox columns line up with the three SWAP_DD dropdown columns below.
+    -- "Chat Messages" (too wide for a 92px grid column) is the right-flush item, so it
+    -- never overflows. The old "Print a message…" hint that stood under Chat Messages no
+    -- longer has a row of its own in the compact layout, so it becomes its hover tooltip.
     local cbRow = flow:AddRow()
-    cbRow:Checkbox({
-        label = "Enable",
-        get = function() return Addon.db.settings.widget.show end,
-        set = function(v) Addon:SetWidgetShown(v) end,
-    })
-    cbRow:Checkbox({
-        label = "Lock",
-        get = function() return Addon.db.settings.widget.locked end,
-        set = function(v) Addon.db.settings.widget.locked = v and true or false end,
-    })
-    cbRow:Checkbox({
-        label = "Chat Messages",
-        get = function() return Addon.db.settings.chatMessages end,
-        set = function(v) Addon.db.settings.chatMessages = v and true or false end,
-        tooltip = "Print a message when a set or item swap is queued for after combat.",
-    })
+    local cbItems = {
+        cbRow:Checkbox({
+            label = "Enable",
+            get = function() return Addon.db.settings.widget.show end,
+            set = function(v) Addon:SetWidgetShown(v) end,
+        }),
+        cbRow:Checkbox({
+            label = "Lock",
+            get = function() return Addon.db.settings.widget.locked end,
+            set = function(v) Addon.db.settings.widget.locked = v and true or false end,
+        }),
+        cbRow:Checkbox({
+            label = "Chat Messages",
+            get = function() return Addon.db.settings.chatMessages end,
+            set = function(v) Addon.db.settings.chatMessages = v and true or false end,
+            tooltip = "Print a message when a set or item swap is queued for after combat.",
+        }),
+    }
+    -- The flow row API has only a left run / centered run / right-pin — no space-between —
+    -- so distribute this row ourselves by overriding its block arrange (the same
+    -- reach-into-the-last-block pattern used for the header→dropdown gap just below).
+    -- Both frame dimensions are set; no negative-y offsets.
+    flow.pane.blocks[#flow.pane.blocks].arrange = function(width)
+        cbRow:SetWidth(math.max(width, 1))
+        local span = math.min(MGMT_GRID, width)   -- distribute within the 292 grid, not the wider column
+        local totalW, h = 0, 0
+        for _, cb in ipairs(cbItems) do
+            totalW = totalW + (cb.uiWidth or cb:GetWidth())
+            h = math.max(h, cb.uiHeight or cb:GetHeight())
+        end
+        local n = #cbItems
+        local gap = (n > 1) and math.max(0, (span - totalW) / (n - 1)) or 0
+        local x = 0
+        for _, cb in ipairs(cbItems) do
+            local ww = cb.uiWidth or cb:GetWidth()
+            cb:ClearAllPoints()
+            cb:SetPoint("LEFT", cbRow, "LEFT", x, 0)
+            cb:SetWidth(ww)
+            x = x + ww + gap
+        end
+        cbRow:SetHeight(math.max(h, 1))
+        return math.max(h, 1)
+    end
 
     -- Row 2 — Open On / Display Mode / Tooltips as three equal ~92px columns sharing
     -- the management grid's edges: a muted-small header row over a row of unlabeled
-    -- dropdowns. Header labels are sized to the column width so each sits over its own
-    -- dropdown (same pattern as the char-window flyout column headers).
+    -- dropdowns. Each header label fills its 92px column and center-justifies, so it sits
+    -- centered over its own dropdown (same pattern as the char-window flyout headers).
     local ddHdr = flow:AddRow()
     local function ddHcell(text)
         local lb = ddHdr:Label(text, { muted = true })
         lb._label:SetFontObject(F_SMALL)
+        lb._label:SetWidth(SWAP_DD)          -- fill the 92px column so the text can center in it
+        lb._label:SetJustifyH("CENTER")      -- center each header over its own dropdown
         lb.uiWidth = SWAP_DD; lb:SetWidth(SWAP_DD)
         return lb
     end
@@ -784,7 +814,9 @@ function Addon:BuildSetsTab(flow)
         end
     end })
 
-    R:Hint("Hover a slot to choose  \194\183  Right-click: disable  \194\183  Shift+Right: clear")
+    -- Centered under the centered action-button row above (default hints left-align).
+    local builderHint = R:Hint("Hover a slot to choose  \194\183  Right-click: disable  \194\183  Shift+Right: clear")
+    builderHint._label:SetJustifyH("CENTER")
 
     -- ── Split arrange: side-by-side at >= SPLIT_MIN ───────────────────────────
     -- The hub minimum window width (Core MIN_W=1140) guarantees the composed content
