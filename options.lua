@@ -900,6 +900,16 @@ function Addon:BuildCharWindowTab(flow)
     flow:AddSection("Character Window Flyouts")
     flow:Hint("Item flyout shown when you hover an equipped slot on the character pane.")
 
+    flow:Checkbox({
+        label   = "Quality borders on equipped slots",
+        get     = function() return Addon.db.settings.charWindow.qualityBorders end,
+        set     = function(v)
+            Addon.db.settings.charWindow.qualityBorders = v and true or false
+            if Addon.UpdateSlotBorders then Addon:UpdateSlotBorders() end
+        end,
+        tooltip = "Color the character-sheet item borders (and flyout entries) by item quality. Uncommon and above only.",
+    })
+
     -- Two side-by-side columns (armor), one split block so they share an arrange.
     local split = CreateFrame("Frame", nil, flow.pane.child)
     local leftCol  = UI.CreateColumn(split)
@@ -1270,6 +1280,9 @@ function Addon:RegisterOptions()
             { id = "sets",    title = "Sets",
               build = function(flow) Addon:BuildSetsSection(flow) end,
               refresh = function() Addon:RefreshOptions() end },
+            { id = "stats",   title = "Stats",
+              build = function(flow) Addon:BuildStatsSection(flow) end,
+              refresh = function() Addon:RefreshStatsTab() end },
             { id = "charwin", title = "Character Window",
               build = function(flow) Addon:BuildCharWindowSection(flow) end },
             { id = "widgets", title = "Item Slot Widgets",

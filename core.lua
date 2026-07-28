@@ -84,6 +84,16 @@ local DEFAULT_DB = {
             scale   = 1,
             buttons = {},  -- [slotId] = { point, relPoint, x, y, dir, perRow, anchor }
         },
+        -- Phase-4 hardening (all additive; ApplyDefaults leaves existing keys untouched)
+        stats = {
+            attach = false,            -- dock the stats panel to the character window
+        },
+        trinkets = {
+            showCooldowns = true,      -- cooldown spiral/text on the trinket slots + flyout
+        },
+        charWindow = {
+            qualityBorders = true,     -- quality-colored borders on equipped-slot buttons
+        },
     },
 }
 
@@ -126,6 +136,9 @@ function Addon:OnLogin()
     if Addon.InitTooltip     then Addon:InitTooltip()     end
     if Addon.InitPaperdoll   then Addon:InitPaperdoll()   end
     if Addon.InitSlotPopouts then Addon:InitSlotPopouts() end
+    if Addon.InitStats     then Addon:InitStats()     end
+    if Addon.InitTrinkets  then Addon:InitTrinkets()  end
+    if Addon.InitBorders   then Addon:InitBorders()   end
     if Addon.ApplySetBindings then Addon:ApplySetBindings() end
     if Addon.InitGoals then Addon:InitGoals() end
     if Addon.WarmGoalItems then C_Timer.After(5, function() Addon:WarmGoalItems() end) end

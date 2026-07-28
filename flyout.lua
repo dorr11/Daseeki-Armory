@@ -12,6 +12,21 @@
 
 local _, Addon = ...
 
+-- Flyout decorator registry (additive, opt-in): other modules stamp extra visuals on
+-- each shown flyout button — trinket cooldown text, quality borders — without this
+-- file knowing about them. Each decorator is called per shown button with
+-- (button, item-or-nil, slotId); errors surface via geterrorhandler (never swallowed).
+Addon._flyoutDecorators = Addon._flyoutDecorators or {}
+function Addon:AddFlyoutDecorator(fn)
+    Addon._flyoutDecorators[#Addon._flyoutDecorators + 1] = fn
+end
+local function runDecorators(btn, item, slotId)
+    for _, fn in ipairs(Addon._flyoutDecorators) do
+        local ok, err = pcall(fn, btn, item, slotId)
+        if not ok then geterrorhandler()(err) end
+    end
+end
+
 local ICON, PAD, MARGIN = 32, 3, 6
 local MAX_ROWS = 8
 local UNEQUIP_TEX = "Interface\\Buttons\\UI-GroupLoot-Pass-Up"  -- red X = take off / remove
@@ -171,6 +186,7 @@ local function ensure()
                     b.icon:SetDesaturated(false)
                     b._link, b._item, b._unequip = nil, nil, true
                 end
+                runDecorators(b, b._item, self._slotId)
                 b:Show()
             end
         end
