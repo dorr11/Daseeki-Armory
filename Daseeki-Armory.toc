@@ -6,7 +6,7 @@
 ## X-Curse-Project-ID: 1592412
 ## SavedVariablesPerCharacter: DaseekiArmoryDB
 ## OptionalDeps: Daseeki-Core, Daseeki-Bags, ItemRack, OPie
-## Version: 1.1.0
+## Version: 1.2.0
 
 core.lua
 itemDB.lua
