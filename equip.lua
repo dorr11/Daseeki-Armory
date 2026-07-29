@@ -12,7 +12,7 @@ local _, Addon = ...
 -- Informational combat-queue chatter — only shown when Chat Messages is enabled.
 function Addon:ChatMsg(text)
     if Addon.db and Addon.db.settings and Addon.db.settings.chatMessages then
-        print("|cff66ccffArmory|r " .. text)
+        print(Addon:Tag() .. " " .. text)
     end
 end
 
@@ -230,7 +230,7 @@ function Addon:FinishEquip(name)
     if Addon.RefreshOptions then Addon:RefreshOptions() end
 
     if #missing > 0 then
-        print("|cff66ccffArmory|r equipped '" .. name .. "' — could not find: " ..
+        print(Addon:Tag() .. " equipped '" .. name .. "' — could not find: " ..
             table.concat(missing, ", "))
     end
 end
@@ -347,7 +347,7 @@ function Addon:UnequipSlot(invSlot)
     end
     local bag, slot = Addon:FindFreeBagSlot()
     if not bag then
-        print("|cff66ccffArmory|r no free bag space to unequip.")
+        print(Addon:Tag() .. " no free bag space to unequip.")
         return
     end
     ClearCursor()
@@ -422,7 +422,7 @@ end
 function Addon:EquipSet(name)
     local set = Addon.db.sets[name]
     if not set then
-        print("|cff66ccffArmory|r set '" .. tostring(name) .. "' doesn't exist.")
+        print(Addon:Tag() .. " set '" .. tostring(name) .. "' doesn't exist.")
         return
     end
     if InCombatLockdown() then

@@ -112,11 +112,11 @@ StaticPopupDialogs["DASEEKI_ARMORY_IRIMPORT"] = {
     OnAccept = function()
         local ok, res = Addon:ImportFromItemRack()
         if ok then
-            print("|cff66ccffArmory|r imported " .. res .. " set(s) from ItemRack.")
+            print(Addon:Tag() .. " imported " ..res .. " set(s) from ItemRack.")
             if Addon.panel then Addon.panel.selectedSet = nil end
             Addon:RefreshOptions(); Addon:RefreshWidget()
         else
-            print("|cff66ccffArmory|r " .. tostring(res))
+            print(Addon:Tag() .. " " ..tostring(res))
         end
     end,
     timeout = 0, whileDead = true, hideOnEscape = true, showAlert = true,
@@ -642,14 +642,14 @@ function Addon:BuildSetsTab(flow)
         _G.DaseekiSuite.ShowNameInputDialog("New Set", "", function(v)
             local ok, err = Addon:CreateSet(v)
             if ok then panel.selectedSet = v; Addon:RefreshOptions(); Addon:RefreshWidget()
-            else print("|cff66ccffArmory|r " .. tostring(err)) end
+            else print(Addon:Tag() .. " " ..tostring(err)) end
         end)
     end })
     crud1:Button({ text = "Duplicate", width = MGMT_BTN, onClick = function()
         if not panel.selectedSet then return end
         local ok, res = Addon:DuplicateSet(panel.selectedSet)
         if ok then panel.selectedSet = res; Addon:RefreshOptions(); Addon:RefreshWidget()
-        else print("|cff66ccffArmory|r " .. tostring(res)) end
+        else print(Addon:Tag() .. " " ..tostring(res)) end
     end })
     local crud2 = L:AddRow()
     crud2:Button({ text = "Rename", width = MGMT_BTN, onClick = function()
@@ -657,7 +657,7 @@ function Addon:BuildSetsTab(flow)
         _G.DaseekiSuite.ShowNameInputDialog("Rename Set", panel.selectedSet, function(v)
             local ok, err = Addon:RenameSet(panel.selectedSet, v)
             if ok then panel.selectedSet = v; Addon:RefreshOptions(); Addon:RefreshWidget()
-            else print("|cff66ccffArmory|r " .. tostring(err)) end
+            else print(Addon:Tag() .. " " ..tostring(err)) end
         end)
     end })
     crud2:Button({ text = "Delete", width = MGMT_BTN, onClick = function()
@@ -675,14 +675,14 @@ function Addon:BuildSetsTab(flow)
     io1:Button({ text = "Import Sets", width = MGMT_BTN, onClick = function()
         _G.DaseekiSuite.ShowTextDialog("Import Armory Sets", "", false, function(text)
             local ok, res = Addon:ImportSets(text)
-            if ok then print("|cff66ccffArmory|r imported " .. res .. " set(s).")
+            if ok then print(Addon:Tag() .. " imported " ..res .. " set(s).")
                 Addon:RefreshOptions(); Addon:RefreshWidget()
-            else print("|cff66ccffArmory|r " .. tostring(res)) end
+            else print(Addon:Tag() .. " " ..tostring(res)) end
         end)
     end })
     L:AddRow():Button({ text = "Import from ItemRack", width = MGMT_GRID, onClick = function()
         local n = Addon:CountItemRackSets()
-        if n == 0 then print("|cff66ccffArmory|r no ItemRack sets found — make sure ItemRack is enabled."); return end
+        if n == 0 then print(Addon:Tag() .. " no ItemRack sets found — make sure ItemRack is enabled."); return end
         StaticPopup_Show("DASEEKI_ARMORY_IRIMPORT", n)
     end })
 
@@ -739,7 +739,7 @@ function Addon:BuildSetsTab(flow)
             if panel.selectedSet and v ~= "" and v ~= panel.selectedSet then
                 local ok, err = Addon:RenameSet(panel.selectedSet, v)
                 if ok then panel.selectedSet = v; Addon:RefreshOptions(); Addon:RefreshWidget()
-                else print("|cff66ccffArmory|r " .. tostring(err)) end
+                else print(Addon:Tag() .. " " ..tostring(err)) end
             end
         end,
     })
@@ -760,11 +760,11 @@ function Addon:BuildSetsTab(flow)
                     if n ~= name and s.key == combo then otherSet = n; break end
                 end
                 if otherSet then
-                    warn = "\n|cffff8800Already bound to Armory set \"" .. otherSet .. "\" — it will be reassigned.|r"
+                    warn = "\n" .. Addon:Wrap("warn", "Already bound to Armory set \"" .. otherSet .. "\" — it will be reassigned.")
                 else
                     local action = GetBindingAction and GetBindingAction(combo)
                     if action and action ~= "" then
-                        warn = "\n|cffff8800Already bound to: " .. (_G["BINDING_NAME_" .. action] or action) .. "|r"
+                        warn = "\n" .. Addon:Wrap("warn", "Already bound to: " .. (_G["BINDING_NAME_" .. action] or action))
                     end
                 end
                 local txt = ("Bind %s to set \"%s\"?"):format(combo, name) .. warn
@@ -1183,7 +1183,7 @@ end
 -- Open the hub straight to the Armory → Sets tab (used by the character-pane button).
 function Addon:OpenToSets()
     if not _G.DaseekiSuite then
-        print("|cff66ccffArmory|r Daseeki-Core not loaded.")
+        print(Addon:Tag() .. " Daseeki-Core not loaded.")
         return
     end
     DaseekiSuite:Open("armory", "sets")
@@ -1267,7 +1267,7 @@ end
 function Addon:RegisterOptions()
     if not _G.DaseekiSuite then return end
     if not (_G.DaseekiUI and _G.DaseekiUI.Token) then
-        print("|cff66ccffArmory|r requires Daseeki Core v2.0.0 or newer — please update Daseeki Core.")
+        print(Addon:Tag() .. " requires Daseeki Core v2.0.0 or newer — please update Daseeki Core.")
         return
     end
     DaseekiSuite:RegisterAddon({

@@ -46,7 +46,8 @@ local function ensure()
 
     f.title = f:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
     f.title:SetPoint("TOP", f, "TOP", 0, -12)
-    f.title:SetText("Choose an Icon"); f.title:SetTextColor(1, 0.82, 0)
+    f.title:SetText("Choose an Icon")
+    if not Addon:TrySetCeremonial(f.title, 16) then f.title:SetTextColor(1, 0.82, 0) end
 
     local close = CreateFrame("Button", nil, f, "UIPanelCloseButton")
     close:SetPoint("TOPRIGHT", f, "TOPRIGHT", -2, -2)
@@ -54,7 +55,7 @@ local function ensure()
 
     f.countText = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     f.countText:SetPoint("BOTTOM", f, "BOTTOM", 0, 8)
-    f.countText:SetTextColor(0.7, 0.7, 0.7)
+    f.countText:SetTextColor(Addon:Col("muted"))
 
     -- search box
     local search
@@ -106,10 +107,10 @@ local function ensure()
         b.sel = b:CreateTexture(nil, "OVERLAY")
         b.sel:SetPoint("TOPLEFT", b, "TOPLEFT", -2, 2)
         b.sel:SetPoint("BOTTOMRIGHT", b, "BOTTOMRIGHT", 2, -2)
-        b.sel:SetColorTexture(1, 0.82, 0, 0)
+        b.sel:SetColorTexture(Addon:Col("brand", 0))
 
         local hl = b:CreateTexture(nil, "HIGHLIGHT")
-        hl:SetAllPoints(); hl:SetColorTexture(1, 1, 1, 0.25)
+        hl:SetAllPoints(); hl:SetColorTexture(Addon:Col("brand", 0.25))
 
         b:SetScript("OnClick", function(self)
             if self._tex ~= nil and picker._onPick then picker._onPick(self._tex) end
@@ -143,7 +144,7 @@ local function ensure()
                 b._tex  = e.tex
                 b._name = e.name and e.name:upper() or (e.id and ("Icon " .. e.id))
                 local isCur = self._current and tostring(self._current) == tostring(e.tex)
-                b.sel:SetColorTexture(1, 0.82, 0, isCur and 0.7 or 0)
+                b.sel:SetColorTexture(Addon:Col("brand", isCur and 0.7 or 0))
                 b:Show()
             else
                 b._tex, b._name = nil, nil

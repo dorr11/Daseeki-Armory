@@ -121,6 +121,83 @@ function Addon:GetCharKey()
     return (UnitName("player") or "?") .. "-" .. (GetRealmName() or "?")
 end
 
+-- ── Field Ledger token bridge (BRAND_SPEC rollout) ────────────────────────────
+-- Armory renders many transient surfaces (item/set flyouts, radial widget, slot
+-- popouts, pickers) that pre-date DaseekiUI and can also run standalone (Core is an
+-- OptionalDep). These helpers read live theme tokens when Daseeki-Core is present,
+-- so every surface tracks SetTheme, and fall back to Armory's legacy palette when it
+-- is absent — the no-Core look is preserved exactly. Colors are read at render time
+-- (flyout Layout / radial build / picker refresh run on every open), so no explicit
+-- re-skin wiring is needed for those; the few build-once borders register UI.Skin.
+--
+-- FALLBACK mirrors the historical hardcoded values so a Core-less client is unchanged
+-- (dominant black backings + gold accent). brand/bronze fall back to the old gold.
+local FALLBACK = {
+    ground = { 0.06, 0.05, 0.04 }, inset = { 0, 0, 0 },
+    panel  = { 0.09, 0.09, 0.11 }, raised = { 0.13, 0.11, 0.13 },
+    border = { 0.30, 0.30, 0.30 }, borderLite = { 0.40, 0.40, 0.40 },
+    control = { 0.17, 0.15, 0.11 }, controlBorder = { 0.30, 0.30, 0.30 },
+    brand  = { 1, 0.82, 0 }, brandBright = { 1, 0.9, 0.4 },
+    bronze = { 1, 0.82, 0 }, bronzeDim = { 0.7, 0.57, 0 }, idle = { 0.43, 0.39, 0.31 },
+    text   = { 1, 1, 1 }, muted = { 0.7, 0.7, 0.7 }, faint = { 0.5, 0.5, 0.5 },
+    accent = { 1, 0.82, 0 }, ok = { 0.5, 0.9, 0.5 },
+    warn   = { 1, 0.53, 0 }, danger = { 0.9, 0.35, 0.28 },
+}
+
+-- r,g,b,a from the active theme token, or the legacy fallback when Core is absent.
+function Addon:Col(token, alpha)
+    local UI = _G.DaseekiUI
+    if UI and UI.Color then return UI.Color(token, alpha) end
+    local c = FALLBACK[token] or FALLBACK.text
+    return c[1], c[2], c[3], alpha or c[4] or 1
+end
+
+-- Token → "|cffRRGGBB" escape prefix for chat / popup strings (no FontObject there);
+-- nil when Core is absent so callers fall back to a plain/legacy literal.
+function Addon:Hex(token)
+    local UI = _G.DaseekiUI
+    if not (UI and UI.Color) then return nil end
+    local r, g, b = UI.Color(token)
+    local function b255(v) return math.max(0, math.min(255, math.floor((v or 0) * 255 + 0.5))) end
+    return ("|cff%02x%02x%02x"):format(b255(r), b255(g), b255(b))
+end
+
+-- Wrap `text` in a token color for chat/popup strings; plain text if Core is absent.
+function Addon:Wrap(token, text)
+    local h = Addon:Hex(token)
+    if not h then return tostring(text) end
+    return h .. tostring(text) .. "|r"
+end
+
+-- Brand-tinted chat identity tag (falls back to the legacy cyan tag without Core).
+function Addon:Tag(text)
+    text = text or "Armory"
+    local h = Addon:Hex("brand")
+    if h then return h .. text .. "|r" end
+    return "|cff66ccff" .. text .. "|r"
+end
+
+-- Apply the ceremonial (MORPHEUS >=16) title font to a FontString when Core is present.
+-- Returns true if applied, so callers can keep their legacy color/font otherwise.
+function Addon:TrySetCeremonial(fs, size)
+    local UI = _G.DaseekiUI
+    if UI and UI.GetCeremonialFont then
+        fs:SetFontObject(UI.GetCeremonialFont(size or 16))
+        return true
+    end
+    return false
+end
+
+-- Apply the telemetry numeral (ARIALN+OUTLINE) font to a FontString when Core present.
+function Addon:TrySetNumeral(fs)
+    local UI = _G.DaseekiUI
+    if UI and UI.fonts and UI.fonts.numeral then
+        fs:SetFontObject(UI.fonts.numeral)
+        return true
+    end
+    return false
+end
+
 function Addon:Init()
     DaseekiArmoryDB = DaseekiArmoryDB or {}
     ApplyDefaults(DaseekiArmoryDB, DEFAULT_DB)
@@ -151,8 +228,8 @@ function Addon:OnLogin()
     local n = 0
     for _ in pairs(Addon.db.sets) do n = n + 1 end
     print(string.format(
-        "|cff66ccffDaseeki Armory|r loaded — %d set%s. |cffffffff/darmory|r for options.",
-        n, n == 1 and "" or "s"))
+        "%s loaded — %d set%s. %s for options.",
+        Addon:Tag("Daseeki Armory"), n, n == 1 and "" or "s", Addon:Wrap("text", "/darmory")))
 end
 
 -- ── Event wiring ──────────────────────────────────────────────────────────────

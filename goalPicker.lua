@@ -170,14 +170,15 @@ local function ensure()
     end
 
     f.title = f:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
-    f.title:SetPoint("TOP", f, "TOP", 0, -12); f.title:SetText("Choose Goal Item"); f.title:SetTextColor(1, 0.82, 0)
+    f.title:SetPoint("TOP", f, "TOP", 0, -12); f.title:SetText("Choose Goal Item")
+    if not Addon:TrySetCeremonial(f.title, 16) then f.title:SetTextColor(1, 0.82, 0) end
 
     local close = CreateFrame("Button", nil, f, "UIPanelCloseButton")
     close:SetPoint("TOPRIGHT", f, "TOPRIGHT", -2, -2)
     close:SetScript("OnClick", function() f:Hide() end)
 
     f.countText = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    f.countText:SetPoint("BOTTOM", f, "BOTTOM", 0, 8); f.countText:SetTextColor(0.7, 0.7, 0.7)
+    f.countText:SetPoint("BOTTOM", f, "BOTTOM", 0, 8); f.countText:SetTextColor(Addon:Col("muted"))
 
     local search
     if DS and DS.MakeEditBox then search = DS.MakeEditBox(f, 14, 40, W - 28)
@@ -197,7 +198,7 @@ local function ensure()
                 if picker._onPick then picker._onPick(id) end
                 picker:Hide()
             else
-                print("|cff66ccffArmory|r that item doesn't fit this slot.")
+                print(Addon:Tag() .. " that item doesn't fit this slot.")
             end
             return
         end
@@ -218,12 +219,12 @@ local function ensure()
         r:SetSize(W - 28, ROWH)
         r:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -(LIST_TOP + (i - 1) * ROWH))
         r.bg = r:CreateTexture(nil, "BACKGROUND"); r.bg:SetAllPoints()
-        r.bg:SetColorTexture(i % 2 == 0 and 0.12 or 0.08, 0.1, 0.12, 0.5)
+        r.bg:SetColorTexture(Addon:Col(i % 2 == 0 and "raised" or "panel", 0.5))
         r.icon = r:CreateTexture(nil, "ARTWORK"); r.icon:SetSize(22, 22); r.icon:SetPoint("LEFT", 2, 0)
         r.icon:SetTexCoord(0.07, 0.93, 0.07, 0.93)
         r.label = r:CreateFontString(nil, "OVERLAY", "GameFontNormal")
         r.label:SetPoint("LEFT", r.icon, "RIGHT", 6, 0); r.label:SetWidth(W - 60); r.label:SetJustifyH("LEFT")
-        local hl = r:CreateTexture(nil, "HIGHLIGHT"); hl:SetAllPoints(); hl:SetColorTexture(1, 0.82, 0, 0.25)
+        local hl = r:CreateTexture(nil, "HIGHLIGHT"); hl:SetAllPoints(); hl:SetColorTexture(Addon:Col("brand", 0.25))
         r:SetScript("OnClick", function(self)
             if self._id and picker._onPick then picker._onPick(self._id) end
             picker:Hide()

@@ -191,21 +191,24 @@ function Addon:_MakeStatHost(parent, blk, registry)
     local UI = DaseekiUI
     local host = CreateFrame("Frame", nil, parent)
 
+    -- True section title → ceremonial (MORPHEUS >=16), per BRAND_SPEC §3. These are
+    -- Armory's own block titles (not Core's shared MakeSectionHeader), so they take the
+    -- ceremonial face in both renderers (hub Stats section + attached panel).
     local title = host:CreateFontString(nil, "OVERLAY")
-    title:SetFontObject(UI.fonts.header)
+    title:SetFontObject(UI.fonts.ceremonial)
     title:SetJustifyH("LEFT")
     title:SetText(blk.title)
 
-    local rule = host:CreateTexture(nil, "ARTWORK")
-    rule:SetHeight(1)
-    UI.Skin(rule, function(self) self:SetColorTexture(UI.Color("borderLite")) end)
+    -- ONE pixel-snapped hairline per block (BRAND_SPEC §9 hairline budget).
+    local rule = UI.Hairline(host, { token = "borderLite" })
 
     host._cells = {}
     for _, c in ipairs(blk.cells) do
         local lbl = host:CreateFontString(nil, "OVERLAY")
         lbl:SetFontObject(UI.fonts.muted); lbl:SetJustifyH("LEFT"); lbl:SetText(c[1])
+        -- Live stat readouts are telemetry columns → numeral face (ARIALN+OUTLINE).
         local val = host:CreateFontString(nil, "OVERLAY")
-        val:SetFontObject(UI.fonts.body); val:SetJustifyH("RIGHT")
+        val:SetFontObject(UI.fonts.numeral); val:SetJustifyH("RIGHT")
         host._cells[#host._cells + 1] = { lbl = lbl, val = val }
         registry[#registry + 1] = { fs = val, fn = c[2] }
     end

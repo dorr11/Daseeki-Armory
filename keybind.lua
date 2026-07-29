@@ -75,9 +75,10 @@ function Addon:CaptureKeybind(onCapture)
             tile = true, tileSize = 16, edgeSize = 16,
             insets = { left = 4, right = 4, top = 4, bottom = 4 },
         })
-        f:SetBackdropColor(0, 0, 0, 0.95); f:SetBackdropBorderColor(0.3, 0.3, 0.3, 1)
+        f:SetBackdropColor(Addon:Col("panel", 0.95)); f:SetBackdropBorderColor(Addon:Col("border"))
         f.title = f:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
-        f.title:SetPoint("TOP", 0, -18); f.title:SetText("Press a key…"); f.title:SetTextColor(1, 0.82, 0)
+        f.title:SetPoint("TOP", 0, -18); f.title:SetText("Press a key…")
+        if not Addon:TrySetCeremonial(f.title, 16) then f.title:SetTextColor(1, 0.82, 0) end
         f.hint = f:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
         f.hint:SetPoint("BOTTOM", 0, 18); f.hint:SetText("Esc to cancel")
         f:SetScript("OnKeyDown", function(self, key)

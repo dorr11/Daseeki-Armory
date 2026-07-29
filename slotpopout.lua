@@ -158,7 +158,7 @@ function Addon:CreateSlotPopout(slotId)
     b:RegisterForDrag("LeftButton")
     b._slotId = slotId
 
-    b.bg = b:CreateTexture(nil, "BACKGROUND"); b.bg:SetAllPoints(); b.bg:SetColorTexture(0, 0, 0, 0.5)
+    b.bg = b:CreateTexture(nil, "BACKGROUND"); b.bg:SetAllPoints(); b.bg:SetColorTexture(Addon:Col("inset", 0.5))
     b.icon = b:CreateTexture(nil, "ARTWORK")
     b.icon:SetPoint("TOPLEFT", 2, -2); b.icon:SetPoint("BOTTOMRIGHT", -2, 2)
     b.icon:SetTexCoord(0.07, 0.93, 0.07, 0.93)
@@ -171,18 +171,18 @@ function Addon:CreateSlotPopout(slotId)
     })
     local bc = Addon:SuiteBorderColor()
     b.border:SetBackdropBorderColor(bc[1], bc[2], bc[3], bc[4] or 1)
-    local hl = b:CreateTexture(nil, "HIGHLIGHT"); hl:SetAllPoints(); hl:SetColorTexture(1, 1, 1, 0.2)
+    local hl = b:CreateTexture(nil, "HIGHLIGHT"); hl:SetAllPoints(); hl:SetColorTexture(Addon:Col("brand", 0.2))
 
     -- pending (queued-in-combat) item overlay, upper-right
     b.pendBg = b:CreateTexture(nil, "OVERLAY"); b.pendBg:SetSize(17, 17); b.pendBg:SetPoint("TOPRIGHT", 2, 2)
-    b.pendBg:SetColorTexture(0, 0, 0, 0.9); b.pendBg:Hide()
+    b.pendBg:SetColorTexture(Addon:Col("inset", 0.9)); b.pendBg:Hide()
     b.pending = b:CreateTexture(nil, "OVERLAY"); b.pending:SetSize(15, 15); b.pending:SetPoint("TOPRIGHT", 1, 1)
     b.pending:SetTexCoord(0.07, 0.93, 0.07, 0.93); b.pending:Hide()
 
     -- magnetic dock-side glows
     b.glows = {}
     for _, side in ipairs(SIDES) do
-        local g = b:CreateTexture(nil, "OVERLAY"); g:SetColorTexture(0.2, 0.8, 1, 0.85); g:Hide()
+        local g = b:CreateTexture(nil, "OVERLAY"); g:SetColorTexture(Addon:Col("brand", 0.85)); g:Hide()
         b.glows[side] = g
     end
     b.glows.left:SetPoint("TOPRIGHT", b, "TOPLEFT", 0, 1);  b.glows.left:SetPoint("BOTTOMRIGHT", b, "BOTTOMLEFT", 0, -1);  b.glows.left:SetWidth(4)

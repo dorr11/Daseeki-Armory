@@ -72,7 +72,7 @@ local function ensure()
         r.icon:SetTexCoord(0.07, 0.93, 0.07, 0.93)
         r.label = r:CreateFontString(nil, "OVERLAY", "GameFontNormal")
         r.label:SetPoint("LEFT", r.icon, "RIGHT", ICON_GAP, 0); r.label:SetJustifyH("LEFT")
-        local hl = r:CreateTexture(nil, "HIGHLIGHT"); hl:SetAllPoints(); hl:SetColorTexture(1, 0.82, 0, 0.25)
+        local hl = r:CreateTexture(nil, "HIGHLIGHT"); hl:SetAllPoints(); hl:SetColorTexture(Addon:Col("brand", 0.25))
         r:SetScript("OnClick", function(self)
             if self._name then Addon:EquipSet(self._name) end
             setFlyout:Hide()
@@ -119,7 +119,7 @@ local function ensure()
                 r:SetWidth(width - SIDE_PAD * 2)
                 r:ClearAllPoints()
                 r:SetPoint("TOPLEFT", self, "TOPLEFT", SIDE_PAD, -(4 + (i - 1) * ROWH))
-                r.bg:SetColorTexture((i % 2 == 0) and 0.12 or 0.08, 0.1, 0.12, 0.6)
+                r.bg:SetColorTexture(Addon:Col(i % 2 == 0 and "raised" or "panel", 0.6))
                 r.icon:SetTexture(set.icon or Addon.DEFAULT_ICON)
                 r.label:SetText(set.name)
                 r._name, r._key = set.name, set.key
@@ -214,7 +214,7 @@ local function ensureIconFlyout()
         b.icon = b:CreateTexture(nil, "ARTWORK"); b.icon:SetAllPoints()
         b.icon:SetTexCoord(0.07, 0.93, 0.07, 0.93)
         local hl = b:CreateTexture(nil, "HIGHLIGHT"); hl:SetAllPoints()
-        hl:SetColorTexture(1, 0.82, 0, 0.3)
+        hl:SetColorTexture(Addon:Col("brand", 0.3))
         b:SetScript("OnEnter", function(self)
             if self._name then
                 GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
@@ -265,9 +265,9 @@ local function ensureIconFlyout()
                 b.icon:SetTexture(set.icon or Addon.DEFAULT_ICON)
                 b._name = set.name
                 if Addon.db.currentSet == set.name then
-                    b.bg:SetColorTexture(1, 0.82, 0, 0.4)
+                    b.bg:SetColorTexture(Addon:Col("brand", 0.4))
                 else
-                    b.bg:SetColorTexture(0, 0, 0, 0.5)
+                    b.bg:SetColorTexture(Addon:Col("inset", 0.5))
                 end
                 b:Show()
             end

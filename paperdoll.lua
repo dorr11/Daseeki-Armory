@@ -21,7 +21,7 @@ function Addon:InitPaperdoll()
                 local slotId, slotName = s.id, s.name
                 -- combat-pending (to-be-equipped) overlay, upper-right of the slot
                 local ovbg = btn:CreateTexture(nil, "OVERLAY", nil, 6)
-                ovbg:SetSize(17, 17); ovbg:SetPoint("TOPRIGHT", 1, 1); ovbg:SetColorTexture(0, 0, 0, 0.9); ovbg:Hide()
+                ovbg:SetSize(17, 17); ovbg:SetPoint("TOPRIGHT", 1, 1); ovbg:SetColorTexture(Addon:Col("inset", 0.9)); ovbg:Hide()
                 local ov = btn:CreateTexture(nil, "OVERLAY", nil, 7)
                 ov:SetSize(15, 15); ov:SetPoint("TOPRIGHT", 0, 0); ov:SetTexCoord(0.07, 0.93, 0.07, 0.93); ov:Hide()
                 ov.bg = ovbg
@@ -88,7 +88,7 @@ function Addon:CreateCharPaneButton()
     b:SetFrameStrata(anchor:GetFrameStrata() or "HIGH")
     b:SetFrameLevel((anchor:GetFrameLevel() or 1) + 5)
     b:RegisterForClicks("LeftButtonUp", "RightButtonUp")
-    b.bg = b:CreateTexture(nil, "BACKGROUND"); b.bg:SetAllPoints(); b.bg:SetColorTexture(0, 0, 0, 0.5)
+    b.bg = b:CreateTexture(nil, "BACKGROUND"); b.bg:SetAllPoints(); b.bg:SetColorTexture(Addon:Col("inset", 0.5))
     b.icon = b:CreateTexture(nil, "ARTWORK")
     b.icon:SetPoint("TOPLEFT", 1, -1); b.icon:SetPoint("BOTTOMRIGHT", -1, 1)
     b.icon:SetTexCoord(0.07, 0.93, 0.07, 0.93)
@@ -96,8 +96,8 @@ function Addon:CreateCharPaneButton()
     local border = CreateFrame("Frame", nil, b, "BackdropTemplate")
     border:SetPoint("TOPLEFT", -1, 1); border:SetPoint("BOTTOMRIGHT", 1, -1)
     border:SetBackdrop({ edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border", edgeSize = 8 })
-    border:SetBackdropBorderColor(1, 0.82, 0, 0.6)
-    local hl = b:CreateTexture(nil, "HIGHLIGHT"); hl:SetAllPoints(); hl:SetColorTexture(1, 0.82, 0, 0.3)
+    border:SetBackdropBorderColor(Addon:Col("bronze", 0.6))
+    local hl = b:CreateTexture(nil, "HIGHLIGHT"); hl:SetAllPoints(); hl:SetColorTexture(Addon:Col("brand", 0.3))
     -- hover: ItemRack-style set flyout; right-click: open the options panel
     b:SetScript("OnClick", function(self, button)
         if button == "RightButton" then Addon:OpenToSets() end

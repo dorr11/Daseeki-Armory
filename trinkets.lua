@@ -68,6 +68,7 @@ function Addon:DecorateTrinketFlyout(btn, item, slotId)
     end
     if not btn._armTrinketCd then
         local t = btn:CreateFontString(nil, "OVERLAY", "NumberFontNormalSmall")
+        Addon:TrySetNumeral(t)   -- telemetry countdown → numeral face (BRAND_SPEC §3)
         t:SetPoint("BOTTOM", btn, "BOTTOM", 0, 1)
         btn._armTrinketCd = t
     end
@@ -96,6 +97,7 @@ function Addon:InitTrinkets()
             cd:SetDrawEdge(false)
             cd:SetHideCountdownNumbers(true)   -- our own text avoids double numbers
             local txt = btn:CreateFontString(nil, "OVERLAY", "NumberFontNormalSmall")
+            Addon:TrySetNumeral(txt)   -- telemetry countdown → numeral face (BRAND_SPEC §3)
             txt:SetPoint("BOTTOM", btn, "BOTTOM", 0, 2)
             Addon._trinketCds[slotId] = { cd = cd, txt = txt, btn = btn }
         end

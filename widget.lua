@@ -30,7 +30,7 @@ function Addon:InitWidget()
     anchor:RegisterForDrag("LeftButton")
 
     local bg = anchor:CreateTexture(nil, "BACKGROUND")
-    bg:SetAllPoints(); bg:SetColorTexture(0, 0, 0, 0.55)
+    bg:SetAllPoints(); bg:SetColorTexture(Addon:Col("inset", 0.55))
 
     local icon = anchor:CreateTexture(nil, "ARTWORK")
     icon:SetPoint("TOPLEFT", 2, -2); icon:SetPoint("BOTTOMRIGHT", -2, 2)
@@ -40,10 +40,10 @@ function Addon:InitWidget()
     local border = CreateFrame("Frame", nil, anchor, "BackdropTemplate")
     border:SetPoint("TOPLEFT", -2, 2); border:SetPoint("BOTTOMRIGHT", 2, -2)
     border:SetBackdrop({ edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border", edgeSize = 12 })
-    border:SetBackdropBorderColor(1, 0.82, 0, 0.6)
+    border:SetBackdropBorderColor(Addon:Col("bronze", 0.6))
 
     local hl = anchor:CreateTexture(nil, "HIGHLIGHT")
-    hl:SetAllPoints(); hl:SetColorTexture(1, 0.82, 0, 0.25)
+    hl:SetAllPoints(); hl:SetColorTexture(Addon:Col("brand", 0.25))
 
     anchor:SetScript("OnDragStart", function(self)
         if not Addon.db.settings.widget.locked then self:StartMoving() end
@@ -146,7 +146,7 @@ function Addon:BuildRadial()
             b.icon:SetPoint("TOPLEFT", 2, -2); b.icon:SetPoint("BOTTOMRIGHT", -2, 2)
             b.icon:SetTexCoord(0.07, 0.93, 0.07, 0.93)
             local bhl = b:CreateTexture(nil, "HIGHLIGHT"); bhl:SetAllPoints()
-            bhl:SetColorTexture(1, 0.82, 0, 0.3)
+            bhl:SetColorTexture(Addon:Col("brand", 0.3))
             b:SetScript("OnEnter", function(self)
                 GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
                 GameTooltip:AddLine(self._setName or "", 1, 1, 1)
@@ -165,9 +165,9 @@ function Addon:BuildRadial()
         b.icon:SetTexture(set.icon or Addon.DEFAULT_ICON)
         b._setName = set.name
         if Addon.db.currentSet == set.name then
-            b.bg:SetColorTexture(1, 0.82, 0, 0.4)
+            b.bg:SetColorTexture(Addon:Col("brand", 0.4))
         else
-            b.bg:SetColorTexture(0, 0, 0, 0.6)
+            b.bg:SetColorTexture(Addon:Col("inset", 0.6))
         end
         b:Show()
     end

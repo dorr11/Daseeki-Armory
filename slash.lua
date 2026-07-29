@@ -22,17 +22,17 @@ SlashCmdList["DASEEKIARMORY"] = function(msg)
         return
     elseif cmd == "widget" then
         Addon:SetWidgetShown(not Addon.db.settings.widget.show)
-        print("|cff66ccffArmory|r switcher " ..
+        print(Addon:Tag() .. " switcher " ..
             (Addon.db.settings.widget.show and "shown." or "hidden."))
         return
     elseif cmd == "list" then
         local sets = Addon:GetSetsSorted()
         if #sets == 0 then
-            print("|cff66ccffArmory|r no sets yet. Open options to create one.")
+            print(Addon:Tag() .. " no sets yet. Open options to create one.")
         else
-            print("|cff66ccffArmory|r sets:")
+            print(Addon:Tag() .. " sets:")
             for _, s in ipairs(sets) do
-                print("  - " .. s.name .. (Addon.db.currentSet == s.name and "  |cffffd100(current)|r" or ""))
+                print("  - " .. s.name .. (Addon.db.currentSet == s.name and ("  " .. Addon:Wrap("brand", "(current)")) or ""))
             end
         end
         return
@@ -41,7 +41,7 @@ SlashCmdList["DASEEKIARMORY"] = function(msg)
     if _G.DaseekiSuite then
         DaseekiSuite:Open("armory")
     else
-        print("|cff66ccffDaseeki Armory|r — Daseeki-Core not loaded, so the options " ..
+        print(Addon:Tag("Daseeki Armory") .. " — Daseeki-Core not loaded, so the options " ..
             "window is unavailable. Sets still work via macros: /run ArmEquip(\"name\")")
     end
 end
