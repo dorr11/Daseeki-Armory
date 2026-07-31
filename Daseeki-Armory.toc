@@ -20,6 +20,7 @@ setFlyout.lua
 opie.lua
 slotpopout.lua
 paperdoll.lua
+statmath.lua
 stats.lua
 trinkets.lua
 borders.lua

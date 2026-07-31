@@ -4,6 +4,10 @@
         /darmory equip <n>  equip a set by name
         /darmory widget     toggle the on-screen set switcher
         /darmory list       print this character's sets
+        /darmory stats      toggle the stats panel attached to the character window
+
+    `stats` exists so the attach setting stays reachable when Daseeki-Core is absent
+    (the options hub needs Core; this command does not).
 --]]
 
 local _, Addon = ...
@@ -24,6 +28,17 @@ SlashCmdList["DASEEKIARMORY"] = function(msg)
         Addon:SetWidgetShown(not Addon.db.settings.widget.show)
         print(Addon:Tag() .. " switcher " ..
             (Addon.db.settings.widget.show and "shown." or "hidden."))
+        return
+    elseif cmd == "stats" then
+        local s = Addon.db.settings.stats
+        s.attach = not s.attach
+        Addon:UpdateStatsPanelShown()
+        local msg = s.attach and "stats panel attached to the character window."
+                              or "stats panel detached."
+        if s.attach and not Addon:StatsUIReady() then
+            msg = "stats panel needs Daseeki-Core — setting is on, but nothing will show."
+        end
+        print(Addon:Tag() .. " " .. msg)
         return
     elseif cmd == "list" then
         local sets = Addon:GetSetsSorted()

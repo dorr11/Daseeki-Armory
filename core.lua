@@ -87,6 +87,11 @@ local DEFAULT_DB = {
         -- Phase-4 hardening (all additive; ApplyDefaults leaves existing keys untouched)
         stats = {
             attach = false,            -- dock the stats panel to the character window
+            -- Block value source. false (default) = Armory's own calculation per
+            -- CSC_BEHAVIOR_SPEC §7.4 (gear scan + Strength/20 + set/enchant terms);
+            -- true = GetShieldBlock() verbatim. Additive key; existing saves seed it
+            -- from this default, so no migration.
+            blizzardBlockValue = false,
         },
         trinkets = {
             showCooldowns = true,      -- cooldown spiral/text on the trinket slots + flyout

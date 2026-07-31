@@ -3,8 +3,10 @@
 
     Ported from ItemRack's ItemRackEquip.lua to Classic Era's C_Container API and
     simplified: locate each set item in bags (or another equipped slot), swap it in,
-    and re-verify across a few lock-driven passes. In combat the swap is deferred to
-    PLAYER_REGEN_ENABLED. Exposes a global EquipSet() so /run EquipSet("name") works.
+    and re-verify across a few lock-driven passes. In combat — or while dead — the
+    swap is queued and drained on PLAYER_REGEN_ENABLED / PLAYER_UNGHOST /
+    PLAYER_ALIVE, whichever leaves the player alive and out of combat first.
+    Exposes a global EquipSet() so /run EquipSet("name") works.
 --]]
 
 local _, Addon = ...
@@ -182,7 +184,7 @@ end
 function Addon:EquipPass(name, attempt)
     local set = Addon.db.sets[name]
     if not set then Addon._equipping = nil; return end
-    if InCombatLockdown() then Addon:DeferToCombatEnd(name); return end
+    if Addon:MustQueueSwap() then Addon:DeferToCombatEnd(name); return end
 
     for _, slotId in ipairs(Addon.SLOT_IDS) do
         local entry = set.equip[slotId]
@@ -244,36 +246,87 @@ end
 -- ── Combat queue (whole sets + individual sidebar equips) ─────────────────────
 -- Keyed by the TARGET equipment slot so only one pending action exists per slot,
 -- and re-selecting the same item toggles it back off.
+
+-- "Really dead" per both queue specs: dead or ghost, EXCEPT a feigning hunter,
+-- who is treated as alive and swaps normally.
+function Addon:IsReallyDead()
+    if UnitIsFeignDeath and UnitIsFeignDeath("player") then return false end
+    return (UnitIsDeadOrGhost and UnitIsDeadOrGhost("player")) and true or false
+end
+
+-- A swap must be queued rather than attempted while in combat OR while dead.
+-- Attempting one as a corpse silently fails and the request is lost.
+function Addon:MustQueueSwap()
+    return InCombatLockdown() or Addon:IsReallyDead()
+end
+
+-- Chat wording so a queued-while-dead swap doesn't claim to be waiting on combat.
+function Addon:QueueReason()
+    if InCombatLockdown() then return "in combat" end
+    if Addon:IsReallyDead() then return "you're dead" end
+    return "queued"
+end
+function Addon:QueueWhen()
+    if InCombatLockdown() then return "when combat ends" end
+    if Addon:IsReallyDead() then return "when you're back up" end
+    return "shortly"
+end
+
+-- Dying drops combat, so PLAYER_REGEN_ENABLED fires while the player is a corpse.
+-- Draining there would consume the queue against a corpse and lose it. The queue is
+-- therefore HELD while really dead and drains on resurrection instead.
+local DRAIN_EVENTS = { "PLAYER_REGEN_ENABLED", "PLAYER_UNGHOST", "PLAYER_ALIVE" }
+
+function Addon:StopQueueWatcher()
+    if not Addon._regen then return end
+    for _, e in ipairs(DRAIN_EVENTS) do
+        pcall(function() Addon._regen:UnregisterEvent(e) end)
+    end
+end
+
+function Addon:DrainCombatQueue()
+    if InCombatLockdown() then return end        -- PLAYER_ALIVE can arrive mid-combat
+    if Addon:IsReallyDead() then return end      -- hold: drains on resurrect instead
+
+    local q    = Addon._combatQueue
+    local pend = Addon._pendingSet
+    if not q and not pend then
+        Addon:StopQueueWatcher()
+        return
+    end
+
+    Addon._combatQueue = nil
+    Addon._pendingSet  = nil
+    Addon:StopQueueWatcher()
+
+    -- queued single-item actions first (slot -> action)
+    if q then
+        for slot, act in pairs(q) do
+            if act.type == "unequip" then
+                Addon:UnequipSlot(slot)
+            elseif act.type == "swap" then
+                Addon:SwapEquippedSlots(act.from, slot)
+            elseif act.type == "equip" then
+                local e = Addon:IdentityFromLink(act.link)
+                local bag, bslot
+                if e then bag, bslot = Addon:FindInBags(e) end
+                if bag and bslot then Addon:EquipContainerItemToSlot(bag, bslot, slot) end
+            end
+        end
+    end
+    -- then a queued whole set
+    if pend then Addon:RunEquip(pend) end
+    if Addon.ClearPendingSlots then Addon:ClearPendingSlots() end
+end
+
 function Addon:EnsureRegenWatcher()
     if not Addon._regen then
         Addon._regen = CreateFrame("Frame")
-        Addon._regen:SetScript("OnEvent", function()
-            Addon._regen:UnregisterEvent("PLAYER_REGEN_ENABLED")
-            -- queued single-item actions first (slot -> action)
-            local q = Addon._combatQueue
-            Addon._combatQueue = nil
-            if q then
-                for slot, act in pairs(q) do
-                    if act.type == "unequip" then
-                        Addon:UnequipSlot(slot)
-                    elseif act.type == "swap" then
-                        Addon:SwapEquippedSlots(act.from, slot)
-                    elseif act.type == "equip" then
-                        local e = Addon:IdentityFromLink(act.link)
-                        local bag, bslot
-                        if e then bag, bslot = Addon:FindInBags(e) end
-                        if bag and bslot then Addon:EquipContainerItemToSlot(bag, bslot, slot) end
-                    end
-                end
-            end
-            -- then a queued whole set
-            local pend = Addon._pendingSet
-            Addon._pendingSet = nil
-            if pend then Addon:RunEquip(pend) end
-            if Addon.ClearPendingSlots then Addon:ClearPendingSlots() end
-        end)
+        Addon._regen:SetScript("OnEvent", function() Addon:DrainCombatQueue() end)
     end
-    Addon._regen:RegisterEvent("PLAYER_REGEN_ENABLED")
+    for _, e in ipairs(DRAIN_EVENTS) do
+        pcall(function() Addon._regen:RegisterEvent(e) end)
+    end
 end
 
 local function sameAction(a, b)
@@ -307,12 +360,12 @@ end
 function Addon:EquipContainerItemToSlot(bag, slot, invSlot)
     if not (bag and slot) then return end
     local link = GetContainerItemLink(bag, slot)
-    if InCombatLockdown() then
+    if Addon:MustQueueSwap() then
         if link and invSlot then
             local id = tonumber(link:match("item:(%d+)"))
             local queued = Addon:QueueCombatAction(invSlot, { type = "equip", link = link, id = id })
             if queued then
-                Addon:ChatMsg("in combat — will equip " .. link .. " when combat ends.")
+                Addon:ChatMsg(Addon:QueueReason() .. " — will equip " .. link .. " " .. Addon:QueueWhen() .. ".")
                 if Addon.SetPendingSlot then Addon:SetPendingSlot(invSlot, select(5, GetItemInfoInstant(link))) end
             else
                 Addon:ChatMsg("un-queued " .. link .. ".")
@@ -335,10 +388,10 @@ end
 function Addon:UnequipSlot(invSlot)
     local link = GetInventoryItemLink("player", invSlot)
     if not link then return end
-    if InCombatLockdown() then
+    if Addon:MustQueueSwap() then
         local queued = Addon:QueueCombatAction(invSlot, { type = "unequip" })
         if queued then
-            Addon:ChatMsg("in combat — will unequip " .. link .. " when combat ends.")
+            Addon:ChatMsg(Addon:QueueReason() .. " — will unequip " .. link .. " " .. Addon:QueueWhen() .. ".")
             if Addon.SetPendingSlot then Addon:SetPendingSlot(invSlot, "Interface\\Buttons\\UI-GroupLoot-Pass-Up") end
         else
             Addon:ChatMsg("un-queued unequip.")
@@ -401,10 +454,10 @@ end
 function Addon:SwapEquippedSlots(fromSlot, toSlot)
     if not fromSlot or fromSlot == toSlot then return end
     if not GetInventoryItemLink("player", fromSlot) then return end
-    if InCombatLockdown() then
+    if Addon:MustQueueSwap() then
         local queued = Addon:QueueCombatAction(toSlot, { type = "swap", from = fromSlot })
         if queued then
-            Addon:ChatMsg("in combat — will move that item when combat ends.")
+            Addon:ChatMsg(Addon:QueueReason() .. " — will move that item " .. Addon:QueueWhen() .. ".")
             if Addon.SetPendingSlot then Addon:SetPendingSlot(toSlot, GetInventoryItemTexture("player", fromSlot)) end
         else
             Addon:ChatMsg("un-queued.")
@@ -425,9 +478,9 @@ function Addon:EquipSet(name)
         print(Addon:Tag() .. " set '" .. tostring(name) .. "' doesn't exist.")
         return
     end
-    if InCombatLockdown() then
+    if Addon:MustQueueSwap() then
         Addon:DeferToCombatEnd(name)
-        Addon:ChatMsg("in combat — '" .. name .. "' will equip when combat ends.")
+        Addon:ChatMsg(Addon:QueueReason() .. " — '" .. name .. "' will equip " .. Addon:QueueWhen() .. ".")
         return
     end
     Addon:RunEquip(name)

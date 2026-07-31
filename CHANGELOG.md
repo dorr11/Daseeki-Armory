@@ -1,5 +1,46 @@
 # Changelog
 
+## Unreleased
+Correctness fixes — the stats panel now matches in-game values.
+
+- **Melee and Ranged Damage** no longer read high. The game already bakes your
+  physical damage bonus and percent modifier into the numbers it reports; Armory
+  was applying both a second time, so the range was inflated (a true 100-150 with
+  +5 damage and a x1.1 modifier displayed as 116-171). Both rows now show the same
+  range as Blizzard's own character sheet.
+- **Mana regen** is rebuilt from scratch. The two rows previously printed the same
+  number, because the client reports the same value for both. There are now two
+  correct and distinct rows — **MP5 Casting** and **MP5 Not Casting** — that
+  include MP5 from your gear and enchants (with the client's one-point-per-item
+  under-report corrected), Blessing of Wisdom / Greater Blessing of Wisdom / Mana
+  Spring Totem / Mageblood / Nightfin Soup, Paladin *Improved Blessing of Wisdom*
+  scaling, the *Meditation* / *Arcane Meditation* / *Reflection* casting fractions,
+  Mage Armor, and the Druid/Priest 3-piece tier bonus. Also stops flashing 0
+  after a gear swap.
+- **Spell Crit** now includes talent crit the client does not report: Mage
+  *Arcane Instability* and *Critical Mass*, Priest *Holy Specialization* and
+  *Force of Will* (plus Benediction), Warlock *Devastation*, Shaman *Call of
+  Thunder* and *Tidal Mastery*. Previously understated by up to 9-12% for those
+  classes.
+- **Ranged block** gained the missing **Hit** row (including the +3% from a ranged
+  scope), and now shows an em-dash instead of meaningless numbers when you have no
+  ranged weapon equipped. Ranged Attack Power also reads as not-applicable with a
+  wand.
+- **Defense** is read from your Defense skill line rather than the client call that
+  does not report the full value; the old call remains as a fallback.
+- **Block Value** now includes Strength/20, the Battlegear of Might 3-piece bonus
+  and warrior Zul'Gurub head/leg enchants, on top of the block value on your gear.
+  A new Stats option switches back to the client's raw figure if you prefer it.
+- **Queued gear swaps survive death.** Dying drops you out of combat, which used to
+  consume a pending trinket or set swap against your corpse and silently lose it.
+  The queue is now held while you are dead and drains when you are back up
+  (resurrect or release). Requests made while dead are queued instead of failing.
+  Feigning hunters are treated as alive and swap immediately.
+- **No more login error without Daseeki Core.** With the attached stats panel
+  enabled and Core disabled, the panel now cleanly does nothing instead of throwing
+  a Lua error, and `/darmory stats` toggles the setting without needing the options
+  window.
+
 ## 1.2.0
 - Settings rebuilt on the new Daseeki Core 2.0 interface (requires Daseeki Core 2.0.0+).
 - Sets: side-by-side layout — set list and management on the left, Set Builder on the
