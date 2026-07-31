@@ -645,6 +645,278 @@ suite("equip-queue-ordering", world(function(ck, w, A)
     w4:teardown()
 end))
 
+-- §1.2 / §2.5A explicit-empty slots: the sentinel entry, its planning, and the
+-- bag-space rule that governs it.
+suite("equip-explicit-empty", world(function(ck, w, A)
+    ck(A:IsEmptyEntry({ id = 0 }) == true, "id 0 is the explicit-empty sentinel")
+    ck(A:IsEmptyEntry(A:EmptyEntry()) == true, "EmptyEntry() builds a sentinel")
+    ck(A:IsEmptyEntry(A:IdentityFromLink(L(1001))) == false, "a real item is not a sentinel")
+    ck(A:IsEmptyEntry(nil) == false, "nil is not a sentinel")
+    ck(A:EntryLink(A:EmptyEntry()) == nil, "the sentinel resolves to no item link")
+
+    -- a governed empty slot with something in it is stripped into a bag
+    w:setWorn(13, L(2001))
+    w:defineSet("strip", { [13] = mock.EMPTY })
+    local freeBefore = w:countFreeBagSlots()
+    ck(A:SlotMatches(13, A:GetSet("strip").equip[13]) == false, "an occupied slot does not satisfy the sentinel")
+    A:EquipSet("strip")
+    ck(w.worn[13] == nil, "the explicitly-empty slot was stripped")
+    ck(w:countFreeBagSlots() == freeBefore - 1, "the item went into exactly one free bag slot")
+    ck(w.cursor == nil, "nothing is stranded on the cursor")
+    ck(A:IsSetEquipped("strip") == true, "an emptied slot counts as the set being worn")
+    ck(w:output():find("could not find") == nil, "a sentinel is never reported as a missing item")
+
+    -- the planner emits exactly one unequip op, and nothing at all once satisfied
+    local w2 = mock.new(P)
+    w2:setWorn(13, L(2001))
+    w2:defineSet("planned", { [13] = mock.EMPTY })
+    local p = w2.Addon:PlanSet(w2.Addon:GetSet("planned"), w2.Addon:BuildCensus())
+    ck(#p == 1, "one operation is planned for the sentinel")
+    ck(p[1].slot == 13 and p[1].unequip == true, "…and it is an unequip of that slot")
+    ck(p[1].from == nil, "an unequip op has no source location")
+    ck(w2.Addon:OpStillNeeded(p[1]) == true, "the unequip is still needed while the slot is occupied")
+    w2.worn[13] = nil
+    ck(w2.Addon:OpStillNeeded(p[1]) == false, "…and drops out once the slot is bare")
+    local p2 = w2.Addon:PlanSet(w2.Addon:GetSet("planned"), w2.Addon:BuildCensus())
+    ck(#p2 == 0, "an already-empty slot plans no operations")
+    w2:teardown()
+
+    -- no bag space: the spec's not-enough-room abort, slot untouched
+    local w3 = mock.new(P)
+    w3:setWorn(13, L(2001))
+    w3:fillBags(0)
+    w3:defineSet("noroom", { [13] = mock.EMPTY })
+    w3.Addon:EquipSet("noroom")
+    ck(w3.worn[13] == L(2001), "with no bag space the slot keeps its item")
+    ck(w3:output():find("bag space") ~= nil, "the not-enough-room abort is reported")
+    w3:teardown()
+
+    -- mixed set: the sentinel slot empties while the rest still equips
+    local w4 = mock.new(P)
+    w4:setWorn(13, L(2001))
+    w4:setWorn(1,  L(3002))
+    w4:setBag(0, 1, L(3001))
+    w4:defineSet("mixed", { [1] = L(3001), [13] = mock.EMPTY })
+    w4.Addon:EquipSet("mixed")
+    ck(w4.worn[1] == L(3001), "the ordinary slot equipped")
+    ck(w4.worn[13] == nil, "the sentinel slot emptied in the same pass")
+    w4:teardown()
+
+    -- a disabled slot is not governed even when it carries a sentinel
+    local w5 = mock.new(P)
+    w5:setWorn(13, L(2001))
+    w5:defineSet("off", { [13] = mock.EMPTY }, { [13] = true })
+    w5.Addon:EquipSet("off")
+    ck(w5.worn[13] == L(2001), "an ignored slot is never stripped")
+    w5:teardown()
+
+    -- in combat the strip queues like any other change, and drains on regen
+    local w6 = mock.new(P)
+    w6:setWorn(13, L(2001))
+    w6:defineSet("cqEmpty", { [13] = mock.EMPTY })
+    w6.combat = true
+    w6.Addon:EquipSet("cqEmpty")
+    ck(w6.worn[13] == L(2001), "nothing is stripped while in combat")
+    w6.combat = false
+    w6:fireEvent("PLAYER_REGEN_ENABLED")
+    w6:pumpTimers()
+    ck(w6.worn[13] == nil, "the strip happened when combat ended")
+    w6:teardown()
+
+    -- single-slot public equip honours the sentinel too
+    local w7 = mock.new(P)
+    w7:setWorn(13, L(2001))
+    w7.Addon:EquipSlot(13, w7.Addon:EmptyEntry())
+    ck(w7.worn[13] == nil, "EquipSlot with a sentinel takes the item off")
+    w7:teardown()
+end))
+
+-- §2.8 / §6.1 in-combat weapon swaps: the secure macro text and the queue split.
+suite("equip-combat-weapon-split", world(function(ck, w, A)
+    ck(A:IsSecureCombatSlot(16) and A:IsSecureCombatSlot(17) and A:IsSecureCombatSlot(18),
+       "slots 16/17/18 are the secure in-combat slots")
+    ck(A:IsSecureCombatSlot(13) == false, "trinkets are NOT secure in-combat slots")
+
+    w:setBag(0, 1, L(4002))   -- Test Sword
+    w:setBag(0, 2, L(4003))   -- Test Shield
+    w:setBag(0, 3, L(4004))   -- Test Bow
+    w:setBag(0, 4, L(3001))   -- Test Helm
+    w:defineSet("war", { [16] = L(4002), [17] = L(4003), [18] = L(4004), [1] = L(3001) })
+
+    local lines = A:WeaponMacroLines("war")
+    ck(#lines == 3, "one /equipslot line per governed weapon slot (got " .. #lines .. ")")
+    ck(lines[1] == "/equipslot [combat]16 Test Sword",  "main hand line")
+    ck(lines[2] == "/equipslot [combat]17 Test Shield", "off hand line")
+    ck(lines[3] == "/equipslot [combat]18 Test Bow",    "ranged line")
+    ck(A:SetHasCombatWeapons("war") == true, "the set is flagged as swappable in combat")
+
+    local macro = A:BuildSetMacroText("war")
+    ck(macro:find('\n/run ArmEquipSecure%("war"%)$') ~= nil,
+       "the macro ends with the flagged equip call")
+    ck(macro:find("/equipslot %[combat%]16") == 1, "the weapon lines come first")
+
+    -- a set governing no weapon slot is just the equip call
+    w:defineSet("cloth", { [1] = L(3001) })
+    ck(#A:WeaponMacroLines("cloth") == 0, "no weapon slots, no /equipslot lines")
+    ck(A:BuildSetMacroText("cloth") == '/run ArmEquipSecure("cloth")', "…just the equip call")
+    ck(A:SetHasCombatWeapons("cloth") == false, "…and it is not flagged")
+
+    -- an explicitly-empty weapon slot gets no line: there is no secure unequip
+    w:defineSet("noOff", { [16] = L(4002), [17] = mock.EMPTY })
+    local l2 = A:WeaponMacroLines("noOff")
+    ck(#l2 == 1 and l2[1]:find("%[combat%]16") ~= nil, "an explicit-empty weapon slot is skipped")
+
+    -- an ignored weapon slot gets no line either
+    w:defineSet("noMain", { [16] = L(4002) }, { [16] = true })
+    ck(#A:WeaponMacroLines("noMain") == 0, "an ignored weapon slot emits no line")
+
+    -- quotes in a set name cannot break out of the /run line
+    w:defineSet('say "hi"', { [1] = L(3001) })
+    ck(A:BuildSetMacroText('say "hi"') == '/run ArmEquipSecure("say \\"hi\\"")',
+       "quotes in a set name are escaped")
+
+    -- THE SPLIT: with the secure path in play the weapon slots are not pending
+    w.combat = true
+    A:EquipSet("war", { secureWeapons = true })
+    ck(A._pendingSet == "war", "the rest of the set is still queued for the end of combat")
+    ck(A._pendingSkip ~= nil, "a skip list was recorded")
+    ck(A._pendingSkip and A._pendingSkip[16] and A._pendingSkip[17] and A._pendingSkip[18],
+       "all three weapon slots are excluded from the pending overlay")
+    ck(A._pendingSkip and A._pendingSkip[1] == nil, "ordinary slots are still pending")
+    ck(w.worn[16] == nil, "the engine itself never moves a weapon during combat")
+
+    -- the ordinary (unbound) path claims nothing
+    A:EquipSet("war")
+    ck(A._pendingSkip == nil, "an ordinary in-combat equip claims no secure weapon handling")
+
+    w.combat = false
+    w:fireEvent("PLAYER_REGEN_ENABLED")
+    w:pumpTimers()
+    ck(w.worn[16] == L(4002) and w.worn[17] == L(4003) and w.worn[18] == L(4004),
+       "the drain completes every weapon slot out of combat")
+    ck(w.worn[1] == L(3001), "…and the ordinary slots too")
+    ck(A._pendingSkip == nil, "the skip list is consumed with the queue")
+
+    -- the global the secure macro calls really goes through the flagged path
+    local w2 = mock.new(P)
+    w2:setBag(0, 1, L(4002))
+    w2:defineSet("secure", { [16] = L(4002) })
+    w2.combat = true
+    _G.ArmEquipSecure("secure")
+    ck(w2.Addon._pendingSkip ~= nil and w2.Addon._pendingSkip[16] == true,
+       "ArmEquipSecure() marks the weapon slots as secure-handled")
+    w2:teardown()
+end))
+
+-- SavedVariables additivity: a set written by the released build must load, plan
+-- and equip exactly as it did before the sentinel existed.
+suite("sv-additive-legacy-sets", world(function(ck, w, A)
+    A.db.sets["legacy"] = {
+        name = "legacy", icon = "Interface\\Icons\\INV_Misc_Bag_08", order = 1,
+        equip = {
+            [1]  = { id = 3001, str = "3001:0:0:0:0:0:0:0:60:0", exact = "3001:0:0" },
+            [11] = { id = 1001, str = "1001:0:0:0:0:0:0:0:60:0", exact = "1001:0:0" },
+        },
+        disabled = { [4] = true, [19] = true },
+    }
+    for slotId, e in pairs(A.db.sets.legacy.equip) do
+        ck(A:IsEmptyEntry(e) == false, "legacy entry in slot " .. slotId .. " is not read as a sentinel")
+    end
+
+    w:setBag(0, 1, L(3001))
+    w:setBag(0, 2, L(1001))
+    A:EquipSet("legacy")
+    ck(w.worn[1] == L(3001) and w.worn[11] == L(1001), "a legacy set equips exactly as before")
+    ck(A:IsSetEquipped("legacy") == true, "…and reads as equipped afterwards")
+
+    local n = 0
+    for _ in pairs(A.db.sets.legacy) do n = n + 1 end
+    ck(n == 5, "equipping a legacy set adds no keys to it (name/icon/order/equip/disabled)")
+    for _, e in pairs(A.db.sets.legacy.equip) do
+        local fields = 0
+        for _ in pairs(e) do fields = fields + 1 end
+        ck(fields == 3, "a legacy entry still carries exactly id/str/exact")
+    end
+
+    -- export/import round trip: the legacy record survives byte-identically, and a
+    -- sentinel rides in the existing id field with no format change
+    local w2 = mock.new(P)
+    local B = w2.Addon
+    B.db.sets["round"] = {
+        name = "round", icon = "icon", order = 1,
+        equip = { [1] = { id = 3001, str = "3001:0:0:0:0:0:0:0:60:0", exact = "3001:0:0" },
+                  [13] = B:EmptyEntry() },
+        disabled = { [4] = true },
+    }
+    local str = B:ExportSets()
+    ck(str:find("^DaseekiArmory:v3") ~= nil, "the export version is unchanged")
+    ck(str:find("S;13;0;;") ~= nil, "the sentinel exports as id 0 in the existing field")
+    B.db.sets = {}
+    local ok, count = B:ImportSets(str)
+    ck(ok and count == 1, "the string imports")
+    local back = B.db.sets["round"]
+    ck(back ~= nil, "the set came back under its own name")
+    ck(back and back.equip[1].id == 3001 and back.equip[1].exact == "3001:0:0",
+       "the ordinary entry round-trips unchanged")
+    ck(back and B:IsEmptyEntry(back.equip[13]) == true, "the sentinel round-trips as explicit-empty")
+    ck(back and back.disabled[4] == true, "ignored slots round-trip")
+    w2:teardown()
+
+    -- save-over keeps a deliberate empty marker but never invents one
+    local w3 = mock.new(P)
+    local C = w3.Addon
+    w3:setWorn(1, L(3001))
+    C.db.sets["keep"] = { name = "keep", equip = { [13] = C:EmptyEntry() }, disabled = {} }
+    C:SaveCurrentGear("keep")
+    ck(C:IsEmptyEntry(C.db.sets.keep.equip[13]) == true, "an explicit-empty marker survives save-over")
+    ck(C.db.sets.keep.equip[1] ~= nil, "worn gear was captured")
+    ck(C.db.sets.keep.equip[14] == nil, "a merely-bare slot is NOT turned into a marker")
+    w3:teardown()
+end))
+
+-- TRINKETMENU §4.2 cooldown readout text. Pure formatter: trinkets.lua is loaded
+-- with no WoW API at all, which is the property this suite asserts first.
+suite("trinket-cooldown-text", function(ck)
+    local T = { db = { settings = { trinkets = { showCooldowns = true, largeNumbers = true } } } }
+    function T:TrySetNumeral() end
+    function T:Col() return 1, 1, 1, 1 end
+
+    local fn, err = loadfile(P("trinkets.lua"))
+    ck(fn ~= nil, "trinkets.lua compiles" .. (fn and "" or (" -> " .. tostring(err))))
+    if not fn then return end
+    local ok, rerr = pcall(fn, "Daseeki-Armory", T)
+    ck(ok, "trinkets.lua loads with no WoW API present" .. (ok and "" or (" -> " .. tostring(rerr))))
+    ck(type(T.CooldownText) == "function", "the formatter is published as Addon:CooldownText")
+    if type(T.CooldownText) ~= "function" then return end
+
+    local function F(start, dur, now, prev) return T:CooldownText(start, dur, now, prev) end
+
+    ck(F(0, 60, 100, "") == "", "start = 0 (not on cooldown) is blank")
+    ck(F(nil, nil, 100, "") == "", "nil start/duration is blank")
+    ck(F(100, 0, 100, "") == "", "a zero duration is blank")
+    ck(F(100, 30, 140, "") == "", "an elapsed cooldown is blank")
+
+    ck(F(100, 45, 100, "") == "45 s", "under a minute reads in seconds")
+    ck(F(100, 45, 102, "") == "43 s", "…counted down from GetTime()")
+    ck(F(100, 10.4, 100, "") == "10 s", "seconds round to nearest: 10.4 -> 10")
+    ck(F(100, 10.6, 100, "") == "11 s", "seconds round to nearest: 10.6 -> 11")
+    ck(F(100, 59.9, 100, "") == "60 s", "59.9 s still reads in seconds, rounded to 60")
+
+    -- the order-dependent global-cooldown rule (spec §4.2 / §7.9)
+    ck(F(100, 2, 100, "") == "", "a countdown that would START under 3 s is suppressed")
+    ck(F(100, 2, 100, nil) == "", "…a nil field counts as blank")
+    ck(F(100, 2, 100, "5 s") == "2 s", "…but one already ticking keeps rendering through 3, 2, 1")
+    ck(F(100, 3, 100, "") == "3 s", "exactly 3 s is not suppressed")
+
+    ck(F(100, 60, 100, "") == "1 m", "60 s reads as 1 m")
+    ck(F(100, 61, 100, "") == "2 m", "minutes round UP: 61 s -> 2 m")
+    ck(F(100, 120, 100, "") == "2 m", "120 s -> 2 m")
+    ck(F(100, 3599, 100, "") == "60 m", "just under an hour still reads in minutes")
+    ck(F(100, 3600, 100, "") == "1 h", "an hour reads in hours")
+    ck(F(100, 3601, 100, "") == "2 h", "hours round UP")
+    ck(F(100, 7200, 100, "") == "2 h", "two hours")
+end)
+
 -- Interface compatibility: the surface the rest of Armory and user macros use.
 suite("equip-public-surface", world(function(ck, w, A)
     for _, name in ipairs({
@@ -655,13 +927,21 @@ suite("equip-public-surface", world(function(ck, w, A)
         "QueueCombatAction", "DeferToCombatEnd", "EquipContainerItemToSlot",
         "UnequipSlot", "GetInventoryItemsForSlot", "SwapEquippedSlots",
         "EquipSet", "IsSetEquipped", "ToggleSet", "GetEquipMacro",
+        -- explicit-empty slots + the secure in-combat weapon path
+        "IsEmptyEntry", "EmptyEntry", "SetSlotEmpty", "ToggleSlotEmpty",
+        "IsSlotEmptySentinel", "IsSecureCombatSlot", "WeaponMacroLines",
+        "BuildSetMacroText", "SetHasCombatWeapons",
     }) do
         ck(type(A[name]) == "function", "Addon:" .. name .. " is present")
     end
     ck(type(A.SLOT_INVTYPES) == "table", "Addon.SLOT_INVTYPES is present")
+    ck(type(A.SECURE_COMBAT_SLOTS) == "table", "Addon.SECURE_COMBAT_SLOTS is present")
+    ck(#A.SECURE_COMBAT_SLOTS == 3, "exactly three slots may swap in combat")
+    ck(type(A.UNEQUIP_ICON) == "string", "Addon.UNEQUIP_ICON is published for the overlays")
 
     ck(type(_G.ArmEquip) == "function", "global ArmEquip is exported for macros")
     ck(type(_G.ArmToggle) == "function", "global ArmToggle is exported for macros")
+    ck(type(_G.ArmEquipSecure) == "function", "global ArmEquipSecure is exported for the secure macro")
     ck(_G.ArmoryEquipSet == _G.ArmEquip, "ArmoryEquipSet aliases ArmEquip")
     ck(_G.ArmoryToggleSet == _G.ArmToggle, "ArmoryToggleSet aliases ArmToggle")
 

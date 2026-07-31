@@ -7,6 +7,16 @@
       - str   : the itemString after "item:" (e.g. "12345:0:0:0:0:0:1234:...")
       - exact : "<id>:<enchant>:<suffix>" — ItemRack-style exact identity, so an
                 enchanted/suffixed item is distinguished from a plain one.
+
+    EXPLICIT-EMPTY SENTINEL (ITEMRACK_BEHAVIOR_SPEC.md §1.2). Three slot states,
+    not two:
+      - absent key            -> "not in this set", the engine never touches it
+      - { id = 0, empty = true } -> "this slot must be EMPTY", the engine takes
+                                 whatever is worn there off into a free bag slot
+      - a real entry          -> "wear this item"
+    The sentinel is purely additive: it is a new VALUE inside the existing
+    set.equip map, no new SavedVariables key, and no set saved before this
+    version can contain one (SetSlotFromLink only ever stores a real item id).
 --]]
 
 local _, Addon = ...
@@ -38,6 +48,26 @@ function Addon:ExactKey(itemString)
     return id .. ":" .. enchant .. ":" .. suffix
 end
 
+-- ── Explicit-empty sentinel (spec §1.2) ──────────────────────────────────────
+-- id 0 is the sentinel: no real item ever has base id 0, so this is unambiguous
+-- against every set saved before the feature existed. `empty = true` is written
+-- alongside for readability; either field alone identifies the sentinel, so an
+-- entry that survives an export/import round trip (which carries only the id)
+-- still reads as empty.
+function Addon:IsEmptyEntry(entry)
+    if type(entry) ~= "table" then return false end
+    return entry.empty == true or entry.id == 0
+end
+
+function Addon:EmptyEntry()
+    return { id = 0, empty = true }
+end
+
+-- Item changes invalidate the secure in-combat weapon macros (keybind.lua).
+local function macrosDirty()
+    if Addon.QueueMacroRefresh then Addon:QueueMacroRefresh() end
+end
+
 function Addon:IdentityFromLink(link)
     local str = Addon:ItemString(link)
     if not str then return nil end
@@ -47,6 +77,7 @@ end
 -- Rebuild a usable item string/link for tooltips, textures, GetItemInfo.
 function Addon:EntryLink(entry)
     if not entry then return nil end
+    if Addon:IsEmptyEntry(entry) then return nil end   -- the sentinel has no item
     if entry.str then return "item:" .. entry.str end
     if entry.id and entry.id > 0 then return "item:" .. entry.id end
     return nil
@@ -188,6 +219,14 @@ end
 function Addon:SaveCurrentGear(name)
     local set = Addon.db.sets[name]
     if not set then return false, "Set not found" end
+    -- Explicit-empty markers are a deliberate authoring choice, not a snapshot of
+    -- what happens to be worn, so re-saving the set keeps them. Slots that are
+    -- merely bare stay OUT of the set (absent = "leave alone"), exactly as before
+    -- this feature existed.
+    local keepEmpty = {}
+    for slotId, e in pairs(set.equip) do
+        if Addon:IsEmptyEntry(e) then keepEmpty[slotId] = true end
+    end
     wipe(set.equip)
     for _, slotId in ipairs(Addon.SLOT_IDS) do
         if not (set.disabled and set.disabled[slotId]) then
@@ -195,9 +234,12 @@ function Addon:SaveCurrentGear(name)
             if link then
                 local e = Addon:IdentityFromLink(link)
                 if e then set.equip[slotId] = e end
+            elseif keepEmpty[slotId] then
+                set.equip[slotId] = Addon:EmptyEntry()
             end
         end
     end
+    macrosDirty()
     return true
 end
 
@@ -207,6 +249,36 @@ function Addon:SetSlotFromLink(name, slotId, link)
     local e = Addon:IdentityFromLink(link)
     if not e then return false end
     set.equip[slotId] = e
+    macrosDirty()
+    return true
+end
+
+-- ── Explicit-empty slot editing (spec §1.2) ───────────────────────────────────
+-- Mark the slot as "must be empty". The slot becomes governed (any ignore flag is
+-- lifted), so the engine will take off whatever is worn there when the set is
+-- equipped.
+function Addon:SetSlotEmpty(name, slotId)
+    local set = Addon.db.sets[name]
+    if not set then return false end
+    set.equip[slotId] = Addon:EmptyEntry()
+    if set.disabled then set.disabled[slotId] = nil end
+    macrosDirty()
+    return true
+end
+
+function Addon:IsSlotEmptySentinel(name, slotId)
+    local set = Addon.db.sets[name]
+    return set ~= nil and Addon:IsEmptyEntry(set.equip[slotId])
+end
+
+-- Editor gesture: empty <-> not-in-set. Returns true when the slot is now marked
+-- empty, false when it was cleared back out of the set.
+function Addon:ToggleSlotEmpty(name, slotId)
+    if Addon:IsSlotEmptySentinel(name, slotId) then
+        Addon:ClearSlot(name, slotId)
+        return false
+    end
+    Addon:SetSlotEmpty(name, slotId)
     return true
 end
 
@@ -220,6 +292,7 @@ function Addon:ClearSlot(name, slotId)
     local set = Addon.db.sets[name]
     if not set then return false end
     set.equip[slotId] = nil
+    macrosDirty()
     return true
 end
 
@@ -284,11 +357,18 @@ function Addon:ImportSets(str)
         elseif parts[1] == "S" and cur then
             local slotId = tonumber(parts[2])
             if slotId then
-                cur.equip[slotId] = {
-                    id    = tonumber(parts[3]) or 0,
-                    exact = (parts[4] ~= "" and parts[4]) or nil,
-                    str   = (parts[5] ~= "" and parts[5]) or nil,
-                }
+                local id = tonumber(parts[3]) or 0
+                if id == 0 then
+                    -- sentinel: "this slot must be empty" (spec §1.2). It rides in
+                    -- the existing id field, so the export format is unchanged.
+                    cur.equip[slotId] = Addon:EmptyEntry()
+                else
+                    cur.equip[slotId] = {
+                        id    = id,
+                        exact = (parts[4] ~= "" and parts[4]) or nil,
+                        str   = (parts[5] ~= "" and parts[5]) or nil,
+                    }
+                end
             end
         elseif parts[1] == "D" and cur then
             for s in (parts[2] or ""):gmatch("(%d+)") do

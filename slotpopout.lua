@@ -331,13 +331,20 @@ function Addon:ClearPendingSlots()
     if Addon.UpdatePaperdollPending then Addon:UpdatePaperdollPending() end
 end
 
-function Addon:MarkSetPending(name)
+-- `skip` (optional) is the set of slots that are NOT waiting for combat to end —
+-- the weapon slots a secure /equipslot macro is swapping right now (equip.lua
+-- §"Secure in-combat weapon swaps"). They get no pending overlay.
+function Addon:MarkSetPending(name, skip)
     local set = Addon.db.sets[name]
     if not set then return end
     Addon._pendingSlots = Addon._pendingSlots or {}
     for _, slotId in ipairs(Addon.SLOT_IDS) do
-        if Addon:IsSlotActive(set, slotId) and not Addon:SlotMatches(slotId, set.equip[slotId]) then
-            Addon._pendingSlots[slotId] = Addon:EntryTexture(set.equip[slotId]) or "Interface\\Icons\\INV_Misc_QuestionMark"
+        if not (skip and skip[slotId])
+           and Addon:IsSlotActive(set, slotId)
+           and not Addon:SlotMatches(slotId, set.equip[slotId]) then
+            local entry = set.equip[slotId]
+            Addon._pendingSlots[slotId] = (Addon:IsEmptyEntry(entry) and Addon.UNEQUIP_ICON)
+                or Addon:EntryTexture(entry) or "Interface\\Icons\\INV_Misc_QuestionMark"
         end
     end
     Addon:UpdateAllSlotPopouts()

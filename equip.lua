@@ -28,6 +28,24 @@
 
     Planning is separated from execution so the whole engine can be driven
     headlessly by harness/run-selftests.lua against a virtual inventory.
+
+    Two behaviors that ride on top of that core:
+
+      * EXPLICIT-EMPTY SLOTS (ITEMRACK spec §1.2 / §2.5A). A set entry of
+        { id = 0 } means "this slot must be EMPTY". The planner emits an unequip
+        operation for it; execution needs one free bag slot and aborts the whole
+        pass with the not-enough-room message when there is none.
+
+      * IN-COMBAT WEAPON SWAPS (ITEMRACK spec §2.8 / §6.1). Nothing in this file
+        can change gear during combat: every move here is a cursor pickup, which
+        the client refuses in combat. The spec's mechanism is a SECURE one — a
+        macro attribute written OUT of combat onto a SecureActionButton, carrying
+        one `/equipslot [combat]<slot> <item name>` line per governed weapon slot
+        (16/17/18 only). Pressing the set's key binding in combat therefore swaps
+        main hand / off hand / ranged immediately through the client's own secure
+        command, while every other slot queues for the end of combat. This file
+        owns the macro TEXT (BuildSetMacroText) and the queue split; keybind.lua
+        owns the button and the binding.
 --]]
 
 local _, Addon = ...
@@ -51,6 +69,14 @@ local ABORT_TEXT = {
 }
 
 local UNEQUIP_ICON = "Interface\\Buttons\\UI-GroupLoot-Pass-Up"
+Addon.UNEQUIP_ICON = UNEQUIP_ICON
+
+-- The only slots a secure `/equipslot [combat]` line may change during combat
+-- (ITEMRACK_BEHAVIOR_SPEC.md §2.8 "the one exception that does swap in combat").
+-- Ordered, because the macro lines are emitted in this order.
+Addon.SECURE_COMBAT_SLOTS = { 16, 17, 18 }
+local IS_SECURE_COMBAT_SLOT = { [16] = true, [17] = true, [18] = true }
+function Addon:IsSecureCombatSlot(slotId) return IS_SECURE_COMBAT_SLOT[slotId] == true end
 
 -- Which INVTYPE_* values may go into each inventory slot (for inventory flyouts).
 -- Slot model per ITEMRACK_BEHAVIOR_SPEC.md §0, minus the ammo slot, which this
@@ -169,9 +195,11 @@ function Addon:IsSlotActive(set, slotId)
     return set.equip[slotId] ~= nil and not (set.disabled and set.disabled[slotId])
 end
 
--- Exact identity: base id + enchant + suffix must all agree.
+-- Exact identity: base id + enchant + suffix must all agree. An explicit-empty
+-- entry is satisfied only by a genuinely bare slot (spec §1.2).
 function Addon:SlotMatches(slotId, entry)
     if not entry then return true end
+    if Addon:IsEmptyEntry(entry) then return wornLink(slotId) == nil end
     local exact = wornIdentity(slotId)
     if not exact then return false end
     return entry.exact ~= nil and exact == entry.exact
@@ -182,6 +210,7 @@ end
 -- ItemRack import without enchant data) doesn't match the live enchanted item.
 function Addon:SlotMatchesBase(slotId, entry)
     if not entry then return true end
+    if Addon:IsEmptyEntry(entry) then return wornLink(slotId) == nil end
     local _, base = wornIdentity(slotId)
     if not base then return false end
     return entry.id ~= nil and base == entry.id
@@ -306,22 +335,33 @@ function Addon:FindFreeBagSlot()
     return nil
 end
 
--- Is the set's item for this slot equippable right now (worn or in bags)?
+-- Is the set's item for this slot equippable right now (worn or in bags)? An
+-- explicit-empty entry needs no item — only somewhere to put what comes off.
 function Addon:IsEntryAvailable(entry)
     if not entry then return false end
-    return resolve(Addon:BuildCensus(), entry) ~= nil
+    local census = Addon:BuildCensus()
+    if Addon:IsEmptyEntry(entry) then return census.free[1] ~= nil end
+    return resolve(census, entry) ~= nil
 end
 
 -- ── Planner ───────────────────────────────────────────────────────────────────
 -- Pure over (set, census): produces the operation list and the missing-item
 -- report without touching the cursor.
 --   op = { slot = <target>, from = <location>, twoHand = <bool> }
+--   op = { slot = <target>, unequip = true }            -- explicit-empty slot
 function Addon:PlanSet(set, census)
     local plan, missing, claims = {}, {}, {}
 
     for _, slotId in ipairs(slotIds()) do
         local entry = Addon:IsSlotActive(set, slotId) and set.equip[slotId] or nil
-        if entry and not Addon:SlotMatches(slotId, entry) then
+        if entry and Addon:SlotMatches(slotId, entry) then
+            entry = nil                     -- already satisfied, nothing to plan
+        end
+        if entry and Addon:IsEmptyEntry(entry) then
+            -- Explicit-empty (spec §1.2): nothing to find, nothing to claim, and
+            -- never reported missing — the slot simply has to come off.
+            table.insert(plan, { slot = slotId, entry = entry, unequip = true })
+        elseif entry then
             -- Exclude the target slot as its own source: it only ever matches
             -- when the slot is already satisfied, which is handled above.
             local loc = resolve(census, entry, claims, slotId)
@@ -398,6 +438,9 @@ end
 -- than trusted from plan time — otherwise the later op would undo the earlier one.
 function Addon:OpStillNeeded(op)
     if Addon:SlotMatches(op.slot, op.entry) then return false end
+    -- An unequip has no source to re-validate: SlotMatches above already said the
+    -- slot is still occupied, which is the whole condition.
+    if op.unequip then return true end
     -- Explicit branch, not `a and b or c`: an emptied bag slot yields nil, which
     -- would fall through to the worn lookup with a nil slot id.
     local link
@@ -413,6 +456,11 @@ end
 function Addon:ExecuteOp(op, census)
     local g = moveGuard()
     if g then return false, g end
+
+    -- Explicit-empty: move the worn item into a free bag slot. stow() raises
+    -- ABORT_NO_ROOM when there is nowhere to put it, and EquipPass stops the
+    -- whole pass there (spec §2.5A).
+    if op.unequip then return stow(op.slot, census) end
 
     if op.from.where == "bag" then
         if bagLocked(op.from.bag, op.from.slot) or slotLocked(op.slot) then
@@ -443,6 +491,7 @@ end
 -- Public single-slot equip.
 function Addon:EquipSlot(slotId, entry)
     if not entry or Addon:SlotMatches(slotId, entry) then return true end
+    if Addon:IsEmptyEntry(entry) then return Addon:UnequipSlot(slotId) end
     local census = Addon:BuildCensus()
     local loc = resolve(census, entry, nil, slotId)
     if not loc then return false end
@@ -615,6 +664,7 @@ function Addon:DrainCombatQueue()
 
     Addon._combatQueue = nil
     Addon._pendingSet  = nil
+    Addon._pendingSkip = nil
     Addon:StopQueueWatcher()
 
     -- Deterministic order: ascending target slot, so trinket 13 drains before 14.
@@ -661,12 +711,27 @@ function Addon:QueueCombatAction(slot, action)
     return true
 end
 
-function Addon:DeferToCombatEnd(name)
-    Addon._pendingSet = name
+function Addon:DeferToCombatEnd(name, secureWeapons)
+    Addon._pendingSet  = name
+    Addon._pendingSkip = nil
+    if secureWeapons then
+        -- Weapon slots are being swapped right now by the secure macro, so they
+        -- are not part of what is waiting for combat to end.
+        local skip = {}
+        for _, slotId in ipairs(Addon.SECURE_COMBAT_SLOTS) do skip[slotId] = true end
+        Addon._pendingSkip = skip
+    end
     Addon:EnsureRegenWatcher()
-    if Addon.MarkSetPending then Addon:MarkSetPending(name) end
+    if Addon.MarkSetPending then Addon:MarkSetPending(name, Addon._pendingSkip) end
+
+    local tail = ""
+    if secureWeapons then
+        tail = " Weapons swap now."
+    elseif Addon:SetHasCombatWeapons(name) then
+        tail = " Give the set a key binding to swap its weapons during combat."
+    end
     Addon:ChatMsg("\"" .. tostring(name) .. "\" queued " .. Addon:QueueReason()
-        .. " — it will equip " .. Addon:QueueWhen() .. ".")
+        .. " — it will equip " .. Addon:QueueWhen() .. "." .. tail)
 end
 
 -- ── Equip a specific inventory item into a slot (used by flyout / sidebar) ─────
@@ -763,12 +828,67 @@ function Addon:GetInventoryItemsForSlot(slotId, includeEquipped)
     return out
 end
 
+-- ── Secure in-combat weapon swaps (spec §2.8 / §6.1) ──────────────────────────
+-- The client will not let this addon move an item during combat — every path in
+-- this file ends in a cursor pickup, which is refused. The one mechanism the
+-- spec describes that DOES work is the client's own secure macro command: a
+-- SecureActionButton carrying `/equipslot [combat]<slot> <item name>` lines,
+-- written while OUT of combat, fired by a real key press. The `[combat]`
+-- condition means the line is inert out of combat, where the normal engine below
+-- already does the work.
+
+-- Macro text is a quoted Lua string inside a macro line; a set name containing a
+-- quote or backslash would otherwise truncate the whole line.
+local function escapeMacroArg(s)
+    return (tostring(s):gsub("\\", "\\\\"):gsub('"', '\\"'))
+end
+
+-- One `/equipslot` line per governed weapon slot whose item name resolves right
+-- now. Skipped: slots the set does not govern, slots the set marks explicitly
+-- empty (there is no secure "take this off" command), and items whose name the
+-- client has not cached yet.
+function Addon:WeaponMacroLines(name)
+    local set, lines = Addon:GetSet(name), {}
+    if not set then return lines end
+    for _, slotId in ipairs(Addon.SECURE_COMBAT_SLOTS) do
+        local entry = Addon:IsSlotActive(set, slotId) and set.equip[slotId] or nil
+        if entry and not Addon:IsEmptyEntry(entry) then
+            local link = Addon:EntryLink(entry)
+            local itemName = link and GetItemInfo and GetItemInfo(link) or nil
+            if itemName then
+                lines[#lines + 1] = "/equipslot [combat]" .. slotId .. " " .. itemName
+            end
+        end
+    end
+    return lines
+end
+
+-- Full macro body for a set's secure button: the weapon lines (which only fire in
+-- combat) followed by the ordinary equip call, flagged so the queue knows the
+-- weapon slots are already being handled.
+function Addon:BuildSetMacroText(name)
+    local lines = Addon:WeaponMacroLines(name)
+    lines[#lines + 1] = '/run ArmEquipSecure("' .. escapeMacroArg(name) .. '")'
+    return table.concat(lines, "\n")
+end
+
+-- Does this set govern any slot the secure path can swap mid-combat?
+function Addon:SetHasCombatWeapons(name)
+    return #Addon:WeaponMacroLines(name) > 0
+end
+
 -- ── Public API ────────────────────────────────────────────────────────────────
-function Addon:EquipSet(name)
+-- opts.secureWeapons — set by the secure macro path only. It means the client is
+-- equipping slots 16/17/18 itself via `/equipslot [combat]`, so those slots are
+-- excluded from the pending-swap overlay: they are not waiting for combat to end,
+-- they are changing right now. The end-of-combat drain still re-plans the whole
+-- set, which is a no-op for any slot the secure lines already satisfied and a
+-- repair for any that failed.
+function Addon:EquipSet(name, opts)
     if not Addon:GetSet(name) then return false end
 
     if Addon:MustQueueSwap() then
-        Addon:DeferToCombatEnd(name)
+        Addon:DeferToCombatEnd(name, opts and opts.secureWeapons)
         return false
     end
 
@@ -801,5 +921,9 @@ end
 -- ── Globals for macros — unique to Armory (no clash with ItemRack's EquipSet) ──
 function ArmEquip(name)  return DaseekiArmory:EquipSet(name)  end
 function ArmToggle(name) return DaseekiArmory:ToggleSet(name) end
+-- Called only from the secure set-binding macro, after its /equipslot lines.
+function ArmEquipSecure(name)
+    return DaseekiArmory:EquipSet(name, { secureWeapons = true })
+end
 ArmoryEquipSet  = ArmEquip
 ArmoryToggleSet = ArmToggle

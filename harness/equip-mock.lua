@@ -28,7 +28,12 @@ local DEFAULT_ITEMS = {
     [4001] = { "Test Greatsword",   "INVTYPE_2HWEAPON"},
     [4002] = { "Test Sword",        "INVTYPE_WEAPON"  },
     [4003] = { "Test Shield",       "INVTYPE_SHIELD"  },
+    [4004] = { "Test Bow",          "INVTYPE_RANGED"  },
 }
+
+-- Pass as a slot value to w:defineSet to store the explicit-empty sentinel
+-- ("this slot must be EMPTY") rather than an item.
+Mock.EMPTY = "<<EMPTY>>"
 
 -- Build an item link. enchant/suffix default to 0.
 function Mock.link(id, enchant, suffix)
@@ -121,7 +126,8 @@ function Mock.new(P)
         "CursorHasItem", "ClearCursor", "SpellIsTargeting", "UnitAffectingCombat",
         "UnitIsDeadOrGhost", "UnitIsFeignDeath", "GetItemInfoInstant", "GetItemInfo",
         "CreateFrame", "C_Timer", "print", "DaseekiArmory",
-        "ArmEquip", "ArmToggle", "ArmoryEquipSet", "ArmoryToggleSet",
+        "ArmEquip", "ArmToggle", "ArmEquipSecure", "ArmoryEquipSet", "ArmoryToggleSet",
+        "strtrim", "wipe",
     }
     local saved = {}
     for _, k in ipairs(INSTALLED) do saved[k] = G[k] end
@@ -209,6 +215,10 @@ function Mock.new(P)
 
     G.C_Timer = { After = function(_, fn) w.timers[#w.timers + 1] = fn end }
 
+    -- Blizzard string/table helpers sets.lua uses (export/import, save-over).
+    G.strtrim = function(s) return (tostring(s):gsub("^%s+", ""):gsub("%s+$", "")) end
+    G.wipe    = function(t) for k in pairs(t) do t[k] = nil end return t end
+
     G.print = function(...)
         local parts = {}
         for i = 1, select("#", ...) do parts[#parts + 1] = tostring((select(i, ...))) end
@@ -232,11 +242,16 @@ function Mock.new(P)
 
     w.Addon = Addon
 
-    -- Define a set from a { [slotId] = link } map.
+    -- Define a set from a { [slotId] = link } map. Mock.EMPTY stores the
+    -- explicit-empty sentinel instead of an item.
     function w:defineSet(name, slots, disabled)
         local set = { name = name, equip = {}, disabled = disabled or {} }
         for slotId, link in pairs(slots) do
-            set.equip[slotId] = Addon:IdentityFromLink(link)
+            if link == Mock.EMPTY then
+                set.equip[slotId] = Addon:EmptyEntry()
+            else
+                set.equip[slotId] = Addon:IdentityFromLink(link)
+            end
         end
         Addon.db.sets[name] = set
         return set

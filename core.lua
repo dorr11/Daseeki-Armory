@@ -94,7 +94,15 @@ local DEFAULT_DB = {
             blizzardBlockValue = false,
         },
         trinkets = {
-            showCooldowns = true,      -- cooldown spiral/text on the trinket slots + flyout
+            -- Cooldown spiral/text on the trinket slots, their detached popouts,
+            -- and the trinket flyout. TRINKETMENU_BEHAVIOR_SPEC §6 defaults its
+            -- numeric text OFF; Armory has shipped this ON since it was added, so
+            -- the released default is kept (turning it off for existing users
+            -- would be a silent regression). Additive key, no migration.
+            showCooldowns = true,
+            -- Spec §4.3 / §6: large = 16pt gold centered, small = 14pt white at
+            -- the bottom edge. Spec default is large.
+            largeNumbers  = true,
         },
         charWindow = {
             qualityBorders = true,     -- quality-colored borders on equipped-slot buttons
@@ -229,6 +237,8 @@ function Addon:OnLogin()
     -- global EquipSet(). Use: /run ArmEquip("1 - DPS")
     ArmEquip  = function(name) return Addon:EquipSet(name)  end
     ArmToggle = function(name) return Addon:ToggleSet(name) end
+    -- used only by the secure set-binding macro, after its /equipslot lines
+    ArmEquipSecure = function(name) return Addon:EquipSet(name, { secureWeapons = true }) end
 
     local n = 0
     for _ in pairs(Addon.db.sets) do n = n + 1 end

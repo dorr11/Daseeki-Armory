@@ -455,26 +455,56 @@ local function buildPaperdoll(flow, panel)
         local slotId = self._slotId
         local set = Addon.db.sets[name]
         local uneq
-        if set and set.equip[slotId] then
+        local entry   = set and set.equip[slotId]
+        local isEmpty = entry ~= nil and Addon:IsEmptyEntry(entry)
+        if entry then
             uneq = { fn = function() Addon:ClearSlot(name, slotId); Addon:RefreshBuilder() end,
                      label = "Remove from set" }
-            local link = Addon:EntryLink(set.equip[slotId])
+        end
+        -- An explicit-empty slot has no item to describe, so the tooltip explains
+        -- the state and the gesture instead; a slot that is not in the set at all
+        -- advertises the gesture. Only ever Show() a tooltip we actually own.
+        local shown = false
+        if isEmpty then
+            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+            GameTooltip:AddLine(self._slotName or "Slot", 1, 1, 1)
+            GameTooltip:AddLine("Must be EMPTY: this set takes off whatever is worn here.", 1, 0.5, 0)
+            GameTooltip:AddLine("Shift-click: stop governing this slot", 0.5, 0.5, 0.5)
+            shown = true
+        elseif entry then
+            local link = Addon:EntryLink(entry)
             if link then
                 GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
                 GameTooltip:SetHyperlink(link)
-                GameTooltip:Show()
+                shown = true
             end
+        else
+            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+            GameTooltip:AddLine(self._slotName or "Slot", 1, 1, 1)
+            GameTooltip:AddLine("Shift-click: require this slot to be empty", 0.5, 0.5, 0.5)
+            shown = true
         end
+        if shown then GameTooltip:Show() end
         Addon:ShowItemFlyout(self, slotId, function(item)
             Addon:SetSlotFromLink(name, slotId, item.link)
             if set and set.disabled then set.disabled[slotId] = nil end
             Addon:RefreshBuilder()
         end, uneq, nil, true)  -- include currently-equipped items in the builder
     end
+    -- Shift+Left-click toggles the explicit-empty marker (spec §1.2: a slot the
+    -- set deliberately strips, distinct from a slot it simply ignores).
     -- Right-click disables the slot; Shift+Right-click clears it.
     local function slotClick(self, button)
         local name = panel.selectedSet
-        if not name or button ~= "RightButton" then return end
+        if not name then return end
+        if button == "LeftButton" then
+            if not IsShiftKeyDown() then return end
+            Addon:ToggleSlotEmpty(name, self._slotId)
+            Addon:HideItemFlyout()
+            Addon:RefreshBuilder()
+            return
+        end
+        if button ~= "RightButton" then return end
         if IsShiftKeyDown() then Addon:ClearSlot(name, self._slotId)
         else Addon:ToggleSlotDisabled(name, self._slotId) end
         Addon:RefreshBuilder()
@@ -507,6 +537,14 @@ local function buildPaperdoll(flow, panel)
         UI.Skin(b.glow, function(self) self:SetVertexColor(UI.Color("danger")) end)
         b.off = b:CreateTexture(nil, "OVERLAY"); b.off:SetAllPoints(); b.off:Hide()
         UI.Skin(b.off, function(self) self:SetColorTexture(UI.Color("ground", 0.65)) end)
+        -- explicit-empty marker: the same red X the flyout uses for "take off",
+        -- badged bottom-left so an emptied slot reads differently from an ignored
+        -- one and from a slot that is simply not in the set (spec §5.2)
+        b.emptyMark = b:CreateTexture(nil, "OVERLAY", nil, 7)
+        b.emptyMark:SetTexture("Interface\\Buttons\\UI-GroupLoot-Pass-Up")
+        b.emptyMark:SetSize(16, 16)
+        b.emptyMark:SetPoint("BOTTOMLEFT", -CHECK_INSET, -CHECK_INSET)
+        b.emptyMark:Hide()
         -- goal obtained check (bottom-right)
         b.check = b:CreateTexture(nil, "OVERLAY", nil, 7)
         b.check:SetTexture("Interface\\RaidFrame\\ReadyCheck-Ready")
@@ -910,6 +948,26 @@ function Addon:BuildCharWindowTab(flow)
         tooltip = "Color the character-sheet item borders (and flyout entries) by item quality. Uncommon and above only.",
     })
 
+    flow:Checkbox({
+        label   = "Trinket cooldown readouts",
+        get     = function() return Addon.db.settings.trinkets.showCooldowns end,
+        set     = function(v)
+            Addon.db.settings.trinkets.showCooldowns = v and true or false
+            if Addon.UpdateTrinketCooldowns then Addon:UpdateTrinketCooldowns() end
+        end,
+        tooltip = "Cooldown sweep and a countdown on the two trinket slots, their detached popout buttons, and trinket entries in the item flyout.",
+    })
+
+    flow:Checkbox({
+        label   = "Large trinket cooldown numbers",
+        get     = function() return Addon.db.settings.trinkets.largeNumbers end,
+        set     = function(v)
+            Addon.db.settings.trinkets.largeNumbers = v and true or false
+            if Addon.RestyleTrinketCooldowns then Addon:RestyleTrinketCooldowns() end
+        end,
+        tooltip = "On: large gold numbers in the middle of the slot. Off: smaller white numbers along the bottom edge.",
+    })
+
     -- Two side-by-side columns (armor), one split block so they share an arrange.
     local split = CreateFrame("Frame", nil, flow.pane.child)
     local leftCol  = UI.CreateColumn(split)
@@ -1210,7 +1268,14 @@ function Addon:RefreshBuilder()
     for slotId, b in pairs(panel.slotButtons) do
         local entry    = set and set.equip[slotId]
         local disabled = set and set.disabled and set.disabled[slotId]
-        if entry then
+        local isEmpty  = entry ~= nil and Addon:IsEmptyEntry(entry)
+        if isEmpty then
+            -- governed and explicitly empty: the slot's own silhouette at FULL
+            -- colour, so it reads as a deliberate choice rather than as the
+            -- dimmed "not in this set" state (spec §5.2)
+            b.icon:SetTexture(b._emptyTex); b.icon:SetDesaturated(false)
+            b.icon:SetAlpha((disabled and 0.5 or 1) * (goalMode and 0.4 or 1))
+        elseif entry then
             b.icon:SetTexture(Addon:EntryTexture(entry) or "Interface\\Icons\\INV_Misc_QuestionMark")
             b.icon:SetDesaturated(disabled and true or false)
             b.icon:SetAlpha((disabled and 0.5 or 1) * (goalMode and 0.4 or 1))
@@ -1218,9 +1283,12 @@ function Addon:RefreshBuilder()
             b.icon:SetTexture(b._emptyTex); b.icon:SetDesaturated(true)
             b.icon:SetAlpha((disabled and 0.35 or 0.6) * (goalMode and 0.6 or 1))
         end
+        if b.emptyMark then b.emptyMark:SetShown(isEmpty and not goalMode) end
         b.off:SetShown(disabled and not goalMode and true or false)
         b:EnableMouse(not goalMode)   -- set slots inert while editing goals
-        local missing = entry and not disabled and not goalMode and not Addon:IsEntryAvailable(entry)
+        -- an explicit-empty marker is never "missing gear"
+        local missing = entry and not isEmpty and not disabled and not goalMode
+                        and not Addon:IsEntryAvailable(entry)
         b.glow:SetShown(missing and true or false)
 
         -- chase-list goal overlay + obtained check
