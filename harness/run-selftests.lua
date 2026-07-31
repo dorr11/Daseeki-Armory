@@ -296,6 +296,425 @@ suite("spec-tables", function(ck)
 end)
 
 ----------------------------------------------------------------------
+-- Equip engine (equip.lua) — driven headlessly against a virtual
+-- bags/worn/cursor world. Behaviors are those specified in
+-- ITEMRACK_BEHAVIOR_SPEC.md §1.3, §2.x, §4 and TRINKETMENU_BEHAVIOR_SPEC.md §2.3.
+----------------------------------------------------------------------
+local mock = dofile(HARNESS_DIR .. "/equip-mock.lua")
+local L = mock.link
+
+-- Each equip suite gets a fresh world, and the world is always torn down so a
+-- failure can never leave the mocked globals installed.
+local function world(fnc)
+    return function(ck)
+        local w = mock.new(P)
+        local ok, err = pcall(fnc, ck, w, w.Addon)
+        w:teardown()
+        if not ok then error(err, 0) end
+    end
+end
+
+-- §0 the engine's slot list must stay in step with core.lua's Addon.SLOTS
+suite("equip-slot-model", world(function(ck, w, A)
+    local core = io.open(P("core.lua"), "r")
+    ck(core ~= nil, "core.lua is readable")
+    if not core then return end
+    local ids = {}
+    for line in core:lines() do
+        local id = line:match("^%s*{%s*id%s*=%s*(%d+)%s*,")
+        if id then ids[#ids + 1] = tonumber(id) end
+    end
+    core:close()
+    ck(#ids == #mock.SLOT_IDS, "core.lua declares " .. #mock.SLOT_IDS .. " slots, found " .. #ids)
+    local same = true
+    for i, v in ipairs(mock.SLOT_IDS) do if ids[i] ~= v then same = false end end
+    ck(same, "mock slot order matches core.lua Addon.SLOTS order")
+    -- every managed slot has an INVTYPE mapping, and ammo is not managed
+    local missing = {}
+    for _, id in ipairs(ids) do
+        if not A.SLOT_INVTYPES[id] then missing[#missing + 1] = id end
+    end
+    ck(#missing == 0, "every managed slot has SLOT_INVTYPES (missing: " .. table.concat(missing, ",") .. ")")
+    ck(A.SLOT_INVTYPES[0] == nil, "ammo slot 0 is not managed")
+    -- goalPicker.lua takes this table verbatim and tests validLoc[item.equipLoc],
+    -- so it must be keyed BY equip location, not an array of them.
+    ck(A.SLOT_INVTYPES[16]["INVTYPE_2HWEAPON"] == true, "main hand accepts two-handers")
+    ck(A.SLOT_INVTYPES[16][1] == nil, "SLOT_INVTYPES is keyed by equip location, not an array")
+    ck(A.SLOT_INVTYPES[17]["INVTYPE_SHIELD"] == true, "off hand accepts shields")
+    ck(A.SLOT_INVTYPES[17]["INVTYPE_2HWEAPON"] == nil, "off hand rejects two-handers")
+    ck(A.SLOT_INVTYPES[5]["INVTYPE_ROBE"] == true, "chest accepts robes")
+end))
+
+-- §1.3 two-tier identity: exact first, base id as fallback; claims stop two
+-- slots resolving to one item.
+suite("equip-set-resolution", world(function(ck, w, A)
+    -- exact identity beats a plain copy of the same base item
+    w:setBag(1, 1, L(1001, 0))        -- plain
+    w:setBag(2, 1, L(1001, 2504))     -- enchanted
+    w:defineSet("exact", { [11] = L(1001, 2504) })
+    A:EquipSet("exact")
+    ck(w.worn[11] == L(1001, 2504), "exact identity wins over a plain copy of the same base id")
+    ck(w:bagOf(1, 1) == L(1001, 0), "the plain copy is left alone")
+
+    -- loose fallback when no exact match exists
+    local w2 = mock.new(P)
+    w2:setBag(0, 5, L(1002, 777))
+    w2:defineSet("loose", { [12] = L(1002, 0) })
+    w2.Addon:EquipSet("loose")
+    ck(w2.worn[12] == L(1002, 777), "falls back to base-item-id match")
+    w2:teardown()
+
+    -- two ring slots, two distinct copies: the claim table stops a collision
+    local w3 = mock.new(P)
+    w3:setBag(0, 1, L(1001, 10))
+    w3:setBag(0, 2, L(1001, 20))
+    w3:defineSet("pair", { [11] = L(1001, 10), [12] = L(1001, 20) })
+    w3.Addon:EquipSet("pair")
+    ck(w3.worn[11] == L(1001, 10), "ring slot 11 got its own copy")
+    ck(w3.worn[12] == L(1001, 20), "ring slot 12 got the other copy")
+    ck(w3.worn[11] ~= w3.worn[12], "two slots never resolve to the same source item")
+    w3:teardown()
+
+    -- a worn item is a valid source: cross-slot ring exchange
+    local w4 = mock.new(P)
+    w4:setWorn(11, L(1002))
+    w4:setWorn(12, L(1001))
+    w4:defineSet("cross", { [11] = L(1001), [12] = L(1002) })
+    w4.Addon:EquipSet("cross")
+    ck(w4.worn[11] == L(1001), "cross-swap put the right ring in slot 11")
+    ck(w4.worn[12] == L(1002), "cross-swap put the right ring in slot 12")
+    ck(w4.cursor == nil, "cross-swap leaves nothing stranded on the cursor")
+    w4:teardown()
+end))
+
+-- §2.5/§2.6 execution: displaced items are put down, guards refuse cleanly.
+suite("equip-execution", world(function(ck, w, A)
+    -- equipping over an occupied slot returns the old item to the source bag slot
+    w:setWorn(1, L(3002))
+    w:setBag(0, 3, L(3001))
+    w:defineSet("helm", { [1] = L(3001) })
+    A:EquipSet("helm")
+    ck(w.worn[1] == L(3001), "new helm equipped")
+    ck(w:bagOf(0, 3) == L(3002), "displaced helm went back into the vacated bag slot")
+    ck(w.cursor == nil, "cursor is empty after the swap")
+
+    -- a two-hander clears the off hand into a free bag slot
+    local w2 = mock.new(P)
+    w2:setWorn(16, L(4002))
+    w2:setWorn(17, L(4003))
+    w2:setBag(0, 1, L(4001))
+    w2:defineSet("2h", { [16] = L(4001) })
+    w2.Addon:EquipSet("2h")
+    ck(w2.worn[16] == L(4001), "two-hander equipped to main hand")
+    ck(w2.worn[17] == nil, "off hand was cleared for the two-hander")
+    ck(w2.cursor == nil, "nothing stranded on the cursor after the 2H swap")
+    w2:teardown()
+
+    -- cursor already occupied: refuse, change nothing
+    local w3 = mock.new(P)
+    w3:setBag(0, 1, L(3001))
+    w3:setWorn(1, L(3002))
+    w3.cursor = L(9999)
+    w3:defineSet("blocked", { [1] = L(3001) })
+    w3.Addon:EquipSet("blocked")
+    ck(w3.worn[1] == L(3002), "an occupied cursor blocks the swap")
+    ck(w3:output():find("cursor") ~= nil, "the cursor abort is reported to the user")
+    w3:teardown()
+
+    -- no free bag slot for the displaced off hand: abort with the room message
+    local w4 = mock.new(P)
+    w4:setWorn(16, L(4002))
+    w4:setWorn(17, L(4003))
+    w4:setBag(0, 1, L(4001))
+    w4:fillBags(0)
+    w4:defineSet("2hfull", { [16] = L(4001) })
+    w4.Addon:EquipSet("2hfull")
+    ck(w4.worn[17] == L(4003), "off hand kept when there is nowhere to put it")
+    ck(w4:output():find("bag space") ~= nil, "the not-enough-room abort is reported")
+    w4:teardown()
+end))
+
+-- §4 partial sets: the rest of the set still equips, missing items reported once.
+suite("equip-partial-sets", world(function(ck, w, A)
+    w:setBag(0, 1, L(3001))
+    w:setWorn(11, L(1003))
+    w:defineSet("partial", { [1] = L(3001), [11] = L(1001), [13] = L(2001) })
+    A:EquipSet("partial")
+    ck(w.worn[1] == L(3001), "the findable item still equipped")
+    ck(w.worn[11] == L(1003), "the unfindable slot kept what it had")
+    ck(w.worn[13] == nil, "the unfindable trinket slot stayed empty")
+    local out = w:output()
+    ck(out:find("Ring of Testing") ~= nil, "missing ring named in the report")
+    ck(out:find("Trinket Alpha") ~= nil, "missing trinket named in the report")
+    local _, n = out:gsub("could not find", "")
+    ck(n == 1, "the missing-item line is printed exactly once (got " .. n .. ")")
+
+    -- a disabled slot is not governed at all
+    local w2 = mock.new(P)
+    w2:setBag(0, 1, L(3001))
+    w2:setWorn(1, L(3002))
+    w2:defineSet("dis", { [1] = L(3001) }, { [1] = true })
+    ck(w2.Addon:IsSlotActive(w2.Addon:GetSet("dis"), 1) == false, "a disabled slot is inactive")
+    w2.Addon:EquipSet("dis")
+    ck(w2.worn[1] == L(3002), "a disabled slot is never touched")
+    w2:teardown()
+
+    -- a stale exact key over the right base item is not reported missing
+    local w3 = mock.new(P)
+    w3:setWorn(1, L(3001, 2504))                  -- worn: enchanted
+    w3:defineSet("stale", { [1] = L(3001, 0) })   -- set: plain (e.g. an import)
+    w3.Addon:EquipSet("stale")
+    ck(w3:output():find("could not find") == nil, "same base item worn is not reported missing")
+    w3:teardown()
+end))
+
+-- §2.7 multi-pass convergence, driven by ITEM_LOCK_CHANGED.
+suite("equip-convergence", world(function(ck, w, A)
+    w:setBag(0, 1, L(3001))
+    w:setBag(0, 2, L(1001))
+    w:defineSet("conv", { [1] = L(3001), [11] = L(1001) })
+    A:EquipSet("conv")
+    ck(w.worn[1] == L(3001) and w.worn[11] == L(1001), "pass 1 satisfied the whole set")
+
+    -- re-planning a satisfied set yields an empty plan (the convergence property)
+    local plan, missing = A:PlanSet(A:GetSet("conv"), A:BuildCensus())
+    ck(#plan == 0, "a satisfied set re-plans to zero operations")
+    ck(#missing == 0, "a satisfied set reports nothing missing")
+
+    -- the lock watcher finalises once the inventory settles
+    w:fireEvent("ITEM_LOCK_CHANGED")
+    w:pumpTimers()
+    ck(A._equipping == nil, "the engine finalised after the locks settled")
+    ck(A.db.currentSet == "conv", "the equipped set became the current set")
+    ck(A:IsSetEquipped("conv") == true, "IsSetEquipped agrees the set is worn")
+
+    -- while something is still locked the next pass must not run
+    local w2 = mock.new(P)
+    w2:setBag(0, 1, L(3001))
+    w2:defineSet("held", { [1] = L(3001) })
+    w2.Addon:EquipSet("held")
+    w2.locks["w11"] = true
+    local before = #w2.log
+    w2:fireEvent("ITEM_LOCK_CHANGED")
+    w2:pumpTimers()
+    ck(#w2.log == before, "no further moves are attempted while anything is locked")
+    w2:teardown()
+
+    -- an unsatisfiable set terminates instead of looping
+    local w3 = mock.new(P)
+    w3:defineSet("nope", { [1] = L(3001) })
+    w3.Addon:EquipSet("nope")
+    for _ = 1, 5 do w3:fireEvent("ITEM_LOCK_CHANGED"); w3:pumpTimers() end
+    ck(w3.Addon._equipping == nil, "an unsatisfiable set does not stay in progress")
+    w3:teardown()
+end))
+
+-- §2.8 / TRINKETMENU §2.3 the combat and really-dead queue contract.
+suite("equip-combat-queue", world(function(ck, w, A)
+    w:setBag(0, 1, L(3001))
+    w:defineSet("cq", { [1] = L(3001) })
+
+    w.combat = true
+    ck(A:MustQueueSwap() == true, "in combat a swap must be queued")
+    A:EquipSet("cq")
+    ck(w.worn[1] == nil, "nothing swapped while in combat")
+    ck(A._pendingSet == "cq", "the set is held as pending")
+
+    w.combat = false
+    w:fireEvent("PLAYER_REGEN_ENABLED")
+    w:pumpTimers()
+    ck(w.worn[1] == L(3001), "leaving combat drained the queue and equipped the set")
+    ck(A._pendingSet == nil, "the pending set was consumed")
+
+    -- feign death is treated as alive and swaps immediately
+    local w2 = mock.new(P)
+    w2:setBag(0, 1, L(3001))
+    w2:defineSet("feign", { [1] = L(3001) })
+    w2.dead, w2.feign = true, true
+    ck(w2.Addon:IsReallyDead() == false, "a feigning hunter is not really dead")
+    ck(w2.Addon:MustQueueSwap() == false, "feign death does not force queueing")
+    w2.Addon:EquipSet("feign")
+    ck(w2.worn[1] == L(3001), "feign death swaps immediately")
+    w2:teardown()
+
+    -- really dead: queue is held across the death-time regen event
+    local w3 = mock.new(P)
+    w3:setBag(0, 1, L(3001))
+    w3:defineSet("dead", { [1] = L(3001) })
+    w3.dead, w3.feign = true, false
+    ck(w3.Addon:IsReallyDead() == true, "dead and not feigning is really dead")
+    w3.Addon:EquipSet("dead")
+    ck(w3.Addon._pendingSet == "dead", "the set queued while dead")
+    -- dying drops combat, so PLAYER_REGEN_ENABLED fires against the corpse
+    w3:fireEvent("PLAYER_REGEN_ENABLED")
+    w3:pumpTimers()
+    ck(w3.worn[1] == nil, "the queue is NOT consumed against a corpse")
+    ck(w3.Addon._pendingSet == "dead", "the pending set survives the corpse-time regen event")
+    -- resurrect
+    w3.dead = false
+    w3:fireEvent("PLAYER_UNGHOST")
+    w3:pumpTimers()
+    ck(w3.worn[1] == L(3001), "the queue drained on resurrection")
+    w3:teardown()
+
+    -- resurrecting mid-fight must NOT consume the queue
+    local w5 = mock.new(P)
+    w5:setBag(0, 1, L(3001))
+    w5:defineSet("resu", { [1] = L(3001) })
+    w5.dead = true
+    w5.Addon:EquipSet("resu")
+    w5.dead, w5.combat = false, true          -- resurrected, still fighting
+    w5:fireEvent("PLAYER_UNGHOST")
+    w5:pumpTimers()
+    ck(w5.worn[1] == nil, "resurrecting while still in combat does not consume the queue")
+    ck(w5.Addon._pendingSet == "resu", "the pending set survives a mid-fight resurrect")
+    w5.combat = false
+    w5:fireEvent("PLAYER_REGEN_ENABLED")
+    w5:pumpTimers()
+    ck(w5.worn[1] == L(3001), "it drains once combat actually ends")
+    w5:teardown()
+
+    -- PLAYER_ALIVE is also a drain trigger
+    local w4 = mock.new(P)
+    w4:setBag(0, 1, L(3001))
+    w4:defineSet("alive", { [1] = L(3001) })
+    w4.dead = true
+    w4.Addon:EquipSet("alive")
+    w4.dead = false
+    w4:fireEvent("PLAYER_ALIVE")
+    w4:pumpTimers()
+    ck(w4.worn[1] == L(3001), "PLAYER_ALIVE drains the queue")
+    w4:teardown()
+end))
+
+-- §2.8 per-slot queue: toggle-off, last-writer-wins, ascending drain order.
+suite("equip-queue-ordering", world(function(ck, w, A)
+    w.combat = true
+    w:setBag(0, 1, L(2001))
+    w:setBag(0, 2, L(2002))
+
+    -- queue trinket 14 FIRST, then 13, to prove drain order is by slot not arrival
+    ck(A:EquipContainerItemToSlot(0, 2, 14) == true, "queued an item for slot 14")
+    ck(A:EquipContainerItemToSlot(0, 1, 13) == true, "queued an item for slot 13")
+
+    w.combat = false
+    w.log = {}
+    w:fireEvent("PLAYER_REGEN_ENABLED")
+    w:pumpTimers()
+    ck(w.worn[13] == L(2001), "slot 13 received its queued trinket")
+    ck(w.worn[14] == L(2002), "slot 14 received its queued trinket")
+    local i13, i14
+    for i, e in ipairs(w.log) do
+        if e == "worn:13" and not i13 then i13 = i end
+        if e == "worn:14" and not i14 then i14 = i end
+    end
+    ck(i13 and i14 and i13 < i14, "the queue drains in ascending slot order (13 before 14)")
+
+    -- re-queueing the identical action toggles it back off
+    local w2 = mock.new(P)
+    w2.combat = true
+    w2:setBag(0, 1, L(2001))
+    ck(w2.Addon:EquipContainerItemToSlot(0, 1, 13) == true, "first request queues")
+    ck(w2.Addon:EquipContainerItemToSlot(0, 1, 13) == false, "the identical request un-queues")
+    ck(w2.Addon._combatQueue[13] == nil, "the slot has no pending action after the toggle")
+    w2:teardown()
+
+    -- a different item for the same slot replaces rather than stacking
+    local w3 = mock.new(P)
+    w3.combat = true
+    w3:setBag(0, 1, L(2001))
+    w3:setBag(0, 2, L(2002))
+    w3.Addon:EquipContainerItemToSlot(0, 1, 13)
+    w3.Addon:EquipContainerItemToSlot(0, 2, 13)
+    w3.combat = false
+    w3:fireEvent("PLAYER_REGEN_ENABLED")
+    w3:pumpTimers()
+    ck(w3.worn[13] == L(2002), "the later request for a slot wins (last-writer-wins)")
+    ck(w3:bagOf(0, 1) == L(2001), "the superseded item was never equipped")
+    w3:teardown()
+
+    -- queued unequip drains too
+    local w4 = mock.new(P)
+    w4.combat = true
+    w4:setWorn(13, L(2001))
+    ck(w4.Addon:UnequipSlot(13) == true, "unequip queues in combat")
+    w4.combat = false
+    w4:fireEvent("PLAYER_REGEN_ENABLED")
+    w4:pumpTimers()
+    ck(w4.worn[13] == nil, "the queued unequip drained")
+    w4:teardown()
+end))
+
+-- Interface compatibility: the surface the rest of Armory and user macros use.
+suite("equip-public-surface", world(function(ck, w, A)
+    for _, name in ipairs({
+        "ChatMsg", "IsSlotActive", "IsEntryAvailable", "SlotMatches", "SlotMatchesBase",
+        "FindInBags", "FindInEquipped", "FindFreeBagSlot", "EquipSlot", "EquipPass",
+        "FinishEquip", "RunEquip", "IsReallyDead", "MustQueueSwap", "QueueReason",
+        "QueueWhen", "StopQueueWatcher", "DrainCombatQueue", "EnsureRegenWatcher",
+        "QueueCombatAction", "DeferToCombatEnd", "EquipContainerItemToSlot",
+        "UnequipSlot", "GetInventoryItemsForSlot", "SwapEquippedSlots",
+        "EquipSet", "IsSetEquipped", "ToggleSet", "GetEquipMacro",
+    }) do
+        ck(type(A[name]) == "function", "Addon:" .. name .. " is present")
+    end
+    ck(type(A.SLOT_INVTYPES) == "table", "Addon.SLOT_INVTYPES is present")
+
+    ck(type(_G.ArmEquip) == "function", "global ArmEquip is exported for macros")
+    ck(type(_G.ArmToggle) == "function", "global ArmToggle is exported for macros")
+    ck(_G.ArmoryEquipSet == _G.ArmEquip, "ArmoryEquipSet aliases ArmEquip")
+    ck(_G.ArmoryToggleSet == _G.ArmToggle, "ArmoryToggleSet aliases ArmToggle")
+
+    ck(A:GetEquipMacro("My Set") == '/run ArmEquip("My Set")', "GetEquipMacro text is unchanged")
+
+    -- the global macro path really equips through DaseekiArmory
+    w:setBag(0, 1, L(3001))
+    w:defineSet("macro", { [1] = L(3001) })
+    _G.ArmEquip("macro")
+    ck(w.worn[1] == L(3001), '/run ArmEquip("name") equips the set')
+
+    -- GetInventoryItemsForSlot record shape consumed by flyout.lua / trinkets.lua
+    local w2 = mock.new(P)
+    w2:setBag(0, 4, L(2001))
+    w2:setWorn(13, L(2002))
+    local items = w2.Addon:GetInventoryItemsForSlot(13, false)
+    ck(#items == 1, "bag-only listing excludes worn items")
+    ck(items[1].link == L(2001) and items[1].bag == 0 and items[1].slot == 4,
+       "bag records carry link/bag/slot")
+    ck(items[1].equipped == false, "bag records are flagged not-equipped")
+    local both = w2.Addon:GetInventoryItemsForSlot(13, true)
+    ck(#both == 2, "includeEquipped adds worn items")
+    ck(both[1].equipped == true and both[1].invSlot == 13, "worn records come first and carry invSlot")
+    -- slot filtering really applies
+    ck(#w2.Addon:GetInventoryItemsForSlot(1, false) == 0, "a trinket is not offered for the head slot")
+    w2:teardown()
+
+    -- the find helpers must reach the base-id fallback when no exact match exists
+    local w4 = mock.new(P)
+    w4:setBag(3, 7, L(1001, 999))          -- enchanted copy only
+    w4:setWorn(12, L(1002, 888))
+    local plainRing = w4.Addon:IdentityFromLink(L(1001, 0))
+    local bag, slot = w4.Addon:FindInBags(plainRing)
+    ck(bag == 3 and slot == 7, "FindInBags falls back to a base-id match")
+    local plainWorn = w4.Addon:IdentityFromLink(L(1002, 0))
+    ck(w4.Addon:FindInEquipped(plainWorn) == 12, "FindInEquipped falls back to a base-id match")
+    ck(w4.Addon:FindInEquipped(plainWorn, 12) == nil, "FindInEquipped honours the exclude slot")
+    ck(w4.Addon:FindFreeBagSlot() ~= nil, "FindFreeBagSlot reports a free slot")
+    w4:teardown()
+
+    -- IsSetEquipped / IsEntryAvailable
+    local w3 = mock.new(P)
+    w3:setBag(0, 1, L(3001))
+    w3:defineSet("chk", { [1] = L(3001) })
+    ck(w3.Addon:IsSetEquipped("chk") == false, "not equipped before the swap")
+    ck(w3.Addon:IsEntryAvailable(w3.Addon:GetSet("chk").equip[1]) == true, "entry available from bags")
+    w3.Addon:EquipSet("chk")
+    ck(w3.Addon:IsSetEquipped("chk") == true, "equipped after the swap")
+    ck(w3.Addon:IsSetEquipped("no-such-set") == false, "unknown set is not equipped")
+    w3:teardown()
+end))
+
+----------------------------------------------------------------------
 -- Every shipped file compiles (loadfile gate)
 ----------------------------------------------------------------------
 suite("loadfile-all-files", function(ck)

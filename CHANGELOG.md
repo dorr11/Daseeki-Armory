@@ -3,6 +3,17 @@
 ## Unreleased
 Correctness fixes — the stats panel now matches in-game values.
 
+- **The gear-swap engine has been rebuilt from the ground up.** Equipping sets
+  behaves exactly as before — your saved sets, their slots, key bindings and
+  macros are all untouched, and `/run ArmEquip("name")` still works the same way.
+  The rewrite is internal: the engine now takes a single indexed snapshot of your
+  bags and worn gear, plans the whole swap up front, and re-checks each step as it
+  runs. Two small swap bugs fell out of that work — a ring/trinket exchange could
+  briefly leave the displaced item on the cursor, and a paired swap could undo
+  itself when one move already satisfied the other slot. Both are fixed.
+- Equipping into an occupied slot now reliably puts the item that came off back
+  into the bag slot the new item came from, instead of leaving it on the cursor.
+
 - **Melee and Ranged Damage** no longer read high. The game already bakes your
   physical damage bonus and percent modifier into the numbers it reports; Armory
   was applying both a second time, so the range was inflated (a true 100-150 with
