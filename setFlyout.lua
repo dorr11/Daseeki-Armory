@@ -38,13 +38,17 @@ local function ensure()
     end
 
     f.empty = f:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+    Addon:TrySetFont(f.empty, "small")
     f.empty:SetPoint("CENTER")
     f.empty:SetText("No sets")
     f.empty:Hide()
 
     -- unconstrained, unshown font string used only to measure each set name's
-    -- natural width so the flyout can size itself to the widest one
+    -- natural width so the flyout can size itself to the widest one.
+    -- MUST carry the same face as r.label below or the measured widths no longer
+    -- describe what is actually drawn and the flyout mis-sizes itself.
     f.measure = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    Addon:TrySetFont(f.measure, "body")
 
     f.rows = {}
     f._offset = 0
@@ -71,6 +75,7 @@ local function ensure()
         r.icon = r:CreateTexture(nil, "ARTWORK"); r.icon:SetSize(ICON_W, ICON_W); r.icon:SetPoint("LEFT", 2, 0)
         r.icon:SetTexCoord(0.07, 0.93, 0.07, 0.93)
         r.label = r:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+        Addon:TrySetFont(r.label, "body")   -- pairs with f.measure above
         r.label:SetPoint("LEFT", r.icon, "RIGHT", ICON_GAP, 0); r.label:SetJustifyH("LEFT")
         local hl = r:CreateTexture(nil, "HIGHLIGHT"); hl:SetAllPoints(); hl:SetColorTexture(Addon:Col("brand", 0.25))
         r:SetScript("OnClick", function(self)
@@ -185,6 +190,7 @@ local function ensureIconFlyout()
     end
 
     f.empty = f:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+    Addon:TrySetFont(f.empty, "small")
     f.empty:SetPoint("CENTER")
     f.empty:SetText("No sets")
     f.empty:Hide()

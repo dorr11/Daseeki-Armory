@@ -178,6 +178,7 @@ local function ensure()
     close:SetScript("OnClick", function() f:Hide() end)
 
     f.countText = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    Addon:TrySetFont(f.countText, "small")   -- before the SetTextColor below
     f.countText:SetPoint("BOTTOM", f, "BOTTOM", 0, 8); f.countText:SetTextColor(Addon:Col("muted"))
 
     local search
@@ -210,6 +211,7 @@ local function ensure()
     f.search = search
 
     f.hint = f:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+    Addon:TrySetFont(f.hint, "small")
     f.hint:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -62)
     f.hint:SetText("Search by item name, or shift-click an item link here")
 
@@ -223,6 +225,7 @@ local function ensure()
         r.icon = r:CreateTexture(nil, "ARTWORK"); r.icon:SetSize(22, 22); r.icon:SetPoint("LEFT", 2, 0)
         r.icon:SetTexCoord(0.07, 0.93, 0.07, 0.93)
         r.label = r:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+        Addon:TrySetFont(r.label, "body")   -- result rows are item names
         r.label:SetPoint("LEFT", r.icon, "RIGHT", 6, 0); r.label:SetWidth(W - 60); r.label:SetJustifyH("LEFT")
         local hl = r:CreateTexture(nil, "HIGHLIGHT"); hl:SetAllPoints(); hl:SetColorTexture(Addon:Col("brand", 0.25))
         r:SetScript("OnClick", function(self)

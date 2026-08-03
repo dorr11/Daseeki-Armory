@@ -201,6 +201,26 @@ function Addon:TrySetCeremonial(fs, size)
     return false
 end
 
+-- Apply a shared DaseekiUI body-family font object to a FontString when Core is
+-- present — the general form of the two helpers above, for the ordinary surfaces
+-- (list rows, hints, counters) that were still left on stock GameFont templates and
+-- so ignored the Core font picker. Roles: body / muted / small / accent / danger /
+-- header / microLabel. Because these are FontObjects, Core re-applies the picked face
+-- and theme tint on every font/theme change for free.
+--
+-- CALL BEFORE any SetTextColor on the same FontString: SetFontObject also re-applies
+-- that object's own color, which would otherwise overwrite the caller's token tint.
+-- Without Core this is a no-op and the caller's GameFont template stands — that IS the
+-- pre-Core appearance. Returns true when the kit face was applied.
+function Addon:TrySetFont(fs, role)
+    local UI = _G.DaseekiUI
+    if fs and fs.SetFontObject and UI and UI.fonts then
+        local fo = UI.fonts[role or "body"] or UI.fonts.body
+        if fo then fs:SetFontObject(fo); return true end
+    end
+    return false
+end
+
 -- Apply the telemetry numeral (ARIALN+OUTLINE) font to a FontString when Core present.
 function Addon:TrySetNumeral(fs)
     local UI = _G.DaseekiUI

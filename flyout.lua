@@ -78,6 +78,7 @@ local function ensure()
     end
 
     f.empty = f:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+    Addon:TrySetFont(f.empty, "small")
     f.empty:SetPoint("CENTER")
     f.empty:SetText("No items")
     f.empty:Hide()

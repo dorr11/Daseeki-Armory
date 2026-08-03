@@ -4,6 +4,15 @@
 Correctness fixes — the stats panel now matches in-game values — plus three new
 gear-swapping features.
 
+- **The pop-up pickers now use the font you picked in Daseeki Core.** The window titles
+  had already moved onto the suite look, but the text under them had not: the set names
+  in the gear flyout, the item names in the Goal picker, the icon and set counters, and
+  the "No sets" / "No items" / "Esc to cancel" lines were all still drawn in the game's
+  stock face. They now follow your picked font and change with it live. The flyout's
+  width still measures from the same face it draws with, so set lists size exactly as
+  before. Layout, sizes and colours are unchanged, and without Daseeki Core installed
+  everything looks as it did.
+
 - **The quality glow on your gear now has the same strength as the one in Bags.** Bags 2
   was shipping the factory value for how strong that soft coloured wash is, and against
   Bags 1 side by side it read as a hard rim rather than a glow that fades inward over the

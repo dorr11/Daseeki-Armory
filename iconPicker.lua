@@ -54,6 +54,7 @@ local function ensure()
     close:SetScript("OnClick", function() f:Hide() end)
 
     f.countText = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    Addon:TrySetFont(f.countText, "small")   -- before the SetTextColor below
     f.countText:SetPoint("BOTTOM", f, "BOTTOM", 0, 8)
     f.countText:SetTextColor(Addon:Col("muted"))
 
@@ -89,6 +90,7 @@ local function ensure()
     search:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
     f.search = search
     f.instructions = f:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+    Addon:TrySetFont(f.instructions, "small")
     f.instructions:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -62)
     f.instructions:SetText("Search by icon or item name, or drag an item here")
 

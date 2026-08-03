@@ -137,6 +137,7 @@ function Addon:CaptureKeybind(onCapture)
         f.title:SetPoint("TOP", 0, -18); f.title:SetText("Press a key…")
         if not Addon:TrySetCeremonial(f.title, 16) then f.title:SetTextColor(1, 0.82, 0) end
         f.hint = f:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+        Addon:TrySetFont(f.hint, "small")
         f.hint:SetPoint("BOTTOM", 0, 18); f.hint:SetText("Esc to cancel")
         f:SetScript("OnKeyDown", function(self, key)
             self:SetPropagateKeyboardInput(false)
