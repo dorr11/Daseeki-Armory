@@ -37,6 +37,14 @@ gear-swapping features.
   the middle of the slot, or smaller white ones along the bottom edge). Armory
   draws these numbers itself and asks OmniCC-style addons to leave the trinket
   slots alone, so you never get two countdowns stacked on one icon.
+- **Item quality on the character pane now matches Daseeki Bags.** The equipped
+  slots (and the hover flyout entries) used to be ringed with a hard
+  quality-colored square outline. They now carry the same soft quality-colored
+  glow that Bags 2.0 ships — a halo that washes over the edge of the icon instead
+  of drawing a box around it, at the same size, the same softness and the same
+  colors as your bags. Nothing else changed: Uncommon and above still glow,
+  poor and common are still left plain, and the single switch that turns it all
+  off is where it always was under **Character Window**.
 
 - **The gear-swap engine has been rebuilt from the ground up.** Equipping sets
   behaves exactly as before — your saved sets, their slots, key bindings and

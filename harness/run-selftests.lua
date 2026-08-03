@@ -917,6 +917,71 @@ suite("trinket-cooldown-text", function(ck)
     ck(F(100, 7200, 100, "") == "2 h", "two hours")
 end)
 
+-- Quality GLOW geometry (borders.lua). These constants ARE the look — the character
+-- window reproduces Daseeki Bags 2.0's soft-glow treatment parameter for parameter, so
+-- they are gated here exactly as Bags gates its own borders/glow-geometry suite. Like
+-- trinkets.lua, borders.lua's pure layer is loaded with no WoW API at all, which is the
+-- property this suite asserts first.
+suite("border-glow-geometry", function(ck)
+    local B = { SLOTS = {} }
+
+    local fn, err = loadfile(P("borders.lua"))
+    ck(fn ~= nil, "borders.lua compiles" .. (fn and "" or (" -> " .. tostring(err))))
+    if not fn then return end
+    local ok, rerr = pcall(fn, "Daseeki-Armory", B)
+    ck(ok, "borders.lua loads with no WoW API present" .. (ok and "" or (" -> " .. tostring(rerr))))
+    local M = B.Borders
+    ck(type(M) == "table", "the pure layer is published as Addon.Borders")
+    if type(M) ~= "table" then return end
+
+    -- The three suite glow parameters, identical to Bags 2.0 Borders.GLOW_*.
+    ck(M.GLOW_TEXTURE == "Interface\\Buttons\\UI-ActionButton-Border", "suite glow texture")
+    ck(math.abs(M.GLOW_SCALE - 67 / 37) < 1e-9, "suite glow proportion (67px halo on a 37px button)")
+    ck(M.GLOW_ALPHA == 0.5, "suite glow alpha, uniform across every rarity")
+    ck(M.GLOW_SCALE > 1, "the halo overhangs the button — a wash, not a rim")
+
+    -- Sizing is read off the host button, so both button sizes in play get the same
+    -- proportional wash: the paper-doll slot (37) and the flyout lead (32).
+    ck(near(M.GlowSize(37), 67), "a 37px paper-doll slot gets the 67px halo")
+    ck(near(M.GlowSize(32), 32 * 67 / 37), "a 32px flyout lead gets a proportional halo")
+    ck(M.GlowSize(48) > M.GlowSize(37), "a bigger button gets a bigger halo")
+    ck(M.GlowSize(0) == 0, "degenerate button -> no halo")
+    ck(M.GlowSize(-5) == 0, "negative button -> no halo")
+    ck(M.GlowSize(nil) == 0, "nil button -> no halo")
+
+    -- Uncommon+ floor, honouring the toggle.
+    ck(M.MIN_QUALITY == 2, "the floor is Uncommon (2)")
+    ck(M.ShouldShow(nil, true) == false, "nil quality -> no glow")
+    ck(M.ShouldShow(0, true) == false, "poor -> no glow")
+    ck(M.ShouldShow(1, true) == false, "common -> no glow")
+    ck(M.ShouldShow(2, true) == true, "uncommon -> glow")
+    ck(M.ShouldShow(3, true) == true, "rare -> glow")
+    ck(M.ShouldShow(5, true) == true, "legendary -> glow")
+    ck(M.ShouldShow(4, false) == false, "toggle off -> no glow even for epic")
+
+    -- Full-saturation colors: headless the static table is the last resort in the
+    -- C_Item -> ITEM_QUALITY_COLORS -> static chain, and it stays rarity-distinct.
+    ck(M.QualityRGB(nil) == nil, "nil quality -> no color")
+    local r3, g3, b3 = M.QualityRGB(3)
+    ck(b3 > r3 and b3 > g3, "rare reads blue-dominant")
+    local r5, g5, b5 = M.QualityRGB(5)
+    ck(r5 > g5 and g5 > b5, "legendary reads orange (R>G>B)")
+    local r4, g4, b4 = M.QualityRGB(4)
+    ck(b4 > g4 and r4 > g4, "epic reads purple (B>G, R>G)")
+    ck(r4 > r3 + 0.15, "epic is separable from rare by the red channel")
+
+    -- The live chain is preferred over the static table when the game APIs exist.
+    _G.C_Item = { GetItemQualityColor = function() return 0.10, 0.20, 0.30 end }
+    local lr, lg, lb = M.QualityRGB(3)
+    ck(lr == 0.10 and lg == 0.20 and lb == 0.30, "C_Item.GetItemQualityColor wins when present")
+    _G.C_Item = nil
+    _G.ITEM_QUALITY_COLORS = { [3] = { r = 0.4, g = 0.5, b = 0.6 } }
+    local fr, fg, fb = M.QualityRGB(3)
+    ck(fr == 0.4 and fg == 0.5 and fb == 0.6, "ITEM_QUALITY_COLORS is the second link in the chain")
+    _G.ITEM_QUALITY_COLORS = nil
+    ck(near(select(1, M.QualityRGB(3)), r3), "…and the static table is the last resort")
+end)
+
 -- Interface compatibility: the surface the rest of Armory and user macros use.
 suite("equip-public-surface", world(function(ck, w, A)
     for _, name in ipairs({

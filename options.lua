@@ -939,13 +939,13 @@ function Addon:BuildCharWindowTab(flow)
     flow:Hint("Item flyout shown when you hover an equipped slot on the character pane.")
 
     flow:Checkbox({
-        label   = "Quality borders on equipped slots",
+        label   = "Quality glow on equipped slots",
         get     = function() return Addon.db.settings.charWindow.qualityBorders end,
         set     = function(v)
             Addon.db.settings.charWindow.qualityBorders = v and true or false
             if Addon.UpdateSlotBorders then Addon:UpdateSlotBorders() end
         end,
-        tooltip = "Color the character-sheet item borders (and flyout entries) by item quality. Uncommon and above only.",
+        tooltip = "Soft quality-colored glow on the character-sheet items (and flyout entries), matching Daseeki Bags. Uncommon and above only.",
     })
 
     flow:Checkbox({

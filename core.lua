@@ -105,7 +105,7 @@ local DEFAULT_DB = {
             largeNumbers  = true,
         },
         charWindow = {
-            qualityBorders = true,     -- quality-colored borders on equipped-slot buttons
+            qualityBorders = true,     -- quality-colored soft glow on equipped-slot buttons
         },
     },
 }
