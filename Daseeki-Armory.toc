@@ -7,7 +7,7 @@
 ## SavedVariablesPerCharacter: DaseekiArmoryDB
 ## SavedVariables: DaseekiArmoryScanDB
 ## OptionalDeps: Daseeki-Core, Daseeki-Bags, ItemRack, OPie
-## Version: 1.2.0
+## Version: 1.3.0
 
 core.lua
 itemDB.lua
