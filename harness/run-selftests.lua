@@ -917,12 +917,14 @@ suite("trinket-cooldown-text", function(ck)
     ck(F(100, 7200, 100, "") == "2 h", "two hours")
 end)
 
--- Quality GLOW geometry (borders.lua), pinned to CII_BEHAVIOR_SPEC §2. These constants
--- ARE the look, and they are a SIBLING CONTRACT: Daseeki Bags 2.0's borders.lua declares
--- the identical block and its own harness gates the identical numbers, so the character
--- window and the bag grid can never drift apart. Any edit here must be mirrored there.
--- Like trinkets.lua, borders.lua's pure layer is loaded with no WoW API at all, which is
--- the property this suite asserts first.
+-- Quality GLOW geometry (borders.lua), pinned to 1.x SOURCE via Daseeki-Bags 2.0's
+-- transcription, NOT to CII_BEHAVIOR_SPEC §2. These constants ARE the look, and they are
+-- a SIBLING CONTRACT: Daseeki-Bags2-beta's borders.lua "SUITE GLOW GEOMETRY" block
+-- (branch v2) is the AUTHORITY — it transcribed Daseeki-Bags 1.x (main) line by line, and
+-- its own harness (borders.lua testGlowGeometry + parity.lua rows 6-9) gates the identical
+-- numbers. Every citation below is that block's citation. Any edit here must be mirrored
+-- there. Like trinkets.lua, borders.lua's pure layer is loaded with no WoW API at all,
+-- which is the property this suite asserts first.
 suite("border-glow-geometry", function(ck)
     local B = { SLOTS = {} }
 
@@ -935,32 +937,96 @@ suite("border-glow-geometry", function(ck)
     ck(type(M) == "table", "the pure layer is published as Addon.Borders")
     if type(M) ~= "table" then return end
 
-    -- Spec §2 anatomy, constant by constant. Identical to Bags 2.0 Borders.GLOW_*.
-    ck(M.GLOW_TEXTURE == "Interface\\Buttons\\UI-ActionButton-Border", "spec §2 glow texture")
-    ck(M.GLOW_REF_BUTTON == 37, "spec §2 reference button is 37px")
-    ck(near(M.GLOW_SCALE, 68 / 37), "spec §2 proportion: a 68px halo on a 37px button")
-    ck(near(M.GLOW_SCALE_AMMO, 58 / 37), "spec §2 Ammo exception: a 58px halo")
-    ck(M.GLOW_ALPHA == 0.49, "spec §2 intensity default 0.49, uniform on every border")
-    ck(near(M.GLOW_OFFSET_Y_SCALE, 1 / 37), "spec §2 CENTER anchor offset (0, 1)")
+    -- 1.x anatomy, constant by constant. Identical to Bags 2.0 Borders.GLOW_*; each
+    -- citation is the one carried by the Bags parity block (branch v2 borders.lua:247-254).
+    ck(M.GLOW_TEXTURE == "Interface\\Buttons\\UI-ActionButton-Border",
+       "1.x item.lua:55 glow texture")
+    ck(M.GLOW_REF_BUTTON == 37, "1.x reference button is the template's own 37px")
+    ck(near(M.GLOW_SCALE, 67 / 37), "1.x item.lua:58 SetSize(67,67) on a 37px button")
+    ck(near(M.GLOW_SCALE_AMMO, 58 / 37), "CII §2 Ammo exception retained: a 58px halo")
+    ck(M.GLOW_ALPHA == 0.5, "1.x settings.lua:34 glowAlpha = 0.5, uniform on every tint")
+    ck(M.GLOW_OFFSET_Y_SCALE == 0, "1.x item.lua:57 SetPoint('CENTER') — no offset")
+    ck(M.GLOW_LAYER == "OVERLAY", "1.x item.lua:54 OVERLAY layer")
+    ck(M.GLOW_SUBLEVEL == -1, "1.x item.lua:54 sublevel -1 (below the button's own overlay art)")
     ck(M.GLOW_SCALE > 1, "the halo overhangs the button — a wash, not a rim")
     ck(M.GLOW_SCALE_AMMO > 1, "even the Ammo halo overhangs")
     ck(M.GLOW_SCALE_AMMO < M.GLOW_SCALE, "the Ammo halo is the smaller exception")
 
-    -- At the spec's own button size the ratios reproduce its literal pixel values.
-    ck(near(M.GlowSize(37), 68), "a 37px paper-doll slot gets the spec's literal 68px halo")
+    -- REGRESSION LOCK on the previous round: these are the four spec §2 values 1.x
+    -- overrides. If any of them comes back, the character window has drifted off the
+    -- suite standard again — the exact drift the Bags parity pass was run to end.
+    ck(not near(M.GLOW_SCALE, 68 / 37), "NOT the spec's 68/37")
+    ck(M.GLOW_ALPHA ~= 0.49, "NOT the spec's 0.49")
+    ck(not near(M.GLOW_OFFSET_Y_SCALE, 1 / 37), "NOT the spec's (0,1) nudge")
+    ck(M.GLOW_SUBLEVEL ~= nil, "NOT the spec's plain-OVERLAY (no sublevel)")
+
+    -- At 1.x's own button size the ratios reproduce its literal pixel values.
+    ck(near(M.GlowSize(37), 67), "a 37px paper-doll slot gets 1.x's literal 67px halo")
     ck(near(M.GlowSize(37, true), 58), "…and an Ammo slot gets literally 58")
-    ck(near(M.GlowOffsetY(37), 1), "…and the offset is literally 1")
+    ck(near(M.GlowOffsetY(37), 0), "…and the offset is literally 0")
 
     -- Sizing is read off the host button, so both button sizes in play get the same
     -- proportional wash: the paper-doll slot (37) and the flyout lead (32).
-    ck(near(M.GlowSize(32), 32 * 68 / 37), "a 32px flyout lead gets a proportional halo")
-    ck(near(M.GlowOffsetY(32), 32 / 37), "…and a proportional offset")
+    ck(near(M.GlowSize(32), 32 * 67 / 37), "a 32px flyout lead gets a proportional halo")
+    ck(M.GlowOffsetY(32) == 0, "…and the zero offset stays zero at the flyout size too")
     ck(M.GlowSize(48) > M.GlowSize(37), "a bigger button gets a bigger halo")
-    ck(near(M.GlowSize(74), 136), "a doubled button doubles the halo (proportion held)")
+    ck(near(M.GlowSize(74), 134), "a doubled button doubles the halo (proportion held)")
     ck(M.GlowSize(0) == 0, "degenerate button -> no halo")
     ck(M.GlowSize(-5) == 0, "negative button -> no halo")
     ck(M.GlowSize(nil) == 0, "nil button -> no halo")
     ck(M.GlowOffsetY(0) == 0 and M.GlowOffsetY(nil) == 0, "degenerate button -> no offset")
+
+    -- ── LAYERING: the halo must stay UNDER Armory's own per-slot overlay art ─────
+    -- The container now sits at the HOST BUTTON'S OWN frame level (not +1), so the halo
+    -- is ordered against the button's other art by DRAW LAYER alone — which is the whole
+    -- point of the sublevel. Armory draws two things on the same paper-doll button:
+    --   trinkets.lua   host:CreateFontString(nil, "OVERLAY", …)      -> sublevel 0
+    --   paperdoll.lua  btn:CreateTexture(nil, "OVERLAY", nil, 6/7)   -> sublevels 6, 7
+    -- All three outrank OVERLAY(-1), so the cooldown readout and the combat-pending
+    -- overlay pair render ABOVE the halo. Scanned from source so the assertion cannot
+    -- rot if those literals are edited (the io.open precedent is equip-slot-model).
+    local function grepAll(rel, pat)
+        local fh = io.open(P(rel), "r")
+        if not fh then return nil end
+        local out = {}
+        for line in fh:lines() do
+            local s = line:match(pat)
+            if s then out[#out + 1] = s end
+        end
+        fh:close()
+        return out
+    end
+
+    -- paperdoll.lua: the combat-pending overlay pair, created ON the character slot button.
+    local pd = grepAll("paperdoll.lua", 'btn:CreateTexture%(nil, "OVERLAY", nil, (%d+)%)')
+    ck(pd ~= nil, "paperdoll.lua is readable")
+    ck(pd and #pd == 2, "paperdoll.lua draws exactly the 2 combat-pending overlay textures")
+    local pdAbove = (pd ~= nil and #pd > 0)
+    for _, s in ipairs(pd or {}) do
+        if tonumber(s) <= M.GLOW_SUBLEVEL then pdAbove = false end
+    end
+    ck(pdAbove, "every combat-pending overlay sublevel outranks the halo's -1")
+
+    -- trinkets.lua: the cooldown readouts, created ON the host button at plain OVERLAY.
+    -- A plain OVERLAY FontString is sublevel 0, so a negative halo sublevel sorts under it.
+    local tr = grepAll("trinkets.lua", '(CreateFontString%(nil, "OVERLAY")')
+    ck(tr ~= nil and #tr >= 2, "trinkets.lua creates the cooldown readouts on plain OVERLAY")
+    ck(grepAll("trinkets.lua", 'CreateFontString%(nil, "OVERLAY", nil, (%-?%d+)') ~= nil
+       and #grepAll("trinkets.lua", 'CreateFontString%(nil, "OVERLAY", nil, (%-?%d+)') == 0,
+       "…none of them carries an explicit sublevel, so all sit at 0")
+    ck(M.GLOW_SUBLEVEL < 0, "…and the halo's sublevel is negative, so OVERLAY(0) text wins")
+
+    -- The container level itself: borders.lua must NOT re-introduce the +1 offset.
+    local bsrc = io.open(P("borders.lua"), "r")
+    ck(bsrc ~= nil, "borders.lua is readable")
+    local body = bsrc and bsrc:read("*a") or ""
+    if bsrc then bsrc:close() end
+    ck(body:find("f:SetFrameLevel(parent:GetFrameLevel() or 1)", 1, true) ~= nil,
+       "the glow container sits at the host button's OWN frame level")
+    ck(body:find("GetFrameLevel() or 1) + 1", 1, true) == nil,
+       "…and the level+1 container (which put the halo over everything) is gone")
+    ck(body:find("Borders.GLOW_LAYER, nil, Borders.GLOW_SUBLEVEL", 1, true) ~= nil,
+       "the halo texture is created with the layer+sublevel constants, not a plain OVERLAY")
 
     -- ── Spec §3: two floors, chosen by how the quality was resolved ──────────────
     -- This is the asymmetry the character window was getting wrong. EQUIPPED slots read

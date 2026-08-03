@@ -6,26 +6,43 @@
     (C_Item.GetItemQualityColor, falling back to ITEM_QUALITY_COLORS, then to a static
     table so the treatment is deterministic headless).
 
-    ── The cue is a soft GLOW, not a hard outline — now SPEC-EXACT ────────────────
+    ── The cue is a soft GLOW, not a hard outline — now 1.x-EXACT ────────────────
     This file used to draw a 2px hard quality-colored SQUARE outline around each slot.
     The suite then shipped a soft additive halo, and this file matched Bags 2.0
-    parameter for parameter. Both were approximations of the reference treatment; both
-    are now reconciled to the clean-room CII_BEHAVIOR_SPEC.md, and this file and Bags
-    2.0's borders.lua declare an IDENTICAL constant block (the sibling contract — both
-    harnesses gate the same numbers, so the character window and the bag grid cannot
-    drift apart silently).
+    parameter for parameter. Round 1 of the glow work then pinned BOTH files to the
+    clean-room CII_BEHAVIOR_SPEC.md §2 numbers (68/37, 0.49, a (0, 1) nudge, a plain
+    OVERLAY texture in a child frame one level ABOVE the button).
 
-    Spec §2 anatomy: ONE additive Interface\Buttons\UI-ActionButton-Border texture on a
-    PLAIN OVERLAY layer (no sublevel), anchored CENTER to the button's CENTER with a
-    (0, 1) offset, sized 68 x 68 on a 37 x 37 button — the Ammo slot excepted at
-    58 x 58 — at a uniform alpha of 0.49 for every rarity. The COLOR carries the
-    distinction; the intensity never varies.
+    That is no longer the target. The spec is a clean-room description of a THIRD-PARTY
+    reference addon; the owner's target is verbatim "what 1.x looks like", and 1.x is
+    OUR OWN code (Daseeki-Bags on main), which we can read. Bags 2.0's forensic pass
+    transcribed 1.x directly and that transcription is now the SUITE STANDARD. This file
+    is trued up to it: the sibling contract is restored, with Bags 2.0's borders.lua
+    glow block as the authority rather than the spec.
 
-    Those are FIXED pixels in the reference, which only ever draws on 37px buttons.
-    Ours are not fixed: paper-doll slots are 37px but flyout leads are 32px, and Bags'
-    density slider moves its cells. So the spec's numbers are carried as RATIOS against
-    its 37px reference button (68/37, 58/37, 1/37) and derived from the host button's
-    measured width — exact at 37px, identical in proportion at any other size.
+    1.x anatomy (Daseeki-Bags on main, transcribed with file:line by the Bags block):
+      core/classes/item.lua:54   CreateTexture(nil, 'OVERLAY', nil, -1)
+      core/classes/item.lua:55   :SetTexture('Interface/Buttons/UI-ActionButton-Border')
+      core/classes/item.lua:56   :SetBlendMode('ADD')
+      core/classes/item.lua:57   :SetPoint('CENTER')          -- NO (0,1) offset
+      core/classes/item.lua:58   :SetSize(67, 67)             -- 67, not 68
+      core/api/settings.lua:34   glowAlpha = 0.5              -- 0.5, not 0.49
+    ONE additive halo, uniform alpha for every rarity — the COLOR carries the
+    distinction, the intensity never varies.
+
+    LAYERING is the row with teeth, and it changes what this window looks like in
+    practice. 1.x's halo is a texture ON the button at OVERLAY sublevel -1, so it sorts
+    BELOW the button's other OVERLAY art. Round 1's level+1 container put the halo ABOVE
+    everything — Armory's own trinket-cooldown readout, the combat-pending overlay icons,
+    and the neighbouring slots' art. We now reproduce 1.x: the container sits at the
+    HOST BUTTON'S OWN frame level and the halo is OVERLAY sublevel -1, which puts it
+    under every one of those (they are OVERLAY sublevel 0 / 6 / 7 on the button itself).
+
+    Those are FIXED pixels in 1.x, which only ever draws on 37px buttons. Ours are not
+    fixed: paper-doll slots are 37px but flyout leads are 32px, and Bags' density slider
+    moves its cells. So the numbers are carried as RATIOS against 1.x's own 37px button
+    (67/37, 58/37, 0) and derived from the host button's measured width — exact at 37px,
+    identical in proportion at any other size.
 
     ── Spec §3: this window is the EVERY-QUALITY surface ─────────────────────────
     The single most important asymmetry in the reference is that quality gating depends
@@ -44,8 +61,9 @@
     reference does.
 
     The look ships as CONSTANTS (Addon.Borders.GLOW_*), not settings: no new
-    SavedVariables key. The reference exposes alpha as a user "intensity" clamped
-    [0.1, 1.0]; we deliberately do not, and pin its DEFAULT (0.49) as our one value.
+    SavedVariables key. 1.x exposes alpha as a glowAlpha slider (and the spec exposes an
+    "intensity" clamped [0.1, 1.0]); we deliberately expose neither, and pin 1.x's
+    DEFAULT (0.5) as our one value.
     The single existing toggle (settings.charWindow.qualityBorders) is unchanged.
 
     NOT ported: the spec §5-6 defects — in particular the reference's merchant toggle
@@ -77,13 +95,25 @@ Borders.EQUIPPED_MIN_QUALITY = EQUIPPED_MIN_QUALITY
 Borders.BAG_MIN_QUALITY      = BAG_MIN_QUALITY
 Borders.MIN_QUALITY          = BAG_MIN_QUALITY   -- back-compat alias (== the link-path floor)
 
--- The suite glow parameters, identical to Bags 2.0 Borders.GLOW_* (spec §2).
-Borders.GLOW_TEXTURE  = "Interface\\Buttons\\UI-ActionButton-Border"
-Borders.GLOW_REF_BUTTON = 37       -- spec §2: the reference's item-button side length
-Borders.GLOW_SCALE      = 68 / 37  -- spec §2: a 68px halo on a 37px item button
-Borders.GLOW_SCALE_AMMO = 58 / 37  -- spec §2 exception: the Ammo slot halo is 58px
-Borders.GLOW_ALPHA      = 0.49     -- spec §2/§5: the reference "intensity" default
-Borders.GLOW_OFFSET_Y_SCALE = 1 / 37 -- spec §2: CENTER anchored with a (0, 1) offset
+----------------------------------------------------------------------
+-- SUITE GLOW GEOMETRY — TRANSCRIBED FROM 1.x, NOT FROM THE SPEC
+--
+-- The sibling contract is restored and its AUTHORITY is Daseeki-Bags2-beta's
+-- borders.lua "SUITE GLOW GEOMETRY" block (branch v2), which transcribed 1.x
+-- (Daseeki-Bags on main) line by line. Every citation below is that block's citation.
+-- Where 1.x and CII_BEHAVIOR_SPEC.md §2 disagree, 1.x wins — four rows disagree
+-- (scale, alpha, offset, layering) and all four are locked by the harness.
+--
+-- These ship as CONSTANTS, not settings — no new SavedVariables key.
+----------------------------------------------------------------------
+Borders.GLOW_TEXTURE  = "Interface\\Buttons\\UI-ActionButton-Border"  -- 1.x item.lua:55
+Borders.GLOW_REF_BUTTON = 37        -- 1.x: the template item button, never resized
+Borders.GLOW_SCALE      = 67 / 37   -- 1.x item.lua:58  SetSize(67, 67)  (NOT the spec's 68)
+Borders.GLOW_SCALE_AMMO = 58 / 37   -- CII §2 Ammo exception; Armory has no Ammo slot (dormant)
+Borders.GLOW_ALPHA      = 0.5       -- 1.x core/api/settings.lua:34  glowAlpha = 0.5
+Borders.GLOW_OFFSET_Y_SCALE = 0     -- 1.x item.lua:57  SetPoint('CENTER') — no offset
+Borders.GLOW_LAYER      = "OVERLAY" -- 1.x item.lua:54
+Borders.GLOW_SUBLEVEL   = -1        -- 1.x item.lua:54 — BELOW the button's other OVERLAY art
 
 -- POOR near-black (spec §3). The reference MUTATES the quality-color table at load so
 -- quality 0 is r=g=b=0.1 rather than Blizzard's 0.62 grey, and every lookup reads the
@@ -127,17 +157,20 @@ function Borders.QualityRGB(q)
     if f then return f[1], f[2], f[3] end
 end
 
--- The halo's side length for a button of `buttonSize`, at the spec's 68/37 proportion,
+-- The halo's side length for a button of `buttonSize`, at 1.x's 67/37 proportion,
 -- so the wash bleeds past the icon by the same amount at any button size. Pass `ammo`
--- truthy for the spec's 58px Ammo-slot exception.
+-- truthy for the spec's 58px Ammo-slot exception (Armory carries no Ammo entry today;
+-- the parameter is wired so adding one can never silently get the wrong halo size).
 function Borders.GlowSize(buttonSize, ammo)
     local s = tonumber(buttonSize) or 0
     if s <= 0 then return 0 end
     return s * (ammo and Borders.GLOW_SCALE_AMMO or Borders.GLOW_SCALE)
 end
 
--- The halo's vertical CENTER offset for a button of `buttonSize` — the spec's (0, 1)
--- nudge, carried as a ratio so it stays proportional at any button size.
+-- The halo's vertical CENTER offset for a button of `buttonSize`. 1.x anchors plain
+-- CENTER with no nudge (item.lua:57), so the ratio is 0 and this is 0 at every button
+-- size. Kept as a function (rather than folded away) so the geometry stays one shape
+-- with Bags 2.0's and a future offset would be a one-constant change.
 function Borders.GlowOffsetY(buttonSize)
     local s = tonumber(buttonSize) or 0
     if s <= 0 then return 0 end
@@ -178,25 +211,29 @@ local function layoutGlow(f)
     g:SetPoint("CENTER", f, "CENTER", 0, Borders.GlowOffsetY(w))
 end
 
--- A soft additive quality halo washing over a button's icon (spec §2 anatomy).
+-- A soft additive quality halo washing over a button's icon (1.x anatomy).
 -- The container spans the button; the halo is CENTERED in it and deliberately larger
--- than the button, so the wash bleeds over the icon edge on all sides.
+-- than the button (1.x's 67-on-37), so the wash bleeds over the icon edge on all sides.
 local function makeGlow(parent, ammo)
     local f = CreateFrame("Frame", nil, parent)
     f:SetPoint("TOPLEFT", parent, "TOPLEFT", 0, 0)
     f:SetPoint("BOTTOMRIGHT", parent, "BOTTOMRIGHT", 0, 0)
-    f:SetFrameLevel((parent:GetFrameLevel() or 1) + 1)
+    -- CELL PARITY with Bags 2.0: the container sits at the button's OWN frame level, not
+    -- one above it. 1.x's IconGlow is a texture ON the button (item.lua:54), ordered
+    -- against the button's other art by DRAW LAYER alone. A level+1 container ordered the
+    -- halo above EVERYTHING — Armory's trinket-cooldown readout (trinkets.lua:100/161,
+    -- OVERLAY sublevel 0 on the button), the combat-pending overlay pair (paperdoll.lua
+    -- :23/:25, OVERLAY sublevels 6 and 7 on the button), and the neighbouring slots' art.
+    -- Same level + OVERLAY(-1) below reproduces 1.x's ordering exactly.
+    f:SetFrameLevel(parent:GetFrameLevel() or 1)
     f._host = parent
     f._ammo = ammo and true or nil
 
-    -- Spec §2: a PLAIN OVERLAY texture — no negative sublevel. (The sublevel was inert
-    -- anyway: this container holds exactly ONE texture and already sits a frame level
-    -- above the button, so it could never have ordered the halo against the button's
-    -- own OVERLAY art. Dropping it just removes a parameter we had no basis for.)
-    local g = f:CreateTexture(nil, "OVERLAY")
+    -- 1.x item.lua:54 — OVERLAY at sublevel -1, i.e. BELOW the button's other OVERLAY art.
+    local g = f:CreateTexture(nil, Borders.GLOW_LAYER, nil, Borders.GLOW_SUBLEVEL)
     g:SetTexture(Borders.GLOW_TEXTURE)
     g:SetBlendMode("ADD")
-    g:SetPoint("CENTER", f, "CENTER", 0, 0)   -- re-anchored with the spec offset by layoutGlow
+    g:SetPoint("CENTER", f, "CENTER", 0, 0)   -- re-anchored with the glow offset by layoutGlow
     f._glow = g
     layoutGlow(f)
 
@@ -256,7 +293,7 @@ function Addon:InitBorders()
     for _, s in ipairs(Addon.SLOTS) do
         if s.slotName then
             local btn = _G["Character" .. s.slotName]
-            -- Spec §2's Ammo exception (58px, not 68px). Armory's SLOTS model does not
+            -- Spec §2's Ammo exception (58px, not the 67px norm). Armory's SLOTS model does not
             -- currently carry an Ammo entry, so this is dormant — it is wired anyway so
             -- that adding one can never silently get the wrong halo size.
             if btn then Addon._slotGlows[s.id] = makeGlow(btn, s.slotName == "AmmoSlot") end

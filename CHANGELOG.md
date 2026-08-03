@@ -51,12 +51,22 @@ gear-swapping features.
   slots stay unbordered, as before. The hover flyout is unchanged and still only
   glows Uncommon and above, which is the right rule for a list of items rather
   than a set of worn slots.
-- **The glow itself is now exact.** It was drawn very slightly too small, a touch
-  too bright, and sat one pixel low. The halo is now a little wider relative to the
-  slot, the intensity is slightly softer, and it is nudged up one pixel so it sits
-  centered on the icon rather than under it. All three scale with button size, so
-  the 37px equipped slots and the smaller flyout entries look identical. No new
-  settings.
+- **The glow itself is now exact — it is the bags glow, to the pixel.** An earlier
+  pass in this same unreleased cycle sized the halo from a written description
+  rather than from Daseeki Bags itself, and got three things slightly wrong: it was
+  a hair too wide, a touch too bright, and nudged one pixel up off center. All
+  three are corrected against the bags treatment directly, so the character sheet
+  and your bag grid now draw the identical halo — same width, same softness,
+  centered with no nudge. Everything scales with button size, so the 37px equipped
+  slots and the smaller flyout entries stay in proportion. No new settings.
+- **The glow no longer covers up the things drawn on top of a slot.** It used to be
+  painted above every other decoration on the character sheet, which meant a
+  trinket's cooldown countdown and the little "will be equipped after combat"
+  marker could be washed out by the halo of the slot they belong to — or by the
+  halo of the slot next to them. The glow now sits underneath all of that, exactly
+  as it does in your bags: the countdown numbers and the pending-swap markers read
+  cleanly over the top, and a bright halo can no longer bleed over a neighbouring
+  slot's artwork.
 
 - **The gear-swap engine has been rebuilt from the ground up.** Equipping sets
   behaves exactly as before — your saved sets, their slots, key bindings and
