@@ -144,6 +144,9 @@ function Mock.new(P)
             if not link then return nil end
             return { hyperlink = link, isLocked = w.locks["b" .. bag .. ":" .. slot] or false }
         end,
+        GetContainerItemLink = function(bag, slot)
+            return w.bags[bag] and w.bags[bag].items[slot] or nil
+        end,
         GetContainerNumFreeSlots = function(bag)
             local n = 0
             for slot = 1, (w.bags[bag] and w.bags[bag].size or 0) do

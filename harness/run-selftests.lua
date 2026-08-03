@@ -1176,6 +1176,213 @@ suite("equip-public-surface", world(function(ck, w, A)
 end))
 
 ----------------------------------------------------------------------
+-- Set-builder goal "obtained" check (the green tick on a slot)
+--
+-- The predicate behind options.lua's b.check:SetShown() is
+-- (GetGoal ~= nil) and IsGoalMet. Owner report: the tick never appeared once a
+-- goal was achieved, because "achieved" only ever meant "the item is loose in a
+-- bag right now" — gear that went straight onto the character was invisible.
+----------------------------------------------------------------------
+local function goalShown(A, set, slotId)
+    -- the exact composition options.lua's RefreshBuilder feeds to b.check
+    local goal = A:GetGoal(set, slotId)
+    local met  = A:IsGoalMet(set, slotId)
+    return (goal ~= nil and met) and true or false
+end
+
+suite("goal-obtained-check", world(function(ck, w, A)
+    local HEAD, HANDS = 1, 10
+
+    -- ── not achieved: item is nowhere ────────────────────────────────────────
+    local set = w:defineSet("chase", { [HEAD] = L(3002) })
+    A:SetGoal("chase", HEAD, 3001)
+    ck(A:GetGoal(set, HEAD) ~= nil, "goal is recorded on the slot")
+    ck(A:IsGoalMet(set, HEAD) == false, "goal not met while the item is nowhere")
+    ck(goalShown(A, set, HEAD) == false, "check HIDDEN when the goal is unmet")
+
+    -- ── achieved via the character: the regression case ──────────────────────
+    w:setWorn(HEAD, L(3001))
+    ck(A:IsGoalWorn(HEAD, A:GetGoal(set, HEAD)) == true, "goal item detected as worn")
+    ck(A:IsGoalMet(set, HEAD) == true, "goal met from WORN gear, with empty bags")
+    ck(goalShown(A, set, HEAD) == true, "check SHOWN when the goal item is worn")
+
+    -- CheckGoals adopts the worn item into the set and makes the flag sticky
+    ck(A:CheckGoals() == true, "CheckGoals reports a change for the worn hit")
+    ck(set.equip[HEAD].id == 3001, "worn goal item is adopted into the set slot")
+    ck(set.goalMet[HEAD] == true, "worn hit sets the sticky obtained flag")
+    w:setWorn(HEAD, nil)
+    ck(A:IsGoalMet(set, HEAD) == true, "stays met after the item comes back off")
+    ck(A:CheckGoals() == false, "CheckGoals is idempotent once the goal is met")
+
+    -- ── worn in a DIFFERENT slot is not this slot's goal ─────────────────────
+    local set2 = w:defineSet("chase2", { [HANDS] = L(1001) })
+    A:SetGoal("chase2", HANDS, 3001)
+    w:setWorn(HEAD, L(3001))          -- right item, wrong slot
+    ck(A:IsGoalMet(set2, HANDS) == false, "worn in another slot does not meet the goal")
+    ck(goalShown(A, set2, HANDS) == false, "check HIDDEN for a wrong-slot match")
+    w:setWorn(HEAD, nil)
+
+    -- ── achieved via bags still works (the original path) ────────────────────
+    w:setBag(0, 1, L(3001))
+    ck(A:CheckGoals() == true, "bag hit still marks the goal obtained")
+    ck(set2.equip[HANDS] ~= nil and set2.equip[HANDS].id == 3001, "bag item adopted into the slot")
+    ck(goalShown(A, set2, HANDS) == true, "check SHOWN after a bag hit")
+    w:setBag(0, 1, nil)
+
+    -- ── no goal on the slot: never a check, whatever is worn ─────────────────
+    local set3 = w:defineSet("plain", { [HEAD] = L(3001) })
+    w:setWorn(HEAD, L(3001))
+    ck(A:GetGoal(set3, HEAD) == nil, "slot has no goal")
+    ck(A:IsGoalMet(set3, HEAD) == false, "no goal means never met")
+    ck(goalShown(A, set3, HEAD) == false, "check HIDDEN on a slot with no goal")
+    w:setWorn(HEAD, nil)
+
+    -- ── CheckGoals survives a goal-bearing set with no equip table ───────────
+    -- Previously this indexed nil and aborted the scan for EVERY set.
+    A.db.sets["broken"] = { name = "broken", goals = { [HEAD] = { id = 3001 } } }
+    local set4 = w:defineSet("after", { [HEAD] = L(3002) })
+    A:SetGoal("after", HEAD, 3001)
+    w:setWorn(HEAD, L(3001))
+    local okScan, scanErr = pcall(function() return A:CheckGoals() end)
+    ck(okScan == true, "CheckGoals does not raise on a set with goals but no equip: "
+                       .. tostring(scanErr))
+    ck(set4.goalMet ~= nil and set4.goalMet[HEAD] == true,
+       "later sets are still scanned after the malformed one")
+    A.db.sets["broken"] = nil
+    w:setWorn(HEAD, nil)
+
+    -- ── a zero/absent goal id can never be "worn" ────────────────────────────
+    ck(A:IsGoalWorn(HEAD, { id = 0 }) == false, "id 0 is never a worn match")
+    ck(A:IsGoalWorn(HEAD, nil) == false, "nil goal is never a worn match")
+
+    -- the equipment event must be watched, or the worn path never fires live
+    local watched = {}
+    for _, e in ipairs(A.GOAL_EVENTS or {}) do watched[e] = true end
+    ck(watched["BAG_UPDATE_DELAYED"] == true, "goals watch BAG_UPDATE_DELAYED")
+    ck(watched["PLAYER_EQUIPMENT_CHANGED"] == true, "goals watch PLAYER_EQUIPMENT_CHANGED")
+end))
+
+----------------------------------------------------------------------
+-- Set-builder preview model: the dressing plan
+--
+-- Owner report: the preview showed live gear, and only one weapon (the
+-- off-hand) rendered, in the main hand. BuildDressPlan is the ordered TryOn
+-- list; the ordering and the handSlotName hints are the contract.
+----------------------------------------------------------------------
+suite("set-preview-dressing", function(ck)
+    local w = mock.new(P)
+    local A = w.Addon
+    local MH, OH, RANGED = 16, 17, 18
+
+    local function ids(plan)
+        local t = {}
+        for i, s in ipairs(plan) do t[i] = s.slotId end
+        return t
+    end
+    local function join(t) return table.concat(t, ",") end
+
+    ck(join(ids(A:BuildDressPlan(nil))) == "", "no set yields an empty plan")
+    ck(join(ids(A:BuildDressPlan({}))) == "", "set with no equip yields an empty plan")
+
+    -- ── 1H + shield: weapons last, main hand first, both hinted ──────────────
+    local s1 = w:defineSet("mh-oh", { [1] = L(3001), [MH] = L(4002), [OH] = L(4003) })
+    local p1 = A:BuildDressPlan(s1)
+    ck(join(ids(p1)) == "1,16,17", "1H+shield: head, then main hand, then off hand")
+    ck(p1[2].hand == "MAINHANDSLOT", "main hand carries MAINHANDSLOT")
+    ck(p1[3].hand == "SECONDARYHANDSLOT", "off hand carries SECONDARYHANDSLOT")
+    ck(p1[1].hand == nil, "non-weapon steps carry no hand hint")
+
+    -- ordering must hold no matter which order the set table happens to iterate
+    for _ = 1, 5 do
+        local p = A:BuildDressPlan(s1)
+        ck(join(ids(p)) == "1,16,17", "plan order is deterministic across rebuilds")
+    end
+
+    -- ── dual wield: still MH then OH, never both into the main hand ──────────
+    local s2 = w:defineSet("dw", { [MH] = L(4002), [OH] = L(4002) })
+    local p2 = A:BuildDressPlan(s2)
+    ck(join(ids(p2)) == "16,17", "dual wield: main hand precedes off hand")
+    ck(p2[1].hand == "MAINHANDSLOT" and p2[2].hand == "SECONDARYHANDSLOT",
+       "dual wield hints both hands explicitly")
+
+    -- ── 2H alone: one weapon step, main hand ─────────────────────────────────
+    local s3 = w:defineSet("2h", { [MH] = L(4001) })
+    local p3 = A:BuildDressPlan(s3)
+    ck(join(ids(p3)) == "16", "2H alone: a single main-hand step")
+    ck(p3[1].hand == "MAINHANDSLOT", "2H is hinted to the main hand")
+
+    -- ── ranged is never previewed ────────────────────────────────────────────
+    local s4 = w:defineSet("bow", { [MH] = L(4002), [RANGED] = L(4004) })
+    local p4 = A:BuildDressPlan(s4)
+    ck(join(ids(p4)) == "16", "ranged slot 18 is excluded from the preview")
+
+    -- ── explicit-empty and disabled slots dress nothing ──────────────────────
+    local s5 = w:defineSet("holes", { [1] = mock.EMPTY, [3] = L(3001), [5] = L(3002) },
+                           { [5] = true })
+    local p5 = A:BuildDressPlan(s5)
+    ck(join(ids(p5)) == "3", "explicit-empty and disabled slots are not dressed")
+
+    -- ── non-weapon steps follow core.lua's Addon.SLOTS order ─────────────────
+    local s6 = w:defineSet("many", { [9] = L(3001), [1] = L(3001), [5] = L(3001) })
+    ck(join(ids(A:BuildDressPlan(s6))) == "1,5,9", "non-weapon steps follow SLOT_IDS order")
+
+    -- every step must carry a usable link
+    local allLinks = true
+    for _, s in ipairs(p1) do if type(s.link) ~= "string" then allLinks = false end end
+    ck(allLinks, "every plan step carries an item link string")
+
+    w:teardown()
+end)
+
+----------------------------------------------------------------------
+-- Source contract for the two surfaces above (the io.open scan gate)
+----------------------------------------------------------------------
+suite("set-builder-source-contract", function(ck)
+    local function slurp(f)
+        local h = io.open(P(f), "r")
+        if not h then return nil end
+        local s = h:read("*a"); h:close(); return s
+    end
+
+    local opt = slurp("options.lua")
+    ck(opt ~= nil, "options.lua is readable")
+    if not opt then return end
+
+    -- the goal check itself: texture, corner, layer, and the shown predicate
+    ck(opt:find('b%.check:SetTexture%("Interface\\\\RaidFrame\\\\ReadyCheck%-Ready"%)') ~= nil,
+       "goal check uses the green ReadyCheck-Ready texture")
+    ck(opt:find('b%.check = b:CreateTexture%(nil, "OVERLAY", nil, BADGE_SUBLEVEL%)') ~= nil,
+       "goal check is created at the named badge sublevel")
+    ck(opt:find("local BADGE_SUBLEVEL = 7") ~= nil, "badge sublevel is OVERLAY 7")
+    ck(opt:find('b%.check:SetPoint%("BOTTOMRIGHT"') ~= nil, "goal check sits bottom-right")
+    ck(opt:find("b%.check:SetShown%(%(goal ~= nil and met%)") ~= nil,
+       "goal check is shown by (goal ~= nil and met)")
+
+    -- the badge must outrank the suite quality glow
+    local bord = slurp("borders.lua")
+    ck(bord ~= nil, "borders.lua is readable")
+    local glowSub = bord and tonumber(bord:match("GLOW_SUBLEVEL%s*=%s*(%-?%d+)"))
+    ck(glowSub ~= nil, "borders.lua declares GLOW_SUBLEVEL")
+    ck(glowSub ~= nil and glowSub < 7, "quality glow (" .. tostring(glowSub)
+       .. ") sorts below the slot badges (7)")
+
+    -- the preview model: SetUnit binds once at build, never on refresh
+    local dress = opt:match("function Addon:DressSetModel%(%).-\nend\n")
+    ck(dress ~= nil, "DressSetModel exists")
+    ck(dress ~= nil and dress:find(":SetUnit%(") == nil,
+       "DressSetModel never calls SetUnit (it would re-dress in live gear)")
+    ck(dress ~= nil and dress:find("BuildDressPlan") ~= nil,
+       "DressSetModel dresses from BuildDressPlan")
+    local refresh = opt:match("function Addon:RefreshSetModel%(%).-\nend\n")
+    ck(refresh ~= nil, "RefreshSetModel exists")
+    ck(refresh ~= nil and refresh:find(":SetUnit%(") == nil,
+       "RefreshSetModel never calls SetUnit")
+    ck(opt:find('model:SetUnit%("player"%)') ~= nil,
+       "the model is still bound to the player once, at build time")
+    ck(opt:find("step%.hand") ~= nil, "the dress pass passes the handSlotName hint")
+end)
+
+----------------------------------------------------------------------
 -- Every shipped file compiles (loadfile gate)
 ----------------------------------------------------------------------
 suite("loadfile-all-files", function(ck)

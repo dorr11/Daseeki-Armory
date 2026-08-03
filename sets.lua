@@ -435,6 +435,49 @@ function Addon:ImportFromItemRack()
     return true, count
 end
 
+-- ── Set-preview model dressing ───────────────────────────────────────────────
+-- The set builder's 3D preview must show the SET being viewed, not what the
+-- player happens to be wearing. The plan below is the pure half of that: given a
+-- set, produce the ordered list of TryOn calls that dresses a DressUpModel in it.
+-- Kept here (and pure) so the ordering contract is testable headlessly.
+--
+-- Two ordering rules, both load-bearing:
+--   * the RANGED slot (18) is never previewed — the model would render the bow
+--     in place of the melee weapons.
+--   * weapons go LAST and MAIN HAND FIRST, each with an explicit handSlotName.
+--     TryOn's second argument (handSlotName, present in 1.15.9) is what keeps an
+--     off-hand out of the main hand; without it the client drops every weapon
+--     into the main hand and the last one processed wins, which is why the
+--     preview showed a single weapon — the off-hand — in the main hand.
+Addon.MODEL_MAINHAND = 16
+Addon.MODEL_OFFHAND  = 17
+Addon.MODEL_RANGED   = 18
+Addon.HAND_SLOT_NAME = { [16] = "MAINHANDSLOT", [17] = "SECONDARYHANDSLOT" }
+
+function Addon:BuildDressPlan(set)
+    local plan = {}
+    if not (set and set.equip) then return plan end
+    local weapons = {}
+    for _, slotId in ipairs(Addon.SLOT_IDS or {}) do
+        if slotId ~= Addon.MODEL_RANGED and Addon:IsSlotActive(set, slotId) then
+            -- EntryLink returns nil for the explicit-empty sentinel, so a slot the
+            -- set deliberately strips is simply never dressed and stays bare.
+            local link = Addon:EntryLink(set.equip[slotId])
+            if link then
+                if Addon.HAND_SLOT_NAME[slotId] then weapons[slotId] = link
+                else plan[#plan + 1] = { slotId = slotId, link = link } end
+            end
+        end
+    end
+    for _, slotId in ipairs({ Addon.MODEL_MAINHAND, Addon.MODEL_OFFHAND }) do
+        if weapons[slotId] then
+            plan[#plan + 1] = { slotId = slotId, link = weapons[slotId],
+                                hand = Addon.HAND_SLOT_NAME[slotId] }
+        end
+    end
+    return plan
+end
+
 -- ── Chase-list goals ──────────────────────────────────────────────────────────
 -- set.goals[slotId]   = { id, str, exact }  — target item the player is chasing
 -- set.goalMet[slotId] = true                — sticky "obtained" flag
@@ -443,12 +486,30 @@ function Addon:GetGoal(set, slotId)
     return set and set.goals and set.goals[slotId] or nil
 end
 
--- Met when explicitly obtained, or the set's current item already IS the goal item.
+-- The goal's base item id, currently WORN in that same inventory slot.
+-- "Obtained" has always meant "the item is mine now", but until this the only
+-- evidence the addon accepted was the item sitting in a BAG at the moment
+-- CheckGoals ran. An item that was looted straight into use, that was already
+-- equipped when the goal was set, or that was worn during a session where the
+-- bag scan never saw it, never tripped the flag — so the builder's obtained
+-- check never appeared even though the player plainly had the item.
+function Addon:IsGoalWorn(slotId, goal)
+    if not (goal and goal.id and goal.id > 0 and slotId) then return false end
+    local GID = _G.GetInventoryItemID
+    if type(GID) ~= "function" then return false end
+    local ok, wornId = pcall(GID, "player", slotId)
+    return ok and wornId == goal.id
+end
+
+-- Met when explicitly obtained, when the set's current item already IS the goal
+-- item, or when the goal item is worn in that slot right now.
 function Addon:IsGoalMet(set, slotId)
     if not (set and set.goals and set.goals[slotId]) then return false end
     if set.goalMet and set.goalMet[slotId] then return true end
+    local goal = set.goals[slotId]
     local cur = set.equip and set.equip[slotId]
-    return cur ~= nil and cur.id == set.goals[slotId].id
+    if cur ~= nil and cur.id == goal.id then return true end
+    return Addon:IsGoalWorn(slotId, goal)
 end
 
 function Addon:SetGoal(name, slotId, itemId)
@@ -469,29 +530,45 @@ function Addon:ClearGoal(name, slotId)
     return true
 end
 
--- Scan bags for any unmet goal's base item; on a hit, fill the set slot with the
--- real bag item (carrying its enchant) and mark the goal obtained. Returns true if
--- anything changed. Idempotent — safe to call on every BAG_UPDATE_DELAYED.
+-- Scan bags AND worn gear for any unmet goal's base item; on a hit, fill the set
+-- slot with the real item (carrying its enchant) and mark the goal obtained.
+-- Returns true if anything changed. Idempotent — safe to call on every
+-- BAG_UPDATE_DELAYED / PLAYER_EQUIPMENT_CHANGED.
+--
+-- The worn pass is what makes "goal achieved" mean what the player means. The
+-- bag pass alone only ever caught an item during the window it happened to be
+-- loose in a bag; gear that went straight onto the character was invisible to it.
 function Addon:CheckGoals()
     local CN = (C_Container and C_Container.GetContainerNumSlots) or _G.GetContainerNumSlots
     local CL = (C_Container and C_Container.GetContainerItemLink)  or _G.GetContainerItemLink
+    local GIL = _G.GetInventoryItemLink
     local changed = false
     for _, set in pairs(Addon.db.sets or {}) do
-        if set.goals then
+        -- A set carrying goals but no equip table used to blow up on the
+        -- set.equip[slotId] index below, which aborted the scan for EVERY set.
+        if set.goals and set.equip then
             for slotId, goal in pairs(set.goals) do
-                if goal and not (set.goalMet and set.goalMet[slotId])
+                if goal and goal.id and goal.id > 0
+                   and not (set.goalMet and set.goalMet[slotId])
                    and not (set.equip[slotId] and set.equip[slotId].id == goal.id) then
                     -- look for the goal's base item in the player's bags
                     local found
-                    for bag = 0, 4 do
-                        local num = CN(bag) or 0
-                        for slot = 1, num do
-                            local link = CL(bag, slot)
-                            if link and tonumber(link:match("item:(%d+)")) == goal.id then
-                                found = link; break
+                    if type(CN) == "function" and type(CL) == "function" then
+                        for bag = 0, 4 do
+                            local num = CN(bag) or 0
+                            for slot = 1, num do
+                                local link = CL(bag, slot)
+                                if link and tonumber(link:match("item:(%d+)")) == goal.id then
+                                    found = link; break
+                                end
                             end
+                            if found then break end
                         end
-                        if found then break end
+                    end
+                    -- ...and, failing that, on the character in that very slot
+                    if not found and Addon:IsGoalWorn(slotId, goal) and type(GIL) == "function" then
+                        local ok, link = pcall(GIL, "player", slotId)
+                        if ok and link then found = link end
                     end
                     if found then
                         set.equip[slotId] = Addon:IdentityFromLink(found)
@@ -511,11 +588,15 @@ function Addon:CheckGoals()
     return changed
 end
 
--- BAG_UPDATE_DELAYED watcher (also run once at login from core.lua).
+-- Bag/equipment watcher (also run once at login from core.lua). The equipment
+-- event is what catches a goal item that is put straight on rather than parked
+-- in a bag.
+Addon.GOAL_EVENTS = { "BAG_UPDATE_DELAYED", "PLAYER_EQUIPMENT_CHANGED" }
+
 function Addon:InitGoals()
     if Addon._goalEv then return end
     Addon._goalEv = CreateFrame("Frame")
-    Addon._goalEv:RegisterEvent("BAG_UPDATE_DELAYED")
+    for _, e in ipairs(Addon.GOAL_EVENTS) do Addon._goalEv:RegisterEvent(e) end
     Addon._goalEv:SetScript("OnEvent", function() Addon:CheckGoals() end)
     Addon:CheckGoals()
 end

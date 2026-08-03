@@ -10,6 +10,30 @@ gear-swapping features.
   Display Mode / Tooltips row directly above them. The settings themselves, and when
   each one appears, are unchanged.
 
+- **A goal you have already achieved now shows its green tick.** The tick on a set
+  slot only ever appeared if the goal item happened to be sitting loose in a bag at
+  the moment the addon looked. Gear you looted and put straight on, gear you were
+  already wearing when you set the goal, and gear picked up in a session where that
+  check never ran all counted as "not obtained" — so the slot stayed blank even
+  though the item was plainly yours. Armory now also counts the item being *worn in
+  that slot*, and it re-checks whenever your equipment changes, not just when your
+  bags do. As with a bag find, the set slot updates to the real item you own and the
+  goal stays ticked afterwards. Nothing else about goals changed: the tick still sits
+  in the bottom-right corner of the slot, above the quality glow, and clearing a goal
+  clears it. A set with goals but no gear in it no longer stops every other set from
+  being checked.
+
+- **The set builder's preview now shows the set you are looking at, not what you are
+  wearing.** The preview was re-binding the model to your character on every refresh,
+  which re-dressed it in your live gear a moment after the set had been put on it, so
+  you saw yourself instead of the set. It now dresses the set only. Weapons are also
+  handled properly: they are put on last, main hand before off hand, and each is told
+  which hand it belongs in — previously both weapons were handed to the game with no
+  hand specified, so they both landed in the main hand and only the last one survived
+  (which is why a single off-hand weapon appeared in the main hand). Slots the set
+  deliberately strips stay bare, slots the set ignores stay bare, and the ranged
+  weapon is still left out so it cannot replace your melee weapons on the model.
+
 - **The pop-up pickers now use the font you picked in Daseeki Core.** The window titles
   had already moved onto the suite look, but the text under them had not: the set names
   in the gear flyout, the item names in the Goal picker, the icon and set counters, and

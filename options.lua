@@ -38,6 +38,13 @@ local PERROW = { "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12" }
 local IB          = 2    -- art inset within an icon button
 local LIST_INSET  = 4    -- scroll viewport inset in the set list
 local CHECK_INSET = 3    -- goal-obtained check inset within a slot
+-- Slot badge layer. OVERLAY sublevel 7 is the top of a button's OVERLAY range,
+-- so the goal check and the explicit-empty X sort above every other slot
+-- decoration: the red "missing gear" ring (OVERLAY sublevel 0 on the button) and
+-- the suite quality glow (borders.lua, OVERLAY sublevel -1 in its own container
+-- frame at the host button's level). Only HIGHLIGHT — the translucent hover
+-- tint — draws over it, which is intended.
+local BADGE_SUBLEVEL = 7
 local SET_ROW_H   = 28   -- set-list row height
 local SETLIST_H   = 200  -- set-list viewport height
 local SLOT_SZ     = 36   -- equip-slot button size
@@ -598,13 +605,13 @@ local function buildPaperdoll(flow, panel)
         -- explicit-empty marker: the same red X the flyout uses for "take off",
         -- badged bottom-left so an emptied slot reads differently from an ignored
         -- one and from a slot that is simply not in the set (spec §5.2)
-        b.emptyMark = b:CreateTexture(nil, "OVERLAY", nil, 7)
+        b.emptyMark = b:CreateTexture(nil, "OVERLAY", nil, BADGE_SUBLEVEL)
         b.emptyMark:SetTexture("Interface\\Buttons\\UI-GroupLoot-Pass-Up")
         b.emptyMark:SetSize(16, 16)
         b.emptyMark:SetPoint("BOTTOMLEFT", -CHECK_INSET, -CHECK_INSET)
         b.emptyMark:Hide()
         -- goal obtained check (bottom-right)
-        b.check = b:CreateTexture(nil, "OVERLAY", nil, 7)
+        b.check = b:CreateTexture(nil, "OVERLAY", nil, BADGE_SUBLEVEL)
         b.check:SetTexture("Interface\\RaidFrame\\ReadyCheck-Ready")
         b.check:SetSize(16, 16); b.check:SetPoint("BOTTOMRIGHT", CHECK_INSET, -CHECK_INSET); b.check:Hide()
         local hl = b:CreateTexture(nil, "HIGHLIGHT"); hl:SetAllPoints()
@@ -1277,23 +1284,57 @@ function Addon:RefreshSetList()
     panel.listChild:SetHeight(math.max(1, #sets * SET_ROW_H))
 end
 
+-- Strip the preview model back to bare. Undress()'s no-argument form is not
+-- guaranteed to drop weapons, so the three weapon slots are cleared explicitly —
+-- otherwise the previous set's blade lingers into the next one.
+local function stripModel(model)
+    if model.Undress then pcall(model.Undress, model) end
+    if model.UndressSlot then
+        for _, sid in ipairs({ Addon.MODEL_MAINHAND, Addon.MODEL_OFFHAND, Addon.MODEL_RANGED }) do
+            pcall(model.UndressSlot, model, sid)
+        end
+    end
+end
+
+-- Dress the preview model in the selected set. Deliberately does NOT call
+-- SetUnit: SetUnit reloads the model and re-dresses it in the player's LIVE gear
+-- asynchronously, so every Undress/TryOn issued in the same frame is discarded
+-- when the reload lands — which is exactly why the preview showed worn gear
+-- instead of the set being viewed. The unit is bound once, at build time.
+function Addon:DressSetModel()
+    local panel = Addon.panel
+    local model = panel and panel.model
+    if not model or not model.TryOn then return end
+    stripModel(model)
+    local set = panel.selectedSet and Addon.db.sets[panel.selectedSet]
+    if not set then return end
+    for _, step in ipairs(Addon:BuildDressPlan(set)) do
+        -- handSlotName keeps the off-hand out of the main hand. If a client ever
+        -- rejects the second argument, fall back to the bare call — the plan
+        -- already orders main hand before off-hand, which is the best a
+        -- slot-blind TryOn can do.
+        local ok = step.hand and pcall(model.TryOn, model, step.link, step.hand)
+        if not ok then pcall(model.TryOn, model, step.link) end
+    end
+end
+
 function Addon:RefreshSetModel()
     local panel = Addon.panel
     local model = panel and panel.model
     if not model then return end
-    local set = panel.selectedSet and Addon.db.sets[panel.selectedSet]
-    model:SetUnit("player")
-    if model.Undress then model:Undress() end
-    if set then
-        for slotId, entry in pairs(set.equip) do
-            -- skip the ranged slot (18): the model should only ever show the MH/OH
-            -- weapons, never the ranged weapon in their place.
-            if slotId ~= 18 and Addon:IsSlotActive(set, slotId) then
-                local link = Addon:EntryLink(entry)
-                if link then model:TryOn(link) end
-            end
+
+    -- Re-dress once the model finishes loading, for the build-time pass that can
+    -- run before SetUnit's reload has landed. Hooked behind pcall because
+    -- OnModelLoaded is not a guaranteed handler on every client.
+    if model.SetScript and not model._armDressHooked then
+        model._armDressHooked = true
+        if not pcall(model.SetScript, model, "OnModelLoaded",
+                     function() Addon:DressSetModel() end) then
+            model._armDressHooked = nil
         end
     end
+
+    Addon:DressSetModel()
 end
 
 -- Open the hub straight to the Armory → Sets tab (used by the character-pane button).
