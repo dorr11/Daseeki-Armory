@@ -4,6 +4,12 @@
 Correctness fixes — the stats panel now matches in-game values — plus three new
 gear-swapping features.
 
+- **The Set Swapper's Type, Direction and Sets Per Row settings now sit side by side.**
+  They were three stacked rows down the settings page; they are now one row of three
+  columns — each with its caption above its dropdown — lined up with the Open On /
+  Display Mode / Tooltips row directly above them. The settings themselves, and when
+  each one appears, are unchanged.
+
 - **The pop-up pickers now use the font you picked in Daseeki Core.** The window titles
   had already moved onto the suite look, but the text under them had not: the set names
   in the gear flyout, the item names in the Goal picker, the icon and set counters, and

@@ -53,9 +53,13 @@ local PD_W        = 512  -- fixed paper-doll builder band width (centered in con
 local SPLIT_MIN   = 828  -- content width to switch Sets to two-pane (SPLIT_LEFT+GAP+PD_W)
 local SPLIT_LEFT  = 300  -- set-list column width in two-pane mode
 local SPLIT_GAP   = 16   -- gap between the two Sets columns
+local ITEM_GAP    = 8    -- mirrors DaseekiUI's inter-item gap inside a flow row
 local MGMT_BTN    = 142  -- management/CRUD button width (two per row in the ~300px column)
-local MGMT_GRID   = MGMT_BTN * 2 + 8  -- full management-grid width (two buttons + ITEM_GAP=8) = 292
-local SWAP_DD     = (MGMT_GRID - 2 * 8) / 3  -- three Set-Swapper dropdowns sharing the management-grid edges (2×ITEM_GAP=16) = 92
+local MGMT_GRID   = MGMT_BTN * 2 + ITEM_GAP  -- full management-grid width (two buttons + one gap) = 292
+local SWAP_DD     = (MGMT_GRID - 2 * ITEM_GAP) / 3  -- three Set-Swapper dropdowns sharing the management-grid edges = 92
+local DD_CAP_H    = 18   -- Set-Swapper column-caption height (UI.MakeLabel's fixed height)
+local DD_CAP_GAP  = 2    -- caption -> dropdown gap (the 20px pitch MakeDropdown's own label uses)
+local DD_BTN_H    = 24   -- MakeDropdown button height
 
 -- Shared re-tinting FontObjects created by DaseekiUI (theme.lua). Referencing the
 -- global names keeps custom FontStrings themed — they re-color on ThemeChanged.
@@ -78,15 +82,30 @@ local function condRow(flow)
     local blk = flow.pane.blocks[#flow.pane.blocks]
     row._blk, row._baseGap = blk, blk.topGap
     local origArrange = blk.arrange
+    -- `row._arrange`, if the caller installs one, replaces the default left-to-right
+    -- row layout while KEEPING the collapse behaviour above (a custom arrange assigned
+    -- straight onto blk.arrange would clobber this wrapper).
     blk.arrange = function(width)
         if row._applicable == false then row:Hide(); return 0 end
-        row:Show(); return origArrange(width)
+        row:Show(); return (row._arrange or origArrange)(width)
     end
     function row:SetApplicable(on)
         self._applicable = on and true or false
         self._blk.topGap = self._applicable and self._baseGap or 0
     end
     return row
+end
+
+-- One Set-Swapper column caption: a muted SMALL label sized to the exact grid column
+-- so its text centers over its own dropdown and can neither truncate nor spill into
+-- the neighbouring column. Shared by both dropdown trios in the Set Swapper block.
+local function swapCaption(row, text)
+    local lb = row:Label(text, { muted = true })
+    lb._label:SetFontObject(F_SMALL)
+    lb._label:SetWidth(SWAP_DD)          -- fill the 92px column so the text can center in it
+    lb._label:SetJustifyH("CENTER")      -- center each caption over its own dropdown
+    lb.uiWidth = SWAP_DD; lb:SetWidth(SWAP_DD)
+    return lb
 end
 
 -- ── Confirmation dialogs ──────────────────────────────────────────────────────
@@ -220,15 +239,7 @@ function Addon:BuildSetSwapperTab(flow)
     -- dropdowns. Each header label fills its 92px column and center-justifies, so it sits
     -- centered over its own dropdown (same pattern as the char-window flyout headers).
     local ddHdr = flow:AddRow()
-    local function ddHcell(text)
-        local lb = ddHdr:Label(text, { muted = true })
-        lb._label:SetFontObject(F_SMALL)
-        lb._label:SetWidth(SWAP_DD)          -- fill the 92px column so the text can center in it
-        lb._label:SetJustifyH("CENTER")      -- center each header over its own dropdown
-        lb.uiWidth = SWAP_DD; lb:SetWidth(SWAP_DD)
-        return lb
-    end
-    ddHcell("Open On"); ddHcell("Display Mode"); ddHcell("Tooltips")
+    swapCaption(ddHdr, "Open On"); swapCaption(ddHdr, "Display Mode"); swapCaption(ddHdr, "Tooltips")
 
     local ddRow = flow:AddRow()
     -- Tighten the header→dropdown gap so each label reads as attached to its column.
@@ -252,27 +263,68 @@ function Addon:BuildSetSwapperTab(flow)
         set = function(v) Addon.db.settings.flyoutTooltip = (v == "Always") and "always" or "ctrl" end,
     })
 
-    local typeRow = condRow(flow)
-    typeRow:Dropdown({
-        label = "Type", width = 140, choices = { "Icon", "List" },
+    -- Row 3 — Type / Direction / Sets Per Row on ONE row (owner directive): three
+    -- columns on the same 92px grid as the trio above, each a caption over its own
+    -- dropdown, replacing the three stacked label-left rows this used to be.
+    --
+    -- Built as ONE block with its own arrange (the flow row API lays items
+    -- left-to-right on a single baseline and has no "stack a caption above a control"
+    -- primitive) — the same construction Nexus's Setup identity row uses. One block
+    -- means a caption can never drift out of sync with its dropdown, and the columns
+    -- are divided once from the real width.
+    local optRow  = condRow(flow)
+    local optCols = {}
+    local function optCol(caption, ddOpts)
+        ddOpts.width = SWAP_DD
+        local col = { cap = swapCaption(optRow, caption), dd = optRow:Dropdown(ddOpts) }
+        optCols[#optCols + 1] = col
+        return col
+    end
+    optCol("Type", {
+        choices = { "Icon", "List" },
         get = function() return w.dropdownType == "list" and "List" or "Icon" end,
         set = function(v)
             w.dropdownType = v:lower()
             Addon:RefreshSwapperTab(); Addon:RefreshWidget()
         end,
     })
-    local dirRow = condRow(flow)
-    dirRow:Dropdown({
-        label = "Direction", width = 140, choices = { "Right", "Left", "Down", "Up" },
+    optCol("Direction", {
+        choices = { "Right", "Left", "Down", "Up" },
         get = function() return cap(w.dropdownDir or "right") end,
         set = function(v) w.dropdownDir = v:lower(); Addon:RefreshWidget() end,
     })
-    local perRow = condRow(flow)
-    perRow:Dropdown({
-        label = "Sets Per Row", width = 140, choices = PERROW,
+    optCol("Sets Per Row", {
+        choices = PERROW,
         get = function() return tostring(w.dropdownPerRow or 5) end,
         set = function(v) w.dropdownPerRow = tonumber(v); Addon:RefreshWidget() end,
     })
+    optRow._cols = optCols
+
+    -- Even three-column division of the same management grid the rows above share, so
+    -- this trio lines up with the Open On / Display Mode / Tooltips trio exactly. Both
+    -- frame dimensions are set and no offset is negative-x. MakeDropdown sizes its
+    -- button at construction (SWAP_DD), so the columns are authored at that width and
+    -- this arrange divides/places them; the caption gets the column width so its
+    -- centered text always stays inside its own column.
+    optRow._arrange = function(width)
+        optRow:SetWidth(math.max(width, 1))
+        local avail = math.max(1, width - optRow._indent)
+        local span  = math.min(MGMT_GRID, avail)   -- distribute within the 292 grid
+        local colW  = math.max(1, (span - 2 * ITEM_GAP) / 3)
+        for i, c in ipairs(optCols) do
+            local x = optRow._indent + (i - 1) * (colW + ITEM_GAP)
+            c.cap:ClearAllPoints()
+            c.cap:SetPoint("TOPLEFT", optRow, "TOPLEFT", x, 0)
+            c.cap:SetWidth(colW); c.cap._label:SetWidth(colW)
+            c.dd:ClearAllPoints()
+            c.dd:SetPoint("TOPLEFT", optRow, "TOPLEFT", x, -(DD_CAP_H + DD_CAP_GAP))
+            c.dd:SetWidth(colW)
+        end
+        local h = DD_CAP_H + DD_CAP_GAP + DD_BTN_H
+        optRow:SetHeight(h)
+        return h
+    end
+
     local alwaysRow = condRow(flow)
     alwaysRow:Checkbox({
         label = "Always Open",
@@ -282,7 +334,7 @@ function Addon:BuildSetSwapperTab(flow)
             Addon:RefreshWidget()
         end,
     })
-    flow._condRows = { type = typeRow, dir = dirRow, per = perRow, always = alwaysRow }
+    flow._condRows = { opts = optRow, always = alwaysRow }
 
     Addon:RefreshSwapperTab()
 end
@@ -296,9 +348,15 @@ function Addon:RefreshSwapperTab()
     local w = Addon.db.settings.widget
     local isDropdown = w.mode == "dropdown"
     local isIcon     = isDropdown and w.dropdownType ~= "list"
-    flow._condRows.type:SetApplicable(isDropdown)
-    flow._condRows.dir:SetApplicable(isIcon)
-    flow._condRows.per:SetApplicable(isIcon)
+    -- The Type/Direction/Sets-Per-Row row applies whenever the widget is a dropdown;
+    -- within it, Direction and Sets Per Row are Icon-only, so those two COLUMNS hide
+    -- individually. The column geometry is fixed, so Type never moves when they do.
+    local optRow = flow._condRows.opts
+    optRow:SetApplicable(isDropdown)
+    for i = 2, 3 do
+        local c = optRow._cols and optRow._cols[i]
+        if c then c.cap:SetShown(isIcon); c.dd:SetShown(isIcon) end
+    end
     flow._condRows.always:SetApplicable(isIcon)
     -- The swapper now lives in the Sets tab's left column, so reflow the OUTER Sets
     -- scroll pane (re-runs the split arrange → re-lays both columns + scroll range)
