@@ -26,9 +26,31 @@
       core/classes/item.lua:56   :SetBlendMode('ADD')
       core/classes/item.lua:57   :SetPoint('CENTER')          -- NO (0,1) offset
       core/classes/item.lua:58   :SetSize(67, 67)             -- 67, not 68
-      core/api/settings.lua:34   glowAlpha = 0.5              -- 0.5, not 0.49
+      core/api/settings.lua:34   glowAlpha = 0.5              -- the DEFAULT, superseded
     ONE additive halo, uniform alpha for every rarity — the COLOR carries the
     distinction, the intensity never varies.
+
+    ── ALPHA IS AN OWNER-PROFILE ROW, NOT A DEFAULT ROW ─────────────────────────
+    glowAlpha is the ONE glow parameter 1.x exposes as a slider (Daseeki-Bags
+    config/panels/slotOptions.lua:70) and the owner moved it years ago. His live value:
+
+      WTF/Account/309992577#1/SavedVariables/Daseeki-Bags.lua:3621  ["glowAlpha"] = 0.77
+
+    (accounts #2 and #3 read 0.87; #1 is his main and is the spec). Shipping 1.x's
+    untouched 0.5 made the additive wash faint enough that the crisp quality RING out-read
+    it, and the cell registered as a hard border rather than a glow that fades inward.
+    Bags 2.0 fixed this on its grid; this file mirrors the constant exactly so the
+    character window and the bag grid stay one look.
+
+    NO RING ROW HERE. The Bags fix came with a ring-vs-wash investigation (does 1.x dim
+    the template IconBorder, and does that region even exist on Era 1.15.9?); the verdict
+    was that 1.x renders the ring at FULL alpha, applying glowAlpha to the halo alone
+    (Daseeki-Bags item.lua:208 vs :210/:220), so Bags' ring was left untouched. The
+    evidence chain lives at Bags 2.0 borders.lua Borders.SetIconBorder. It does not reach
+    this file: Armory drives NO IconBorder on any surface (grep-verified across the repo)
+    — it dresses Blizzard's own _G["Character"..slotName] paper-doll buttons and the
+    flyout leads with this halo and nothing else. The halo IS the whole cue here, so the
+    alpha is the only lever, and mirroring it is the entire change.
 
     LAYERING is the row with teeth, and it changes what this window looks like in
     practice. 1.x's halo is a texture ON the button at OVERLAY sublevel -1, so it sorts
@@ -62,8 +84,8 @@
 
     The look ships as CONSTANTS (Addon.Borders.GLOW_*), not settings: no new
     SavedVariables key. 1.x exposes alpha as a glowAlpha slider (and the spec exposes an
-    "intensity" clamped [0.1, 1.0]); we deliberately expose neither, and pin 1.x's
-    DEFAULT (0.5) as our one value.
+    "intensity" clamped [0.1, 1.0]); we deliberately expose neither, and pin the OWNER'S
+    OWN slider position (0.77) as our one value.
     The single existing toggle (settings.charWindow.qualityBorders) is unchanged.
 
     NOT ported: the spec §5-6 defects — in particular the reference's merchant toggle
@@ -110,7 +132,7 @@ Borders.GLOW_TEXTURE  = "Interface\\Buttons\\UI-ActionButton-Border"  -- 1.x ite
 Borders.GLOW_REF_BUTTON = 37        -- 1.x: the template item button, never resized
 Borders.GLOW_SCALE      = 67 / 37   -- 1.x item.lua:58  SetSize(67, 67)  (NOT the spec's 68)
 Borders.GLOW_SCALE_AMMO = 58 / 37   -- CII §2 Ammo exception; Armory has no Ammo slot (dormant)
-Borders.GLOW_ALPHA      = 0.5       -- 1.x core/api/settings.lua:34  glowAlpha = 0.5
+Borders.GLOW_ALPHA      = 0.77      -- owner profile glowAlpha, account #1 (1.x default 0.5 superseded)
 Borders.GLOW_OFFSET_Y_SCALE = 0     -- 1.x item.lua:57  SetPoint('CENTER') — no offset
 Borders.GLOW_LAYER      = "OVERLAY" -- 1.x item.lua:54
 Borders.GLOW_SUBLEVEL   = -1        -- 1.x item.lua:54 — BELOW the button's other OVERLAY art

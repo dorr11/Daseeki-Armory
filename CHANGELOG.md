@@ -4,6 +4,14 @@
 Correctness fixes — the stats panel now matches in-game values — plus three new
 gear-swapping features.
 
+- **The quality glow on your gear now has the same strength as the one in Bags.** Bags 2
+  was shipping the factory value for how strong that soft coloured wash is, and against
+  Bags 1 side by side it read as a hard rim rather than a glow that fades inward over the
+  icon. Bags 1 puts that strength on a slider and yours has been at 0.77 for years, so
+  that is now the shipped value in both addons. Nothing about the character window's
+  layout, gating or colours changed — only how strongly the wash is drawn — and there is
+  no new setting.
+
 - **Weapons can now be swapped in the middle of a fight.** Give a set a key
   binding, and pressing that key during combat swaps its main hand, off hand and
   ranged weapon *immediately*; everything else in the set still waits for combat

@@ -938,13 +938,15 @@ suite("border-glow-geometry", function(ck)
     if type(M) ~= "table" then return end
 
     -- 1.x anatomy, constant by constant. Identical to Bags 2.0 Borders.GLOW_*; each
-    -- citation is the one carried by the Bags parity block (branch v2 borders.lua:247-254).
+    -- citation is the one carried by the Bags "SUITE GLOW GEOMETRY" constant block, whose
+    -- alpha row is now the OWNER'S PROFILE value rather than 1.x's shipped default.
     ck(M.GLOW_TEXTURE == "Interface\\Buttons\\UI-ActionButton-Border",
        "1.x item.lua:55 glow texture")
     ck(M.GLOW_REF_BUTTON == 37, "1.x reference button is the template's own 37px")
     ck(near(M.GLOW_SCALE, 67 / 37), "1.x item.lua:58 SetSize(67,67) on a 37px button")
     ck(near(M.GLOW_SCALE_AMMO, 58 / 37), "CII §2 Ammo exception retained: a 58px halo")
-    ck(M.GLOW_ALPHA == 0.5, "1.x settings.lua:34 glowAlpha = 0.5, uniform on every tint")
+    ck(M.GLOW_ALPHA == 0.77,
+       "owner profile glowAlpha 0.77 (WTF account #1), uniform on every tint")
     ck(M.GLOW_OFFSET_Y_SCALE == 0, "1.x item.lua:57 SetPoint('CENTER') — no offset")
     ck(M.GLOW_LAYER == "OVERLAY", "1.x item.lua:54 OVERLAY layer")
     ck(M.GLOW_SUBLEVEL == -1, "1.x item.lua:54 sublevel -1 (below the button's own overlay art)")
@@ -957,6 +959,13 @@ suite("border-glow-geometry", function(ck)
     -- suite standard again — the exact drift the Bags parity pass was run to end.
     ck(not near(M.GLOW_SCALE, 68 / 37), "NOT the spec's 68/37")
     ck(M.GLOW_ALPHA ~= 0.49, "NOT the spec's 0.49")
+    -- ...and the release-blocking lock the Bags round added: 1.x's UNTOUCHED slider default
+    -- is not the owner's look. glowAlpha is the one glow parameter 1.x exposes as a slider
+    -- and his live value is 0.77 (WTF account #1, his main; #2/#3 read 0.87). At 0.5 the
+    -- additive wash is too faint to be the primary cue and the cell reads as a hard edge.
+    ck(M.GLOW_ALPHA ~= 0.5, "NOT 1.x's untouched default 0.5 (superseded by the profile)")
+    ck(M.GLOW_ALPHA > 0.5, "the wash is the PRIMARY cue, stronger than the 1.x default")
+    ck(M.GLOW_ALPHA < 1, "...and still a wash, not an opaque fill")
     ck(not near(M.GLOW_OFFSET_Y_SCALE, 1 / 37), "NOT the spec's (0,1) nudge")
     ck(M.GLOW_SUBLEVEL ~= nil, "NOT the spec's plain-OVERLAY (no sublevel)")
 
