@@ -42,9 +42,21 @@ gear-swapping features.
   quality-colored square outline. They now carry the same soft quality-colored
   glow that Bags 2.0 ships — a halo that washes over the edge of the icon instead
   of drawing a box around it, at the same size, the same softness and the same
-  colors as your bags. Nothing else changed: Uncommon and above still glow,
-  poor and common are still left plain, and the single switch that turns it all
-  off is where it always was under **Character Window**.
+  colors as your bags. The single switch that turns it all off is where it always
+  was under **Character Window**.
+- **Every equipped slot is now glowed, not just the good stuff.** This is the part
+  the halo was missing. On the character sheet, *anything* you are wearing gets a
+  border — a white one for common items, and a near-black one for greys — so an
+  empty slot and a slot holding a plain white item no longer look the same. Empty
+  slots stay unbordered, as before. The hover flyout is unchanged and still only
+  glows Uncommon and above, which is the right rule for a list of items rather
+  than a set of worn slots.
+- **The glow itself is now exact.** It was drawn very slightly too small, a touch
+  too bright, and sat one pixel low. The halo is now a little wider relative to the
+  slot, the intensity is slightly softer, and it is nudged up one pixel so it sits
+  centered on the icon rather than under it. All three scale with button size, so
+  the 37px equipped slots and the smaller flyout entries look identical. No new
+  settings.
 
 - **The gear-swap engine has been rebuilt from the ground up.** Equipping sets
   behaves exactly as before — your saved sets, their slots, key bindings and
