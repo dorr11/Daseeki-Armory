@@ -137,6 +137,13 @@ glow and font on every surface, and a rebuilt gear-swap engine underneath all of
 
 ### Fixed
 
+- **Logging out during the first fifteen seconds no longer cancels the item scan for
+  good.** Armory marked the one-time scan as "already attempted" the moment you logged
+  in, fifteen seconds before it actually started — so if you reloaded, disconnected or
+  logged out inside that window, the scan never ran and never offered to run again. It is
+  now marked only when the scan really starts, so an interrupted login simply tries again
+  next time.
+
 - **A goal you have already achieved now shows its green tick.** The tick on a set slot
   only ever appeared if the goal item happened to be sitting loose in a bag at the moment
   the addon looked. Gear you looted and put straight on, gear you were already wearing

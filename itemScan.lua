@@ -806,21 +806,48 @@ end
 ----------------------------------------------------------------------
 -- Login hook. Auto-runs ONCE on an empty cache (the owner directive's "auto-run
 -- if the cache is empty" marker), delayed so it never competes with the login
--- burst. The marker is cleared by a completed scan, so a scan interrupted by a
--- /reload will be re-attempted; a scan that keeps failing does not nag forever.
+-- burst.
+--
+-- WHERE THE MARKER IS SET IS THE WHOLE POINT (release verification N5).
+-- It used to be stamped HERE, at login, before the 15s timer was even armed.
+-- cache is DaseekiArmoryScanDB — SavedVariables — so any logout, /reload or
+-- disconnect inside that 15s window wrote autoScanTried = true to disk for a scan
+-- that never ran. The auto path was then permanently disarmed on that account:
+-- IsComplete() is false (no scan ever finished) and the marker is true, so this
+-- function returns early on every login for ever after, in silence. The owner's
+-- only way out was to find "Rescan Items" in the goal picker by themselves.
+--
+-- The marker is therefore set inside the callback, immediately before the scan
+-- actually starts, and AFTER the callback's own guards — so a 15s window that is
+-- cut short by a logout costs nothing, and a timer that fires into an already
+-- running scan does not burn the one-shot either.
+--
+-- FINAL SEMANTICS (autoScanTried is a latch on the AUTO path only):
+--   armed        cache not complete and no marker -> one attempt per login
+--   latched      set only when this callback reaches StartItemScan
+--   interrupted  a scan that STARTED but never finished keeps the marker: the
+--                auto path does not retry it (that is the "does not nag forever"
+--                property — a scan that hangs the client must not restart itself
+--                every login), and Rescan Items is the manual door
+--   terminal     completion is the real terminal state: FinishItemScan sets
+--                scannedAt/count, so IsComplete() gates every future login, and
+--                clears the marker so a later cache wipe re-arms the auto path
 ----------------------------------------------------------------------
 Addon.AUTO_SCAN_DELAY = 15
 
 function Addon:InitItemScan()
     local cache = Addon:ItemScanCache()
     if Scan.IsComplete(cache) or cache.autoScanTried then return end
-    cache.autoScanTried = true
     C_Timer.After(Addon.AUTO_SCAN_DELAY, function()
         if Addon:IsScanning() then return end
-        if Scan.IsComplete(Addon:ItemScanCache()) then return end
+        local c = Addon:ItemScanCache()
+        if Scan.IsComplete(c) then return end
         print(Addon:Tag() .. " building the item database for the first time — "
               .. "this runs once per account and takes about a minute. "
               .. Addon:Wrap("muted", "(Goal picker -> Rescan Items to redo it.)"))
+        -- N5: the latch closes HERE, on a scan that is actually starting — never at
+        -- login, where an early logout would disarm the auto path for good.
+        c.autoScanTried = true
         Addon:StartItemScan()
     end)
 end

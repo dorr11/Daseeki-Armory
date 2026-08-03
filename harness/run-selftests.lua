@@ -1975,6 +1975,180 @@ suite("goal-picker-row-model", function(ck)
 end)
 
 ----------------------------------------------------------------------
+-- AUTO-SCAN ARMING  (release verification N5)
+--
+-- Addon:InitItemScan is the login hook. It one-shots the first-run item scan behind a
+-- 15s delay so the scan never competes with the login burst, and behind a marker
+-- (cache.autoScanTried) so it does not nag.
+--
+-- The defect: the marker was stamped at LOGIN, before the timer was even armed. cache is
+-- DaseekiArmoryScanDB — SavedVariables — so a logout, /reload or disconnect inside that
+-- 15s window persisted "already tried" for a scan that never ran, and the auto path was
+-- disarmed on that account for ever (IsComplete false + marker true => early return on
+-- every subsequent login, silently).
+--
+-- These suites drive the real InitItemScan with a recording C_Timer, so the window can be
+-- opened and abandoned the way a logout abandons it.
+----------------------------------------------------------------------
+local function newScanEnv()
+    local A = {}
+    local fnc, e = loadfile(P("itemScan.lua"))
+    if not fnc then return nil, "compile: " .. tostring(e) end
+    local okl, el = pcall(fnc, "Daseeki-Armory", A)
+    if not okl then return nil, "load: " .. tostring(el) end
+
+    local env = { addon = A, timers = {}, starts = 0, printed = {}, scanning = false }
+    -- The chat/format helpers the notice uses, and the one call we must NOT let through:
+    -- the real StartItemScan wants CreateFrame and GetTime. Its INVOCATION is what this
+    -- suite is about, so a recorder is the faithful stand-in.
+    A.Tag           = function() return "[Armory]" end
+    A.Wrap          = function(_, _, s) return s end
+    A.IsScanning    = function() return env.scanning end
+    A.StartItemScan = function() env.starts = env.starts + 1; return true end
+    return env
+end
+
+-- One login: bind the SavedVariables table, run the hook, collect whatever timer it armed.
+-- Returns the number of timers armed by THIS login.
+local function scanLogin(env, savedVars)
+    local savedTimer, savedPrint, savedDB = _G.C_Timer, _G.print, _G.DaseekiArmoryScanDB
+    local armed = 0
+    _G.DaseekiArmoryScanDB = savedVars
+    _G.C_Timer = { After = function(delay, cb)
+        armed = armed + 1
+        env.timers[#env.timers + 1] = { delay = delay, cb = cb }
+    end }
+    _G.print = function(...)
+        local parts = {}
+        for i = 1, select("#", ...) do parts[i] = tostring((select(i, ...))) end
+        env.printed[#env.printed + 1] = table.concat(parts, " ")
+    end
+    local okc, errc = pcall(env.addon.InitItemScan, env.addon)
+    _G.C_Timer, _G.print, _G.DaseekiArmoryScanDB = savedTimer, savedPrint, savedDB
+    env.lastError = (not okc) and errc or nil
+    return armed
+end
+
+-- Fire every armed timer (i.e. the player stayed logged in past the delay).
+local function scanFireTimers(env, savedVars)
+    local savedTimer, savedPrint, savedDB = _G.C_Timer, _G.print, _G.DaseekiArmoryScanDB
+    _G.DaseekiArmoryScanDB = savedVars
+    _G.C_Timer = { After = function() end }
+    _G.print = function(...)
+        local parts = {}
+        for i = 1, select("#", ...) do parts[i] = tostring((select(i, ...))) end
+        env.printed[#env.printed + 1] = table.concat(parts, " ")
+    end
+    local pending = env.timers
+    env.timers = {}
+    for _, t in ipairs(pending) do pcall(t.cb) end
+    _G.C_Timer, _G.print, _G.DaseekiArmoryScanDB = savedTimer, savedPrint, savedDB
+end
+
+suite("item-scan-auto-arm", function(ck)
+    if type(Scan) ~= "table" then ck(false, "itemScan.lua did not load"); return end
+
+    -- ── 1. THE DEFECT: an early logout must not disarm the auto path ────────────
+    -- Cache is the SavedVariables table, so the SAME table is carried across the
+    -- simulated logouts below — that is exactly what persists to disk.
+    local sv = Scan.NewCache()
+    local e1 = newScanEnv()
+    ck(e1 ~= nil, "a fresh itemScan environment loads with no WoW API")
+    if not e1 then return end
+
+    local armed1 = scanLogin(e1, sv)
+    ck(e1.lastError == nil, "InitItemScan runs on an empty cache (" .. tostring(e1.lastError) .. ")")
+    ck(armed1 == 1, "an empty cache arms exactly one delayed auto-scan (got " .. armed1 .. ")")
+    ck(e1.timers[1] and e1.timers[1].delay == e1.addon.AUTO_SCAN_DELAY,
+       "…at AUTO_SCAN_DELAY (" .. tostring(e1.addon.AUTO_SCAN_DELAY) .. "s), off the login burst")
+    ck(sv.autoScanTried == nil,
+       "THE FIX: nothing is written to SavedVariables merely by ARMING the timer")
+    ck(e1.starts == 0, "…and no scan has started yet")
+    ck(#e1.printed == 0, "…and the owner has not been told anything yet")
+
+    -- LOGOUT inside the 15s window: the timer dies with the session, unfired.
+    -- Next login gets a whole new addon environment, but the same saved cache.
+    local e2 = newScanEnv()
+    local armed2 = scanLogin(e2, sv)
+    ck(armed2 == 1,
+       "THE REGRESSION: after an early logout the NEXT login re-arms the auto-scan " ..
+       "(got " .. armed2 .. " — 0 means the one-time scan is disarmed for ever)")
+    ck(sv.autoScanTried == nil, "…and still nothing has been persisted")
+
+    -- Three abandoned windows in a row still leave it armed: nothing latches until a
+    -- scan actually runs.
+    local armedN = 0
+    for _ = 1, 3 do armedN = armedN + scanLogin(newScanEnv(), sv) end
+    ck(armedN == 3, "…and it survives repeated early logouts (got " .. armedN .. " of 3)")
+    ck(sv.autoScanTried == nil, "…with the marker still unset")
+
+    -- ── 2. THE LATCH CLOSES WHEN THE SCAN ACTUALLY STARTS ──────────────────────
+    scanFireTimers(e2, sv)
+    ck(e2.starts == 1, "staying logged in past the delay starts the scan (got " .. e2.starts .. ")")
+    ck(sv.autoScanTried == true, "…and THAT is what sets the marker")
+    ck(#e2.printed == 1, "…with one first-run notice printed (got " .. #e2.printed .. ")")
+    ck((e2.printed[1] or ""):find("first time") ~= nil and
+       (e2.printed[1] or ""):find("Rescan Items") ~= nil,
+       "…that says it runs once and names the manual way to redo it")
+
+    -- ── 3. INTERRUPTED SCAN: started, never finished -> does NOT re-arm ─────────
+    -- The marker is on disk and scannedAt is not, so the auto path stays quiet. This is
+    -- deliberate: a scan that wedges the client must not restart itself every login.
+    ck(Scan.IsComplete(sv) == false, "an interrupted scan is NOT a completed scan")
+    local e3 = newScanEnv()
+    local armed3 = scanLogin(e3, sv)
+    ck(armed3 == 0, "a login after an interrupted scan does not auto-retry (got " .. armed3 .. ")")
+    ck(e3.starts == 0, "…and starts nothing")
+
+    -- ── 4. COMPLETION IS THE TERMINAL STATE ────────────────────────────────────
+    -- FinishItemScan is the only writer of scannedAt/count, and it clears the marker so a
+    -- later cache wipe re-arms the auto path. Source-asserted because reaching the real
+    -- FinishItemScan needs a live scan (CreateFrame + GetTime).
+    local fh = io.open(P("itemScan.lua"), "r")
+    ck(fh ~= nil, "itemScan.lua is readable")
+    if fh then
+        local src = fh:read("*a"); fh:close()
+        local finishAt = src:find("function Addon:FinishItemScan")
+        local initAt   = src:find("function Addon:InitItemScan")
+        local clearAt  = src:find("cache%.autoScanTried%s*=%s*nil")
+        ck(finishAt ~= nil and clearAt ~= nil and clearAt > finishAt and clearAt < initAt,
+           "FinishItemScan clears autoScanTried (a completed scan re-arms a future reset)")
+        -- The regression this suite exists for, stated structurally: the marker must not
+        -- be written in InitItemScan's own body before the timer is armed.
+        local timerAt = src:find("C_Timer%.After%(Addon%.AUTO_SCAN_DELAY", initAt or 1)
+        local setAt   = src:find("autoScanTried%s*=%s*true", initAt or 1)
+        ck(timerAt ~= nil and setAt ~= nil and setAt > timerAt,
+           "the marker is set INSIDE the delayed callback, not at login time")
+        local startAt = src:find("Addon:StartItemScan%(%)", setAt or 1)
+        ck(startAt ~= nil, "…immediately before the scan it is recording")
+    end
+
+    -- A completed cache never arms, marker or no marker.
+    local done = Scan.NewCache()
+    Scan.Put(done, 23709, "Corehound Belt", 3, 0, 0)
+    done.scannedAt, done.autoScanTried = 1700000000, nil
+    ck(Scan.IsComplete(done) == true, "a scanned, non-empty cache reads as complete")
+    ck(scanLogin(newScanEnv(), done) == 0, "…and never arms the auto-scan again")
+
+    -- …and a wipe of that completed cache re-arms it (the "future reset" path).
+    local wiped = Scan.NewCache()
+    ck(scanLogin(newScanEnv(), wiped) == 1, "a wiped cache arms the auto-scan afresh")
+
+    -- ── 5. THE TIMER'S OWN GUARDS DO NOT BURN THE ONE-SHOT ─────────────────────
+    -- Firing into a manual scan that is already running must leave the latch open, or a
+    -- rescan the owner kicked off at login would eat the automatic first run.
+    local sv5 = Scan.NewCache()
+    local e5 = newScanEnv()
+    ck(scanLogin(e5, sv5) == 1, "empty cache arms")
+    e5.scanning = true
+    scanFireTimers(e5, sv5)
+    ck(e5.starts == 0, "the callback declines to start a second, overlapping scan")
+    ck(sv5.autoScanTried == nil, "…and does NOT spend the one-shot marker doing so")
+    e5.scanning = false
+    ck(scanLogin(newScanEnv(), sv5) == 1, "…so the next login still arms it")
+end)
+
+----------------------------------------------------------------------
 -- Every shipped file compiles (loadfile gate)
 ----------------------------------------------------------------------
 suite("loadfile-all-files", function(ck)
