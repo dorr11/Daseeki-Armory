@@ -179,6 +179,21 @@ function Borders.QualityRGB(q)
     if f then return f[1], f[2], f[3] end
 end
 
+-- TEXT variant of the same chain, for surfaces that TINT A STRING rather than a glow
+-- (the goal picker's result rows). Identical to QualityRGB in every respect EXCEPT
+-- Poor: QualityRGB overrides Poor to near-black because that value is a GLOW tint under
+-- an ADD blend, where 0.1 is deliberately "almost nothing". As TEXT on a dark panel a
+-- 0.1 grey is unreadable, so the text path keeps Blizzard's own Poor grey. Every other
+-- quality goes through QualityRGB unchanged, so the two surfaces cannot drift.
+local POOR_TEXT_RGB = { 0.62, 0.62, 0.62 }   -- Blizzard's ITEM_QUALITY_COLORS[0]
+Borders.POOR_TEXT_RGB = POOR_TEXT_RGB
+
+function Borders.QualityTextRGB(q)
+    if q == nil then return nil end
+    if q == 0 then return POOR_TEXT_RGB[1], POOR_TEXT_RGB[2], POOR_TEXT_RGB[3] end
+    return Borders.QualityRGB(q)
+end
+
 -- The halo's side length for a button of `buttonSize`, at 1.x's 67/37 proportion,
 -- so the wash bleeds past the icon by the same amount at any button size. Pass `ammo`
 -- truthy for the spec's 58px Ammo-slot exception (Armory carries no Ammo entry today;

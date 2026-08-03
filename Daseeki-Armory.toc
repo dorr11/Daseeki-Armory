@@ -5,12 +5,14 @@
 ## X-License: All Rights Reserved
 ## X-Curse-Project-ID: 1592412
 ## SavedVariablesPerCharacter: DaseekiArmoryDB
+## SavedVariables: DaseekiArmoryScanDB
 ## OptionalDeps: Daseeki-Core, Daseeki-Bags, ItemRack, OPie
 ## Version: 1.2.0
 
 core.lua
 itemDB.lua
 pvpItems.lua
+itemScan.lua
 iconData.lua
 sets.lua
 equip.lua

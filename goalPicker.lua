@@ -1,10 +1,26 @@
 --[[
     Daseeki Armory — goal item picker (search any item by name).
 
-    A themed search list of items that fit a given slot, drawn from the bundled
-    AtlasLoot-derived item DB (Addon.ItemNameDB). Icons/equip-locations come from
-    GetItemInfoInstant (synchronous, offline). Shift-clicking an item link into the
-    search box picks that item directly (covers items not in the DB).
+    A themed search list of items that fit a given slot. Three sources are merged,
+    highest-confidence first:
+
+      1. the SCANNED cache (itemScan.lua / DaseekiArmoryScanDB) — real client names,
+         real qualities, and the class/faction locks read off each item's tooltip;
+      2. the bundled AtlasLoot-derived name table (itemDB.lua) as the seed/fallback
+         while no scan has completed, with itemDB's ItemClassMask as its lock source;
+      3. the vanilla PvP rank-set ids (pvpItems.lua), whose names only exist at runtime.
+
+    Icons and equip locations always come from GetItemInfoInstant (synchronous,
+    offline, never persisted so it cannot go stale). Shift-clicking an item link into
+    the search box picks that item directly, which covers anything all three miss.
+
+    Rows are tinted by item RARITY (Borders.QualityTextRGB). Quality is not available
+    for an item the client has not loaded, so unresolved rows request a load and are
+    re-tinted when it arrives.
+
+    Rows the viewing character can NEVER equip — wrong class lock, wrong faction, wrong
+    armor/weapon proficiency — are hidden by default; "Show unusable" in the footer
+    turns the filter off for edge cases.
 
     Addon:ShowGoalPicker(slotId, onPick)   -- onPick(itemId)
 --]]
@@ -12,106 +28,87 @@
 local _, Addon = ...
 
 local ROWH, ROWS, W = 28, 12, 360
-local LIST_TOP = 82
+local LIST_TOP  = 82
+local FOOTER_Y  = LIST_TOP + ROWS * ROWH + 24
+local MAX_RESULTS = 500
 local picker
 
--- ── Class usability ───────────────────────────────────────────────────────────
--- Per-class weapon/armor proficiency by numeric subclass id (locale-safe). classID
--- 2 = Weapon, 4 = Armor. Weapon subclasses: 0 axe1h,1 axe2h,2 bow,3 gun,4 mace1h,
--- 5 mace2h,6 polearm,7 sword1h,8 sword2h,10 staff,13 fist,15 dagger,16 thrown,
--- 18 crossbow,19 wand. Armor subclasses: 0 misc,1 cloth,2 leather,3 mail,4 plate,
--- 6 shield,7 libram,8 idol,9 totem.
-local function S(...) local t = {}; for _, v in ipairs({...}) do t[v] = true end; return t end
-local PROF = {
-    WARRIOR = { weapon = S(0,1,2,3,4,5,6,7,8,10,13,15,16,18), armor = S(0,1,2,3,4,6) },
-    PALADIN = { weapon = S(0,1,4,5,6,7,8),                     armor = S(0,1,2,3,4,6,7) },
-    HUNTER  = { weapon = S(0,1,2,3,6,7,8,10,13,15,18),         armor = S(0,1,2,3) },
-    ROGUE   = { weapon = S(0,2,3,4,7,13,15,16,18),             armor = S(0,1,2) },
-    PRIEST  = { weapon = S(4,10,15,19),                        armor = S(0,1) },
-    SHAMAN  = { weapon = S(0,1,4,5,10,13,15),                  armor = S(0,1,2,3,6,9) },
-    MAGE    = { weapon = S(7,10,15,19),                        armor = S(0,1) },
-    WARLOCK = { weapon = S(7,10,15,19),                        armor = S(0,1) },
-    DRUID   = { weapon = S(4,5,6,10,13,15),                    armor = S(0,1,2,8) },
-}
+local Scan = Addon.ItemScan
 
-local scanTip
-local CLASS_PREFIX = ((ITEM_CLASSES_ALLOWED or "Classes: %s"):gsub("%%s.*$", ""))
-local playerClass, playerClassLoc
-
--- Class token -> allowable-class bit (matches Addon.ItemClassMask in itemDB.lua).
-local CLASS_BIT = { WARRIOR = 1, PALADIN = 2, HUNTER = 4, ROGUE = 8, PRIEST = 16,
-                    SHAMAN = 64, MAGE = 128, WARLOCK = 256, DRUID = 1024 }
-
--- True if the logged-in class can use this item (proficiency + explicit "Classes:"
--- restriction). Class-set pieces are filtered offline via the bundled mask; the
--- tooltip-scan fallback only bites once the item is cached.
-function Addon:ItemUsableByClass(e)
-    playerClass    = playerClass    or select(2, UnitClass("player"))
-    playerClassLoc = playerClassLoc or UnitClass("player")
-    local mask = Addon.ItemClassMask and Addon.ItemClassMask[e.id]
-    if mask and CLASS_BIT[playerClass] and bit.band(mask, CLASS_BIT[playerClass]) == 0 then
-        return false
-    end
-    local prof = PROF[playerClass]
-    if prof and e.classID then
-        if e.classID == 2 and not prof.weapon[e.subclassID] then return false end
-        if e.classID == 4 and not prof.armor[e.subclassID]  then return false end
-    end
-    if e._classOK ~= nil then return e._classOK end
-    if not scanTip then
-        scanTip = CreateFrame("GameTooltip", "DaseekiArmoryGoalScan", nil, "GameTooltipTemplate")
-        scanTip:SetOwner(UIParent, "ANCHOR_NONE")
-    end
-    scanTip:ClearLines(); scanTip:SetItemByID(e.id)
-    local n = scanTip:NumLines() or 0
-    if n > 1 then
-        for i = 2, n do
-            local fs = _G["DaseekiArmoryGoalScanTextLeft" .. i]
-            local txt = fs and fs:GetText()
-            if txt and txt:find(CLASS_PREFIX, 1, true) == 1 then
-                e._classOK = txt:find(playerClassLoc, 1, true) ~= nil
-                return e._classOK
-            end
-        end
-        e._classOK = true   -- tooltip loaded, no class restriction
-    end
-    return true             -- uncached: assume usable for now (re-checked on refresh)
+-- ── Class / faction usability ─────────────────────────────────────────────────
+-- The predicate itself lives in itemScan.lua (pure, harness-gated); this is the
+-- addon-facing wrapper kept for callers that only have an entry.
+function Addon:ItemUsableByClass(e, ctx)
+    return Scan.Usable(e, ctx or Addon:ScanContext(false))
 end
 
--- Lazy item index: { id, name(lower), display, icon, equipLoc, classID, subclassID }
+-- Bundled class mask for a seed entry (0 = no bundled restriction known).
+local function seedClassMask(id)
+    local m = Addon.ItemClassMask and Addon.ItemClassMask[id]
+    return tonumber(m) or 0
+end
+
+-- ── The merged item index ─────────────────────────────────────────────────────
+-- Entry: { id, name(lower), display, icon, equipLoc, classID, subclassID,
+--          quality, classMask, faction, scanned }
+-- Rebuilt whenever the scan cache changes (stamp = completion time + item count).
 function Addon:BuildGoalItemDB()
-    if Addon.GoalItemDB then return Addon.GoalItemDB end
-    local list = {}
+    local cache = Addon:ItemScanCache()
+    local stamp = tostring(cache.scannedAt or 0) .. "/" .. tostring(cache.count or 0)
+    if Addon.GoalItemDB and Addon._goalDBStamp == stamp then return Addon.GoalItemDB end
+
+    local list, byId = {}, {}
+    local function add(id, name, quality, classMask, faction, scanned)
+        if not id or byId[id] or type(name) ~= "string" or name == "" then return end
+        local _, _, _, equipLoc, icon, classID, subclassID = GetItemInfoInstant(id)
+        if not (icon and equipLoc and equipLoc ~= "" and equipLoc ~= "INVTYPE_NON_EQUIP") then return end
+        local e = {
+            id = id, name = name:lower(), display = name, icon = icon,
+            equipLoc = equipLoc, classID = classID, subclassID = subclassID,
+            quality = quality, classMask = classMask or 0,
+            faction = faction or Scan.FACTION_NONE, scanned = scanned or false,
+        }
+        byId[id] = e
+        list[#list + 1] = e
+    end
+
+    -- 1 — the scan (authoritative)
+    for id in pairs(cache.names) do
+        local nm, q, m, f = Scan.Get(cache, id)
+        add(id, nm, q, m, f, true)
+    end
+
+    -- 2 — the bundled seed, for anything the scan has not covered yet
     if Addon.ItemNameDB then
         for id, nm in pairs(Addon.ItemNameDB) do
-            local _, _, _, equipLoc, icon, classID, subclassID = GetItemInfoInstant(id)
-            if icon and equipLoc and equipLoc ~= "" and equipLoc ~= "INVTYPE_NON_EQUIP" then
-                list[#list + 1] = { id = id, name = nm:lower(), display = nm, icon = icon,
-                                    equipLoc = equipLoc, classID = classID, subclassID = subclassID }
-            end
+            add(id, nm, nil, seedClassMask(id), Scan.FACTION_NONE, false)
         end
     end
-    Addon.GoalItemDB = list
+
+    -- 3 — PvP rank pieces: no bundled name, so ask the client for one
+    local missing = 0
+    for _, id in ipairs(Addon.PvPItemIDs or {}) do
+        if not byId[id] then
+            local nm, _, q = GetItemInfo(id)
+            if nm then add(id, nm, q, seedClassMask(id), Scan.FACTION_NONE, false)
+            else missing = missing + 1 end
+        end
+    end
+
+    Addon.GoalItemDB      = list
+    Addon._goalDBStamp    = stamp
+    -- How many PvP ids still have no name. While this is > 0 an incoming
+    -- GET_ITEM_INFO_RECEIVED is worth a full rebuild; once it hits 0 (always, after a
+    -- completed scan) the streaming refresh is a re-filter only, never a rebuild.
+    Addon._goalPvPMissing = missing
     return list
 end
 
--- PvP rank items have no bundled name; resolve from the client at runtime.
+-- Back-compat shim: the old two-table model exposed this and the OnEvent refresh
+-- called it. Unresolved PvP names now stream in through the same rebuild path.
 function Addon:BuildGoalPvP()
-    local out = {}
-    for _, id in ipairs(Addon.PvPItemIDs or {}) do
-        if not (Addon.ItemNameDB and Addon.ItemNameDB[id]) then
-            local name = GetItemInfo(id)
-            if name then
-                local _, _, _, equipLoc, icon, classID, subclassID = GetItemInfoInstant(id)
-                if icon and equipLoc and equipLoc ~= "" and equipLoc ~= "INVTYPE_NON_EQUIP" then
-                    out[#out + 1] = { id = id, name = name:lower(), display = name, icon = icon,
-                                      equipLoc = equipLoc, classID = classID, subclassID = subclassID }
-                end
-            end
-        end
-    end
-    Addon.GoalPvP = out
-    return out
+    Addon.GoalItemDB, Addon._goalDBStamp = nil, nil
+    return Addon:BuildGoalItemDB()
 end
 
 -- item level for sorting (cached once resolved; 0 while the client hasn't cached it)
@@ -122,34 +119,69 @@ local function ilvlOf(e)
     return 0
 end
 
-local function filtered(query, validLoc)
+-- quality for the row tint (nil until the client has the item; requested lazily)
+local function qualityOf(e)
+    if e.quality ~= nil then return e.quality end
+    local q = select(3, GetItemInfo(e.id))
+    if q ~= nil then e.quality = q end
+    return q
+end
+
+local function filtered(query, validLoc, ctx)
     query = strtrim((query or "")):lower()
-    local out, seen = {}, {}
-    local function scan(listt)
-        for _, e in ipairs(listt) do
-            if not seen[e.id] and validLoc[e.equipLoc]
-               and (query == "" or e.name:find(query, 1, true))
-               and Addon:ItemUsableByClass(e) then
-                seen[e.id] = true
-                out[#out + 1] = e
-                if #out >= 500 then return true end
-            end
+    local out = {}
+    for _, e in ipairs(Addon:BuildGoalItemDB()) do
+        if validLoc[e.equipLoc]
+           and (query == "" or e.name:find(query, 1, true))
+           and Scan.Usable(e, ctx) then
+            out[#out + 1] = e
         end
     end
-    if not scan(Addon:BuildGoalItemDB()) then scan(Addon:BuildGoalPvP()) end
+    -- Sort FIRST, cap after: capping during the gather would hand back an arbitrary
+    -- 500 (the index is walked in table order) and only then sort them, so the
+    -- "highest item level first" promise held only when the result set was small.
     table.sort(out, function(a, b)
         local la, lb = ilvlOf(a), ilvlOf(b)
         if la ~= lb then return la > lb end   -- highest item level first
         return a.display < b.display
     end)
+    for i = #out, MAX_RESULTS + 1, -1 do out[i] = nil end
     return out
+end
+
+-- ── Footer widgets (Core factories when present, Blizzard templates otherwise) ─
+local function makeButton(parent, text, x, y, w, h, fn)
+    local DS = _G.DaseekiSuite
+    if DS and DS.MakeButton then return DS.MakeButton(parent, text, x, y, w, h, fn) end
+    local b = CreateFrame("Button", nil, parent, "UIPanelButtonTemplate")
+    b:SetSize(w, h); b:SetText(text)
+    b:SetPoint("TOPLEFT", parent, "TOPLEFT", x, -y)
+    b:SetScript("OnClick", fn)
+    return b
+end
+
+local function makeCheckbox(parent, text, x, y, getter, setter)
+    local DS = _G.DaseekiSuite
+    if DS and DS.MakeCheckbox then return DS.MakeCheckbox(parent, text, x, y, getter, setter) end
+    local cb = CreateFrame("CheckButton", nil, parent, "UICheckButtonTemplate")
+    cb:SetPoint("TOPLEFT", parent, "TOPLEFT", x, -y); cb:SetSize(24, 24)
+    local lbl = cb:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    lbl:SetPoint("LEFT", cb, "RIGHT", 2, 0); lbl:SetText(text)
+    cb:SetScript("OnShow",  function(self) self:SetChecked(getter()) end)
+    cb:SetScript("OnClick", function(self) setter(self:GetChecked()) end)
+    return cb
+end
+
+local function pickerSettings()
+    local s = Addon.db and Addon.db.settings
+    return (s and s.goalPicker) or {}
 end
 
 local function ensure()
     if picker then return picker end
     local DS = _G.DaseekiSuite
 
-    local H = LIST_TOP + ROWS * ROWH + 16
+    local H = FOOTER_Y + 32
     local f = CreateFrame("Frame", "DaseekiArmoryGoalPicker", UIParent, "BackdropTemplate")
     f:SetSize(W, H)
     f:SetFrameStrata("FULLSCREEN_DIALOG")
@@ -179,7 +211,9 @@ local function ensure()
 
     f.countText = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     Addon:TrySetFont(f.countText, "small")   -- before the SetTextColor below
-    f.countText:SetPoint("BOTTOM", f, "BOTTOM", 0, 8); f.countText:SetTextColor(Addon:Col("muted"))
+    f.countText:SetPoint("TOP", f, "TOP", 0, -(LIST_TOP + ROWS * ROWH + 6))
+    f.countText:SetWidth(W - 28); f.countText:SetJustifyH("CENTER")
+    f.countText:SetTextColor(Addon:Col("muted"))
 
     local search
     if DS and DS.MakeEditBox then search = DS.MakeEditBox(f, 14, 40, W - 28)
@@ -203,9 +237,7 @@ local function ensure()
             end
             return
         end
-        picker._list = filtered(self:GetText(), picker._validLoc or {})
-        picker._offset = 0
-        picker:RefreshList()
+        picker:Requery()
     end)
     search:SetScript("OnEscapePressed", function(self) self:ClearFocus(); picker:Hide() end)
     f.search = search
@@ -239,6 +271,30 @@ local function ensure()
         f.rows[i] = r
     end
 
+    -- ── footer: rescan + the usability toggle ────────────────────────────────
+    f.rescan = makeButton(f, "Rescan Items", 14, FOOTER_Y, 118, 22, function()
+        if Addon:IsScanning() then return end
+        Addon:StartItemScan({ force = true })
+        f:SyncScanUI()
+    end)
+    f.rescan:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:AddLine("Rescan Items")
+        GameTooltip:AddLine("Re-reads every equippable item from the client and caches its name,"
+            .. " rarity and class/faction locks.", 0.7, 0.7, 0.7, true)
+        GameTooltip:AddLine("Account-wide; takes about a minute. Safe to keep playing.", 0.7, 0.7, 0.7, true)
+        GameTooltip:Show()
+    end)
+    f.rescan:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+    f.showUnusable = makeCheckbox(f, "Show unusable", W - 148, FOOTER_Y + 1,
+        function() return pickerSettings().showUnusable end,
+        function(v)
+            local s = Addon.db and Addon.db.settings
+            if s then s.goalPicker = s.goalPicker or {}; s.goalPicker.showUnusable = v and true or false end
+            if picker then picker:Requery() end
+        end)
+
     f:EnableMouseWheel(true)
     f:SetScript("OnMouseWheel", function(_, delta)
         local maxOff = math.max(0, #(picker._list or {}) - ROWS)
@@ -246,20 +302,69 @@ local function ensure()
         picker:RefreshList()
     end)
 
-    -- as item names / levels stream in, rebuild PvP entries and re-sort the list
+    -- as item names / levels / qualities stream in, rebuild and re-tint
     f:RegisterEvent("GET_ITEM_INFO_RECEIVED")
     f:SetScript("OnEvent", function(self)
         if not self:IsShown() or self._refreshPending then return end
         self._refreshPending = true
         C_Timer.After(0.3, function()
             self._refreshPending = nil
-            if self:IsShown() then
-                Addon:BuildGoalPvP()
-                self._list = filtered(self.search:GetText(), self._validLoc or {})
-                self:RefreshList()
+            if self:IsShown() and not Addon:IsScanning() then
+                if (Addon._goalPvPMissing or 0) > 0 then
+                    Addon.GoalItemDB, Addon._goalDBStamp = nil, nil
+                end
+                self:Requery()
             end
         end)
     end)
+
+    function f:Requery()
+        self._ctx    = Addon:ScanContext(pickerSettings().showUnusable)
+        self._list   = filtered(self.search:GetText(), self._validLoc or {}, self._ctx)
+        self._offset = 0
+        self:RefreshList()
+    end
+
+    -- The picker POLLS the scan rather than being called back by it, so a scan the
+    -- picker did not start (the once-per-account auto scan at login) still shows its
+    -- progress if the owner opens the picker while it is running.
+    function f:SyncScanUI()
+        local scanning = Addon:IsScanning()
+        if self.rescan.SetText then self.rescan:SetText(scanning and "Scanning…" or "Rescan Items") end
+        if self.rescan._label then self.rescan._label:SetText(scanning and "Scanning…" or "Rescan Items") end
+        if scanning then self.rescan:Disable() else self.rescan:Enable() end
+        if scanning and not self._scanPoll then
+            self._scanPoll = true
+            local function poll()
+                if not picker or not picker._scanPoll then return end
+                if Addon:IsScanning() then
+                    picker:ShowScanProgress(Addon:ItemScanStatus())
+                    C_Timer.After(0.25, poll)
+                else
+                    picker._scanPoll = nil
+                    picker:ScanFinished()
+                end
+            end
+            poll()
+        end
+    end
+
+    function f:ShowScanProgress(st)
+        if not st then return end
+        self:SyncScanUI()
+        if st.phase == "instant" then
+            self.countText:SetText(string.format("Scanning item ids… %d%%  (%d equippable found)",
+                st.percent or 0, st.found or 0))
+        else
+            self.countText:SetText(string.format("Loading items… %d / %d  (%d%%)",
+                st.cursor or 0, st.total or 0, st.percent or 0))
+        end
+    end
+
+    function f:ScanFinished()
+        self:SyncScanUI()
+        if self:IsShown() then self:Requery() end
+    end
 
     function f:RefreshList()
         local list  = self._list or {}
@@ -269,13 +374,29 @@ local function ensure()
             if e then
                 r.icon:SetTexture(e.icon)
                 r.label:SetText(e.display)
+                -- RARITY TINT: the suite's quality chain, text variant.
+                local q = qualityOf(e)
+                local cr, cg, cb = Addon.Borders and Addon.Borders.QualityTextRGB(q)
+                if cr then r.label:SetTextColor(cr, cg, cb)
+                else
+                    r.label:SetTextColor(Addon:Col("text"))
+                    -- uncached: ask the client, then re-tint on GET_ITEM_INFO_RECEIVED
+                    if _G.C_Item and _G.C_Item.RequestLoadItemDataByID then
+                        _G.C_Item.RequestLoadItemDataByID(e.id)
+                    end
+                end
                 r._id = e.id
                 r:Show()
             else
                 r._id = nil; r:Hide()
             end
         end
-        self.countText:SetText(#list .. " items")
+        if not Addon:IsScanning() then
+            local n = #list
+            local cache = Addon:ItemScanCache()
+            local suffix = Scan.IsComplete(cache) and "" or "  (unscanned — press Rescan Items)"
+            self.countText:SetText((n >= MAX_RESULTS and (MAX_RESULTS .. "+ items") or (n .. " items")) .. suffix)
+        end
     end
 
     picker = f
@@ -283,9 +404,11 @@ local function ensure()
 end
 
 -- Warm the client cache for set-piece ids so their names resolve (called once,
--- a few seconds after login and again when the picker opens).
+-- a few seconds after login and again when the picker opens). Redundant once a
+-- scan has completed — those ids are then already in the cache — so it is skipped.
 function Addon:WarmGoalItems()
     if Addon._pvpWarmed then return end
+    if Scan.IsComplete(Addon:ItemScanCache()) then Addon._pvpWarmed = true; return end
     Addon._pvpWarmed = true
     for _, id in ipairs(Addon.PvPItemIDs or {}) do GetItemInfo(id) end
 end
@@ -293,14 +416,12 @@ end
 function Addon:ShowGoalPicker(slotId, onPick)
     local f = ensure()
     Addon:WarmGoalItems()
-    Addon:BuildGoalPvP()
     f._onPick   = onPick
     f._slotId   = slotId
     f._validLoc = Addon.SLOT_INVTYPES[slotId] or {}
-    f._offset   = 0
     f.search:SetText("")
-    f._list = filtered("", f._validLoc)
-    f:RefreshList()
+    f:SyncScanUI()
+    f:Requery()
     f:Show(); f:Raise()
     f.search:SetFocus()
 end

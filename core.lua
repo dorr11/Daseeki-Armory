@@ -107,6 +107,13 @@ local DEFAULT_DB = {
         charWindow = {
             qualityBorders = true,     -- quality-colored soft glow on equipped-slot buttons
         },
+        goalPicker = {
+            -- Hide items the viewing character can never equip (class locks, opposite
+            -- faction, wrong armor/weapon proficiency). Default ON per the owner
+            -- directive; the picker's footer toggles it for edge cases. Additive key,
+            -- per character on purpose — usability is a property of the character.
+            showUnusable = false,
+        },
     },
 }
 
@@ -251,6 +258,7 @@ function Addon:OnLogin()
     if Addon.InitBorders   then Addon:InitBorders()   end
     if Addon.ApplySetBindings then Addon:ApplySetBindings() end
     if Addon.InitGoals then Addon:InitGoals() end
+    if Addon.InitItemScan then Addon:InitItemScan() end
     if Addon.WarmGoalItems then C_Timer.After(5, function() Addon:WarmGoalItems() end) end
 
     -- Macro entry points, unique to Armory so they never collide with ItemRack's

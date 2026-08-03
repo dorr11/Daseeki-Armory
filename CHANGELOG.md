@@ -4,6 +4,47 @@
 Correctness fixes — the stats panel now matches in-game values — plus three new
 gear-swapping features.
 
+- **The Goal picker now colours every item by its rarity.** Result rows were all drawn
+  in the same colour, so an epic and a grey looked identical until you hovered them.
+  Each name is now tinted by the item's quality, using the same colour chain as the
+  quality glow on your character window — with one deliberate difference: a grey item's
+  name is drawn in the readable grey rather than the near-black used for the glow wash,
+  which on a dark panel would be invisible. Items the game has not loaded yet have no
+  quality to show, so those rows start in the plain text colour, ask the game for the
+  item, and re-colour themselves the moment it arrives.
+
+- **The Goal picker can now scan your client for every equippable item in the game.**
+  The picker used to search one bundled list of item names. That list is a snapshot: it
+  misses items outright (Corehound Belt among them), it has no rarity information, and
+  it knows almost nothing about which class or faction an item is locked to. There is
+  now a **Rescan Items** button at the bottom of the picker. It walks the client's own
+  item space, keeps everything that fits a gear slot Armory manages, and records each
+  item's real name, rarity and class/faction locks. It runs once per account — not once
+  per character — and the result is saved, so you pay for it once. The first time you
+  open the game after this update, Armory starts that scan for you automatically about
+  fifteen seconds after login and tells you in chat when it is done; you can keep
+  playing throughout. While a scan is running the picker's counter shows its progress.
+  The bundled list stays in place as a fallback until a scan finishes, so nothing is
+  ever *worse* than before, and shift-clicking an item link into the search box still
+  picks that item directly.
+
+  Two smaller fixes came with it. Results are now sorted by item level *before* the
+  500-row cap is applied — previously an arbitrary 500 matches were taken and only then
+  sorted, so "highest item level first" quietly stopped being true on broad searches.
+  And the scan's item data is re-read from the client every session rather than stored,
+  so it can never go stale against a game patch.
+
+- **The Goal picker now hides items your character can never equip.** Atiesh showed up
+  when picking a goal for a warrior; Alliance PvP rank pieces showed up on Horde
+  characters, and vice versa. The picker now reads each item's class lock ("Classes:
+  Mage") and faction lock off the item itself during the scan, remembers them, and
+  filters the list against whichever character has the picker open — class lock, faction
+  lock, and whether your class can wear that armour or wield that weapon at all. A
+  **Show unusable** tick box in the picker's footer turns the filter off when you want
+  to set a goal on something outside those rules; it is off by default and remembered
+  per character. Requirements you can still go and *earn* — reputation, a profession,
+  a level — are deliberately not filtered, because those are exactly what a goal is for.
+
 - **The Set Swapper's Type, Direction and Sets Per Row settings now sit side by side.**
   They were three stacked rows down the settings page; they are now one row of three
   columns — each with its caption above its dropdown — lined up with the Open On /

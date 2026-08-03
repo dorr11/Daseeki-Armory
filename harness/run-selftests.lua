@@ -1383,6 +1383,598 @@ suite("set-builder-source-contract", function(ck)
 end)
 
 ----------------------------------------------------------------------
+-- ITEM SCAN (itemScan.lua) — the pure layer behind the goal picker's
+-- rescan, its class/faction filter and its SavedVariables cache.
+--
+-- Like trinkets.lua and borders.lua, itemScan.lua is loaded with NO WoW API
+-- present at all, which is the property the first suite asserts.
+----------------------------------------------------------------------
+local Scan
+do
+    local A = {}
+    local fn = loadfile(P("itemScan.lua"))
+    if fn then
+        local ok = pcall(fn, "Daseeki-Armory", A)
+        if ok then Scan = A.ItemScan end
+    end
+end
+
+suite("item-scan-batching", function(ck)
+    ck(type(Scan) == "table", "itemScan.lua loads with no WoW API and publishes Addon.ItemScan")
+    if type(Scan) ~= "table" then return end
+
+    -- ── the id space ────────────────────────────────────────────────────────
+    local R = { { 1, 10 }, { 100, 104 } }
+    ck(Scan.RangeTotal(R) == 15, "RangeTotal sums the (inclusive) ranges")
+    ck(Scan.RangeTotal({}) == 0, "no ranges -> nothing to walk")
+    ck(Scan.RangeTotal(nil) == 0, "nil ranges -> nothing to walk")
+    ck(Scan.RangeTotal({ { 5, 4 } }) == 0, "an inverted range contributes nothing")
+
+    ck(Scan.IdAt(R, 1)  == 1,   "index 1 is the first id of the first range")
+    ck(Scan.IdAt(R, 10) == 10,  "index 10 is the last id of the first range")
+    ck(Scan.IdAt(R, 11) == 100, "index 11 rolls into the second range")
+    ck(Scan.IdAt(R, 15) == 104, "index 15 is the final id")
+    ck(Scan.IdAt(R, 16) == nil, "past the end is nil")
+    ck(Scan.IdAt(R, 0)  == nil, "index 0 is nil (the space is 1-based)")
+    ck(Scan.IdAt(R, -3) == nil, "a negative index is nil")
+    -- the walk visits every id exactly once, in order
+    local seen, ordered, dupes, prev = {}, true, 0, nil
+    for i = 1, Scan.RangeTotal(R) do
+        local id = Scan.IdAt(R, i)
+        if seen[id] then dupes = dupes + 1 end
+        seen[id] = true
+        if prev and id <= prev and id ~= 100 then ordered = false end
+        prev = id
+    end
+    ck(dupes == 0, "the virtual index visits each id exactly once")
+    ck(ordered, "…ascending within a range, stepping cleanly across the range boundary")
+
+    -- ── batch math ──────────────────────────────────────────────────────────
+    local from, to, done = Scan.BatchPlan(15, 0, 6)
+    ck(from == 1 and to == 6 and done == false, "first batch is [1,6], not finished")
+    from, to, done = Scan.BatchPlan(15, 6, 6)
+    ck(from == 7 and to == 12 and done == false, "second batch is [7,12]")
+    from, to, done = Scan.BatchPlan(15, 12, 6)
+    ck(from == 13 and to == 15 and done == true, "last batch clamps to the total and reports done")
+    from, to, done = Scan.BatchPlan(15, 15, 6)
+    ck(from == nil and to == nil and done == true, "an exhausted cursor yields no slice")
+    from, to, done = Scan.BatchPlan(15, 99, 6)
+    ck(from == nil and done == true, "a cursor past the end is still 'done', never negative")
+    from, to = Scan.BatchPlan(15, 0, 0)
+    ck(from == 1 and to == 1, "a zero batch size is floored to 1 (the walk cannot stall)")
+    from, to = Scan.BatchPlan(15, -5, 4)
+    ck(from == 1 and to == 4, "a negative cursor is clamped to the start")
+    from, to = Scan.BatchPlan(3, 0, 1000)
+    ck(from == 1 and to == 3, "an oversized batch clamps to the total")
+    ck(select(3, Scan.BatchPlan(0, 0, 10)) == true, "an empty space is immediately done")
+    -- exhaustive: batching covers the space with no gap and no overlap, any size
+    for size = 1, 7 do
+        local cursor, covered, guard = 0, 0, 0
+        repeat
+            local a, b, fin = Scan.BatchPlan(15, cursor, size)
+            if a then
+                if a ~= cursor + 1 then covered = -1 end
+                covered = covered + (b - a + 1)
+                cursor = b
+            end
+            guard = guard + 1
+        until fin or guard > 100
+        ck(covered == 15, "batch size " .. size .. " covers all 15 indices exactly once")
+        ck(guard <= 100, "batch size " .. size .. " terminates")
+    end
+
+    -- ── progress / estimate ─────────────────────────────────────────────────
+    ck(Scan.Percent(0, 200)   == 0,   "0 of 200 is 0%")
+    ck(Scan.Percent(100, 200) == 50,  "100 of 200 is 50%")
+    ck(Scan.Percent(200, 200) == 100, "200 of 200 is 100%")
+    ck(Scan.Percent(300, 200) == 100, "over-count clamps to 100%")
+    ck(Scan.Percent(-5, 200)  == 0,   "under-count clamps to 0%")
+    ck(Scan.Percent(5, 0)     == 100, "an empty total reads as complete, never a divide by zero")
+
+    ck(Scan.EstimateSeconds(600, 300) == 2, "600 left at 300/s is 2 s")
+    ck(Scan.EstimateSeconds(0, 300)   == 0, "nothing left is 0 s")
+    ck(Scan.EstimateSeconds(600, 0)  == nil, "a zero rate has no estimate (not infinity)")
+    ck(Scan.EstimateSeconds(600, nil) == nil, "a nil rate has no estimate")
+
+    ck(Scan.FormatDuration(0)    == "0s",     "0 s")
+    ck(Scan.FormatDuration(41.4) == "41s",    "seconds round to nearest")
+    ck(Scan.FormatDuration(59)   == "59s",    "just under a minute stays in seconds")
+    ck(Scan.FormatDuration(60)   == "1m 00s", "a minute switches format")
+    ck(Scan.FormatDuration(125)  == "2m 05s", "the seconds field is zero padded")
+    ck(Scan.FormatDuration(-1)   == nil,      "a negative duration has no text")
+    ck(Scan.FormatDuration(nil)  == nil,      "nil has no text")
+
+    -- ── throttle envelope ───────────────────────────────────────────────────
+    -- The server rate-limits item queries; these are the numbers that keep the
+    -- scan inside "a few hundred requests/sec" AND keep any single frame cheap.
+    ck(Scan.TICK > 0 and Scan.TICK <= 0.1, "the tick is a sub-tenth-second cadence")
+    ck(Scan.PeakRequestsPerSecond() == 300, "peak request rate is 300/s")
+    ck(Scan.PeakRequestsPerSecond() >= 100, "...fast enough to finish in about a minute")
+    ck(Scan.PeakRequestsPerSecond() <= 500, "...and well under a flood")
+    ck(Scan.MAX_INFLIGHT > 0, "there is a ceiling on outstanding requests")
+    ck(Scan.MAX_INFLIGHT >= Scan.REQUEST_PER_TICK,
+       "the in-flight window is wider than one tick's dispatch, or the scan self-stalls")
+    ck(Scan.TOOLTIP_BUDGET > 0, "per-tick tooltip work is budgeted")
+    ck(Scan.PeakRecordsPerSecond() >= Scan.PeakRequestsPerSecond(),
+       "the record budget keeps up with the request rate (the queue cannot back up)")
+    ck(Scan.REQUEST_TIMEOUT > 0 and Scan.MAX_TRIES >= 1,
+       "a silent request times out and is retried, so the scan can always terminate")
+    ck(Scan.InstantIdsPerSecond() >= 10000,
+       "the free local walk is fast (no server traffic to pace against)")
+
+    -- ── the id ceiling ──────────────────────────────────────────────────────
+    local total = Scan.RangeTotal(Scan.ActiveRanges())
+    ck(total >= 24500, "the default ceiling clears vanilla's ~24.3k top item id")
+    ck(total <= 60000, "...without walking a pointlessly large space")
+    ck(Scan.IdAt(Scan.ActiveRanges(), 1) == 1, "the walk starts at item id 1")
+    ck(Scan.RangesLabel({ { 1, 10 }, { 20, 30 } }) == "1-10,20-30", "ranges stringify for the cache stamp")
+    ck(#Scan.EXTRA_RANGES == 0, "the high (SoD / non-Era) id blocks are off by default")
+    local act = Scan.ActiveRanges()
+    act[1][1] = 999
+    ck(Scan.RANGES[1][1] == 1, "ActiveRanges hands back a copy, not the live constant")
+end)
+
+----------------------------------------------------------------------
+-- Tooltip restriction parsing: the ONLY place Era exposes class and faction
+-- locks. Pure over already-extracted tooltip lines.
+----------------------------------------------------------------------
+suite("item-scan-restrictions", function(ck)
+    if type(Scan) ~= "table" then ck(false, "itemScan.lua did not load"); return end
+
+    local LOC = {
+        classPrefix = "Classes: ",
+        racesPrefix = "Races: ",
+        classByName = { Warrior = "WARRIOR", Paladin = "PALADIN", Hunter = "HUNTER",
+                        Rogue = "ROGUE", Priest = "PRIEST", Shaman = "SHAMAN",
+                        Mage = "MAGE", Warlock = "WARLOCK", Druid = "DRUID" },
+        raceFaction = { Human = 1, Dwarf = 1, ["Night Elf"] = 1, Gnome = 1,
+                        Orc = 2, Undead = 2, Tauren = 2, Troll = 2 },
+        allianceLines = { Alliance = true, ["Alliance Only"] = true },
+        hordeLines    = { Horde = true, ["Horde Only"] = true },
+    }
+    local B = Scan.CLASS_BIT
+
+    local function parse(...) return Scan.ParseRestrictions({ ... }, LOC) end
+
+    -- ── no restriction ──────────────────────────────────────────────────────
+    local m, f = parse("Binds when picked up", "Cloth", "Head", "+10 Stamina")
+    ck(m == 0, "an ordinary item has no class mask")
+    ck(f == Scan.FACTION_NONE, "...and no faction lock")
+    ck(select(1, Scan.ParseRestrictions({}, LOC)) == 0, "no lines -> unrestricted")
+    ck(select(1, Scan.ParseRestrictions(nil, LOC)) == 0, "nil lines -> unrestricted")
+    ck(select(1, Scan.ParseRestrictions({ "Classes: Mage" }, nil)) == 0,
+       "no locale context -> unrestricted (fails open, never hides)")
+
+    -- ── class locks (the Atiesh case) ───────────────────────────────────────
+    m, f = parse("Binds when picked up", "Two-Hand", "Staff", "Classes: Mage")
+    ck(m == B.MAGE, "a single-class lock yields exactly that class bit")
+    ck(f == Scan.FACTION_NONE, "a class lock is not a faction lock")
+    m = parse("Classes: Druid, Mage, Priest, Warlock")
+    ck(m == B.DRUID + B.MAGE + B.PRIEST + B.WARLOCK, "a multi-class lock ORs the bits")
+    ck(Scan.HasBit(m, B.MAGE) and not Scan.HasBit(m, B.WARRIOR),
+       "...and reads back per class")
+    m = parse("Classes:Rogue")           -- no space after the colon
+    ck(m == 0, "a line that does not carry the localized prefix is ignored, not guessed")
+    m = parse("Classes: Mage, Mage")
+    ck(m == B.MAGE, "a duplicated class is counted once")
+    m = parse("Classes:  Mage ,  Priest ")
+    ck(m == B.MAGE + B.PRIEST, "surrounding whitespace on each entry is trimmed")
+    ck(m < Scan.CLASS_UNKNOWN, "a fully parsed list never sets the unknown bit")
+
+    -- ── unparseable class names fail OPEN ───────────────────────────────────
+    m = parse("Classes: Necromancer")
+    ck(Scan.HasBit(m, Scan.CLASS_UNKNOWN), "an unresolvable class name raises the unknown bit")
+    m = parse("Classes: Mage, Necromancer")
+    ck(Scan.HasBit(m, B.MAGE), "...the resolvable part is still recorded")
+    ck(Scan.HasBit(m, Scan.CLASS_UNKNOWN), "...alongside the unknown bit")
+
+    -- ── faction locks ───────────────────────────────────────────────────────
+    m, f = parse("Binds when picked up", "Alliance Only")
+    ck(f == Scan.FACTION_ALLIANCE, "an 'Alliance Only' line is an Alliance lock")
+    m, f = parse("Horde Only")
+    ck(f == Scan.FACTION_HORDE, "a 'Horde Only' line is a Horde lock")
+    m, f = parse("Horde")
+    ck(f == Scan.FACTION_HORDE, "the bare faction name also counts (FACTION_HORDE)")
+
+    -- vanilla mostly expresses faction as a full-faction RACE mask
+    m, f = parse("Races: Orc, Undead, Tauren, Troll")
+    ck(f == Scan.FACTION_HORDE, "a whole-Horde race list collapses to a Horde lock")
+    m, f = parse("Races: Human, Dwarf, Night Elf, Gnome")
+    ck(f == Scan.FACTION_ALLIANCE, "a whole-Alliance race list collapses to an Alliance lock")
+    m, f = parse("Races: Human, Orc")
+    ck(f == Scan.FACTION_NONE, "a CROSS-faction race list is not a faction lock")
+    m, f = parse("Races: Gnome")
+    ck(f == Scan.FACTION_ALLIANCE, "a single-race list still identifies its faction")
+    m, f = parse("Races: Dryad")
+    ck(f == Scan.FACTION_NONE, "an unrecognised race leaves the item unrestricted (fails open)")
+    m, f = parse("Races: ")
+    ck(f == Scan.FACTION_NONE, "an empty race list is not a lock")
+
+    -- ── both axes on one tooltip ────────────────────────────────────────────
+    m, f = parse("Binds when picked up", "Classes: Warrior", "Horde Only", "Requires level 60")
+    ck(m == B.WARRIOR and f == Scan.FACTION_HORDE, "class and faction locks coexist")
+
+    -- ── deliberately NOT filtered (coverage limit, asserted so it stays a choice) ─
+    m, f = parse("Requires Blacksmithing (300)", "Requires Argent Dawn - Exalted", "Requires Level 60")
+    ck(m == 0 and f == Scan.FACTION_NONE,
+       "profession / reputation / level requirements are NOT restrictions — a goal can be earned")
+
+    ck(Scan.IsRestricted({ classMask = B.MAGE }) == true, "IsRestricted sees a class lock")
+    ck(Scan.IsRestricted({ faction = Scan.FACTION_HORDE }) == true, "IsRestricted sees a faction lock")
+    ck(Scan.IsRestricted({ classMask = 0, faction = 0 }) == false, "an open item is not restricted")
+    ck(Scan.IsRestricted(nil) == false, "nil is not restricted")
+end)
+
+----------------------------------------------------------------------
+-- THE FILTER PREDICATE MATRIX, plus a mutation-adequacy gate.
+--
+-- The whole point of the round: "hide items the CURRENT character can never
+-- equip". Every row below is a (item, viewer) pair with a stated verdict.
+----------------------------------------------------------------------
+suite("item-scan-filter-matrix", function(ck)
+    if type(Scan) ~= "table" then ck(false, "itemScan.lua did not load"); return end
+    local B = Scan.CLASS_BIT
+    local WEAPON, ARMOR = Scan.ITEM_CLASS_WEAPON, Scan.ITEM_CLASS_ARMOR
+
+    local function viewer(class, faction, showUnusable)
+        return { class = class, classBit = B[class] or 0, faction = faction or 0,
+                 showUnusable = showUnusable and true or false }
+    end
+    local hordeWarrior  = viewer("WARRIOR", Scan.FACTION_HORDE)
+    local allyWarrior   = viewer("WARRIOR", Scan.FACTION_ALLIANCE)
+    local hordeMage     = viewer("MAGE",    Scan.FACTION_HORDE)
+    local hordeRogue    = viewer("ROGUE",   Scan.FACTION_HORDE)
+
+    -- ── items ───────────────────────────────────────────────────────────────
+    local plainCloak  = { classID = ARMOR,  subclassID = 0, classMask = 0, faction = 0 }
+    local plateChest  = { classID = ARMOR,  subclassID = 4, classMask = 0, faction = 0 }
+    local clothRobe   = { classID = ARMOR,  subclassID = 1, classMask = 0, faction = 0 }
+    local atiesh      = { classID = WEAPON, subclassID = 10, classMask = B.MAGE, faction = 0 }
+    local warrSet     = { classID = ARMOR,  subclassID = 4, classMask = B.WARRIOR, faction = 0 }
+    local allyRank    = { classID = ARMOR,  subclassID = 4, classMask = 0, faction = Scan.FACTION_ALLIANCE }
+    local hordeRank   = { classID = ARMOR,  subclassID = 4, classMask = 0, faction = Scan.FACTION_HORDE }
+    local allyWarrSet = { classID = ARMOR,  subclassID = 4, classMask = B.WARRIOR, faction = Scan.FACTION_ALLIANCE }
+    local wand        = { classID = WEAPON, subclassID = 19, classMask = 0, faction = 0 }
+    local fuzzyClass  = { classID = ARMOR,  subclassID = 1, classMask = B.MAGE + Scan.CLASS_UNKNOWN, faction = 0 }
+    local onlyUnknown = { classID = ARMOR,  subclassID = 1, classMask = Scan.CLASS_UNKNOWN, faction = 0 }
+
+    local U = Scan.Usable
+
+    -- unrestricted
+    ck(U(plainCloak, hordeWarrior) == true, "an unrestricted cloak shows for everyone")
+    ck(U(plainCloak, hordeMage)    == true, "...including a cloth wearer")
+
+    -- class lock, right vs wrong class  (THE reported defect: Atiesh on a warrior)
+    ck(U(atiesh, hordeMage)    == true,  "Atiesh (Classes: Mage) SHOWS for a mage")
+    ck(U(atiesh, hordeWarrior) == false, "Atiesh is HIDDEN from a warrior")
+    ck(U(warrSet, hordeWarrior) == true, "a warrior set piece shows for a warrior")
+    ck(U(warrSet, hordeMage)    == false, "...and is hidden from a mage")
+
+    -- faction lock, right vs wrong faction (Alliance rank gear on Horde)
+    ck(U(allyRank, allyWarrior)  == true,  "an Alliance rank piece shows for Alliance")
+    ck(U(allyRank, hordeWarrior) == false, "...and is HIDDEN from Horde")
+    ck(U(hordeRank, hordeWarrior) == true,  "a Horde rank piece shows for Horde")
+    ck(U(hordeRank, allyWarrior)  == false, "...and is hidden from Alliance")
+
+    -- the two axes are independent
+    ck(U(allyWarrSet, allyWarrior)  == true,  "right class + right faction shows")
+    ck(U(allyWarrSet, hordeWarrior) == false, "right class + WRONG faction hides")
+    ck(U(allyWarrSet, viewer("MAGE", Scan.FACTION_ALLIANCE)) == false,
+       "wrong class + right faction hides")
+
+    -- proficiency
+    ck(U(plateChest, hordeWarrior) == true,  "a warrior can wear plate")
+    ck(U(plateChest, hordeMage)    == false, "a mage cannot")
+    ck(U(clothRobe,  hordeMage)    == true,  "a mage can wear cloth")
+    ck(U(clothRobe,  hordeWarrior) == true,  "a warrior can also wear cloth (no downgrade lock)")
+    ck(U(wand, hordeMage)     == true,  "a mage can use a wand")
+    ck(U(wand, hordeWarrior)  == false, "a warrior cannot")
+    ck(U(wand, hordeRogue)    == false, "nor can a rogue")
+    ck(U(plainCloak, hordeRogue) == true, "armor subclass 0 (cloaks/rings/necks/trinkets) is universal")
+
+    -- the unknown-class bit fails OPEN
+    ck(U(fuzzyClass, hordeWarrior) == true,
+       "a partly-unparseable class list is SHOWN to a non-listed class (fails open)")
+    ck(U(fuzzyClass, hordeMage) == true, "...and of course to the listed class")
+    ck(U(onlyUnknown, hordeWarrior) == true, "a wholly unparseable class list is shown")
+
+    -- the escape hatch
+    local shown = viewer("WARRIOR", Scan.FACTION_HORDE, true)
+    ck(U(atiesh,   shown) == true, "'show unusable' reveals class-locked items")
+    ck(U(allyRank, shown) == true, "...and opposite-faction items")
+    ck(U(wand,     shown) == true, "...and items the class has no proficiency for")
+
+    -- degenerate inputs
+    ck(U(nil, hordeWarrior) == false, "a nil record is never usable")
+    ck(U(plainCloak, nil)   == true,  "with no viewer context nothing is filtered")
+    ck(U(atiesh, viewer("NOTACLASS", 0)) == true,
+       "an unknown viewer class filters nothing rather than hiding everything")
+    ck(U({ classID = ARMOR, subclassID = 99, classMask = 0, faction = 0 }, hordeWarrior) == false,
+       "an armor subclass no class knows is treated as unusable")
+    ck(U({ classID = 15, subclassID = 99, classMask = 0, faction = 0 }, hordeWarrior) == true,
+       "a non-armor / non-weapon item class is not proficiency-gated")
+
+    -- ── MUTATION ADEQUACY ───────────────────────────────────────────────────
+    -- Each mutant is a plausible WRONG implementation of the predicate. The
+    -- fixture set above must distinguish every one of them, or a regression of
+    -- that exact shape would ship green.
+    local fixtures = {
+        { plainCloak, hordeWarrior }, { plainCloak, hordeMage },
+        { atiesh, hordeMage },        { atiesh, hordeWarrior },
+        { warrSet, hordeWarrior },    { warrSet, hordeMage },
+        { allyRank, allyWarrior },    { allyRank, hordeWarrior },
+        { hordeRank, hordeWarrior },  { hordeRank, allyWarrior },
+        { allyWarrSet, allyWarrior }, { allyWarrSet, hordeWarrior },
+        { plateChest, hordeWarrior }, { plateChest, hordeMage },
+        { wand, hordeMage },          { wand, hordeWarrior },
+        { fuzzyClass, hordeWarrior }, { onlyUnknown, hordeWarrior },
+        { atiesh, shown },            { allyRank, shown }, { wand, shown },
+    }
+    local hasBit = Scan.HasBit
+    local MUTANTS = {
+        ["M1 class lock ignored"] = function(rec, ctx)
+            if ctx.showUnusable then return true end
+            local fa = rec.faction or 0
+            if fa ~= 0 and (ctx.faction or 0) ~= 0 and fa ~= ctx.faction then return false end
+            local prof = Scan.PROF[ctx.class]
+            if prof and rec.classID == 4 and not prof.armor[rec.subclassID] then return false end
+            if prof and rec.classID == 2 and not prof.weapon[rec.subclassID] then return false end
+            return true
+        end,
+        ["M2 class test inverted"] = function(rec, ctx)
+            if ctx.showUnusable then return true end
+            local cm = rec.classMask or 0
+            if cm > 0 and not hasBit(cm, Scan.CLASS_UNKNOWN) then
+                if hasBit(cm % Scan.CLASS_UNKNOWN, ctx.classBit) then return false end
+            end
+            return true
+        end,
+        ["M3 faction lock ignored"] = function(rec, ctx)
+            if ctx.showUnusable then return true end
+            local cm = rec.classMask or 0
+            if cm > 0 and not hasBit(cm, Scan.CLASS_UNKNOWN)
+               and (cm % Scan.CLASS_UNKNOWN) > 0 and not hasBit(cm, ctx.classBit) then return false end
+            local prof = Scan.PROF[ctx.class]
+            if prof and rec.classID == 4 and not prof.armor[rec.subclassID] then return false end
+            if prof and rec.classID == 2 and not prof.weapon[rec.subclassID] then return false end
+            return true
+        end,
+        ["M4 faction test inverted"] = function(rec, ctx)
+            if ctx.showUnusable then return true end
+            local fa = rec.faction or 0
+            if fa ~= 0 and fa == (ctx.faction or 0) then return false end
+            return true
+        end,
+        ["M5 unrestricted treated as locked"] = function(rec, ctx)
+            if ctx.showUnusable then return true end
+            if not hasBit(rec.classMask or 0, ctx.classBit) then return false end
+            return true
+        end,
+        ["M6 show-unusable inverted"] = function(rec, ctx)
+            local c2 = {}
+            for k, v in pairs(ctx) do c2[k] = v end
+            c2.showUnusable = not ctx.showUnusable
+            return Scan.Usable(rec, c2)
+        end,
+        ["M7 proficiency ignored"] = function(rec, ctx)
+            if ctx.showUnusable then return true end
+            local cm = rec.classMask or 0
+            if cm > 0 and not hasBit(cm, Scan.CLASS_UNKNOWN)
+               and (cm % Scan.CLASS_UNKNOWN) > 0 and not hasBit(cm, ctx.classBit) then return false end
+            local fa = rec.faction or 0
+            if fa ~= 0 and (ctx.faction or 0) ~= 0 and fa ~= ctx.faction then return false end
+            return true
+        end,
+        ["M8 unknown class bit fails CLOSED"] = function(rec, ctx)
+            if ctx.showUnusable then return true end
+            local cm = rec.classMask or 0
+            if cm > 0 and not hasBit(cm, ctx.classBit) then return false end
+            local fa = rec.faction or 0
+            if fa ~= 0 and (ctx.faction or 0) ~= 0 and fa ~= ctx.faction then return false end
+            local prof = Scan.PROF[ctx.class]
+            if prof and rec.classID == 4 and not prof.armor[rec.subclassID] then return false end
+            if prof and rec.classID == 2 and not prof.weapon[rec.subclassID] then return false end
+            return true
+        end,
+    }
+    local names = {}
+    for k in pairs(MUTANTS) do names[#names + 1] = k end
+    table.sort(names)
+    for _, name in ipairs(names) do
+        local mut, killed = MUTANTS[name], false
+        for _, fx in ipairs(fixtures) do
+            local real = Scan.Usable(fx[1], fx[2])
+            local ok, got = pcall(mut, fx[1], fx[2])
+            if not ok or (got and true or false) ~= real then killed = true; break end
+        end
+        ck(killed, "mutation killed: " .. name)
+    end
+end)
+
+----------------------------------------------------------------------
+-- CACHE ROUND-TRIP: pack/unpack, Put/Get, and a real SavedVariables
+-- serialize -> reload cycle (the cache's whole job is to survive a logout).
+----------------------------------------------------------------------
+suite("item-scan-cache-roundtrip", function(ck)
+    if type(Scan) ~= "table" then ck(false, "itemScan.lua did not load"); return end
+    local B = Scan.CLASS_BIT
+
+    -- ── the packed meta field ───────────────────────────────────────────────
+    local function trip(q, m, f)
+        local a, b, c = Scan.UnpackMeta(Scan.PackMeta(q, m, f))
+        return a == q and b == m and c == f
+    end
+    ck(trip(0, 0, 0), "the all-zero record round-trips")
+    ck(trip(4, B.MAGE, Scan.FACTION_HORDE), "epic / mage-locked / Horde round-trips")
+    ck(trip(5, B.DRUID + B.MAGE + B.PRIEST + B.WARLOCK, 0), "a multi-class legendary round-trips")
+    ck(trip(1, Scan.CLASS_UNKNOWN, Scan.FACTION_ALLIANCE), "the unknown bit survives the round trip")
+    ck(trip(7, 4095, 3), "the top of every field round-trips")
+    local allOK = true
+    for q = 0, 7 do
+        for _, m in ipairs({ 0, 1, 2, 4, 8, 16, 64, 128, 256, 1024, 2048, 1503, 4095 }) do
+            for f = 0, 2 do if not trip(q, m, f) then allOK = false end end
+        end
+    end
+    ck(allOK, "every (quality x mask x faction) combination in play round-trips exactly")
+    ck(Scan.PackMeta(nil, nil, nil) == 0, "nil fields pack as zero")
+    ck(select(1, Scan.UnpackMeta(nil)) == 0, "unpacking nil yields zeros")
+    ck(Scan.PackMeta(99, 99999, 9) == Scan.PackMeta(15, 4095, 3), "out-of-range fields clamp")
+    ck(Scan.PackMeta(-4, -1, -1) == 0, "negative fields clamp to zero")
+    ck(Scan.PackMeta(4, 0, 0) < 2^24, "a packed record stays a small integer")
+
+    -- ── Put / Get ───────────────────────────────────────────────────────────
+    local c = Scan.NewCache()
+    ck(c.version == Scan.CACHE_VERSION and c.count == 0, "a fresh cache is empty and versioned")
+    ck(Scan.IsComplete(c) == false, "a fresh cache is not a completed scan")
+    ck(Scan.Put(c, 23709, "Corehound Belt", 3, 0, 0) == true, "Put accepts a record")
+    ck(c.count == 1, "count tracks the insert")
+    ck(Scan.Put(c, 22589, "Atiesh, Greatstaff of the Guardian", 5, B.MAGE, 0) == true, "second record")
+    ck(c.count == 2, "count tracks the second insert")
+    ck(Scan.Put(c, 23709, "Corehound Belt", 3, 0, 0) == true, "re-Put of a known id succeeds")
+    ck(c.count == 2, "...without double counting")
+    ck(Scan.Put(c, nil, "x") == false, "Put rejects a nil id")
+    ck(Scan.Put(c, 5, nil) == false, "Put rejects a nil name")
+    ck(Scan.Put(c, 5, "") == false, "Put rejects an empty name")
+    ck(Scan.Put(nil, 5, "x") == false, "Put rejects a nil cache")
+    ck(c.count == 2, "rejected Puts do not move the count")
+
+    local nm, q, m, f = Scan.Get(c, 22589)
+    ck(nm == "Atiesh, Greatstaff of the Guardian", "Get returns the name")
+    ck(q == 5, "...the quality")
+    ck(m == B.MAGE, "...the class mask")
+    ck(f == 0, "...and the faction")
+    ck(Scan.Get(c, 999999) == nil, "an unscanned id reads back nil")
+    ck(Scan.Get(nil, 1) == nil, "a nil cache reads back nil")
+    ck(Scan.Get(c, "22589") ~= nil, "a numeric-string id is coerced (SavedVariables keys)")
+
+    -- ── SavedVariables serialize -> reload ──────────────────────────────────
+    Scan.Put(c, 16542, "Warlord's Iron-Breastplate", 4, B.WARRIOR, Scan.FACTION_HORDE)
+    c.scannedAt, c.build, c.ranges = 1754200000, "1.15.9.68808", "1-32000"
+    local function ser(v, out)
+        local t = type(v)
+        if t == "string" then out[#out + 1] = string.format("%q", v)
+        elseif t == "number" or t == "boolean" then out[#out + 1] = tostring(v)
+        elseif t == "table" then
+            out[#out + 1] = "{"
+            local keys = {}
+            for k in pairs(v) do keys[#keys + 1] = k end
+            table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+            for _, k in ipairs(keys) do
+                out[#out + 1] = "[" .. (type(k) == "string" and string.format("%q", k) or tostring(k)) .. "]="
+                ser(v[k], out)
+                out[#out + 1] = ","
+            end
+            out[#out + 1] = "}"
+        else out[#out + 1] = "nil" end
+    end
+    local buf = {}
+    ser(c, buf)
+    local chunk = loadstring("return " .. table.concat(buf))
+    ck(chunk ~= nil, "the cache serializes to a loadable SavedVariables chunk")
+    local reloaded = chunk and Scan.Normalize(chunk())
+    ck(reloaded ~= nil, "…and normalizes on the way back in")
+    if reloaded then
+        ck(reloaded.count == 3, "the reloaded cache recounts its entries")
+        ck(Scan.IsComplete(reloaded) == true, "a reloaded completed scan reads as complete")
+        local n2, q2, m2, f2 = Scan.Get(reloaded, 16542)
+        ck(n2 == "Warlord's Iron-Breastplate", "the apostrophe survives the round trip")
+        ck(q2 == 4 and m2 == B.WARRIOR and f2 == Scan.FACTION_HORDE,
+           "quality, class lock and faction lock all survive a logout")
+        ck(reloaded.scannedAt == 1754200000 and reloaded.build == "1.15.9.68808",
+           "the scan stamp survives")
+        -- and the predicate still answers correctly off the reloaded record
+        local rec = { classID = 4, subclassID = 4, classMask = m2, faction = f2 }
+        ck(Scan.Usable(rec, { class = "WARRIOR", classBit = B.WARRIOR, faction = Scan.FACTION_HORDE }) == true,
+           "reloaded Horde warrior piece is usable by a Horde warrior")
+        ck(Scan.Usable(rec, { class = "WARRIOR", classBit = B.WARRIOR, faction = Scan.FACTION_ALLIANCE }) == false,
+           "…and hidden from an Alliance warrior")
+    end
+
+    -- ── Normalize guards ────────────────────────────────────────────────────
+    local n = Scan.Normalize(nil)
+    ck(type(n) == "table" and n.count == 0, "Normalize(nil) yields a fresh cache")
+    n = Scan.Normalize("not a table")
+    ck(type(n) == "table" and n.count == 0, "Normalize of a non-table yields a fresh cache")
+    n = Scan.Normalize({ version = Scan.CACHE_VERSION - 1, names = { [1] = "old" }, count = 1 })
+    ck(n.count == 0 and next(n.names) == nil,
+       "a stale cache version is DISCARDED, not migrated (it is a derived artefact)")
+    n = Scan.Normalize({ version = Scan.CACHE_VERSION, names = { [1] = "a", [2] = "b" } })
+    ck(n.count == 2 and type(n.meta) == "table", "a torn cache is repaired and recounted")
+    ck(Scan.IsComplete(nil) == false, "nil is not a completed scan")
+    ck(Scan.IsComplete({ scannedAt = 1, count = 0 }) == false, "an empty completed scan is not complete")
+end)
+
+----------------------------------------------------------------------
+-- ROW MODEL: the picker tints each result row by item RARITY, using the
+-- suite's quality-color chain rather than a private copy.
+----------------------------------------------------------------------
+suite("goal-picker-row-model", function(ck)
+    local Bd = {}
+    local fn = loadfile(P("borders.lua"))
+    ck(fn ~= nil, "borders.lua compiles")
+    if not fn then return end
+    Bd.SLOTS = {}
+    local ok = pcall(fn, "Daseeki-Armory", Bd)
+    ck(ok, "borders.lua loads with no WoW API present")
+    local M = Bd.Borders
+    ck(type(M) == "table" and type(M.QualityTextRGB) == "function",
+       "the text variant is published as Borders.QualityTextRGB")
+    if type(M) ~= "table" or type(M.QualityTextRGB) ~= "function" then return end
+
+    -- the row tint IS the suite chain for every quality above Poor
+    for q = 1, 7 do
+        local a1, a2, a3 = M.QualityTextRGB(q)
+        local b1, b2, b3 = M.QualityRGB(q)
+        ck(a1 == b1 and a2 == b2 and a3 == b3,
+           "quality " .. q .. " tints identically to the glow chain (no private palette)")
+    end
+    local r, g, b = M.QualityTextRGB(4)
+    ck(near(r, 0.64) and near(g, 0.21) and near(b, 0.93), "epic rows are the Blizzard purple")
+    r = M.QualityTextRGB(5)
+    ck(near(r, 1.00) and near(select(2, M.QualityTextRGB(5)), 0.50), "legendary rows are orange")
+
+    -- Poor is the ONE deliberate divergence: the glow value is near-black by design
+    -- (spec §3, an ADD-blended wash), which as TEXT would be invisible.
+    local pr = M.QualityTextRGB(0)
+    ck(pr ~= nil, "Poor has a text color")
+    ck(pr > 0.4, "Poor TEXT is legible grey, not the near-black glow tint (" .. tostring(pr) .. ")")
+    ck(near(pr, 0.62), "...specifically Blizzard's own ITEM_QUALITY_COLORS[0] grey")
+    ck(near(M.QualityRGB(0), 0.1), "...while the GLOW path keeps its near-black override")
+    ck(M.QualityTextRGB(nil) == nil,
+       "an unresolved quality has NO color, so the caller can fall back and re-tint later")
+
+    -- source contract: the picker actually uses all of this
+    local h = io.open(P("goalPicker.lua"), "r")
+    ck(h ~= nil, "goalPicker.lua is readable")
+    if not h then return end
+    local src = h:read("*a"); h:close()
+    ck(src:find("QualityTextRGB") ~= nil, "the picker tints rows through Borders.QualityTextRGB")
+    ck(src:find("RequestLoadItemDataByID") ~= nil,
+       "…and requests a load for rows whose quality has not arrived yet")
+    ck(src:find("GET_ITEM_INFO_RECEIVED") ~= nil, "…and re-tints when it does")
+    ck(src:find("Scan%.Usable") ~= nil, "the result filter runs the shared usability predicate")
+    ck(src:find("Addon:ScanContext") ~= nil, "…against the VIEWING character's context")
+    ck(src:find("StartItemScan") ~= nil, "the picker can start a rescan")
+    ck(src:find("showUnusable") ~= nil, "…and exposes the show-unusable escape hatch")
+    -- the cap must come after the sort, or "highest ilvl first" is a lie on big result sets
+    local fs, ss = src:find("table%.sort%(out"), src:find("for i = #out, MAX_RESULTS")
+    ck(fs ~= nil and ss ~= nil and ss > fs, "results are capped AFTER the ilvl sort, not before")
+
+    -- the scan cache is a NEW account-wide SavedVariables; the per-character one is untouched
+    local t = io.open(P("Daseeki-Armory.toc"), "r")
+    ck(t ~= nil, "TOC is readable")
+    if not t then return end
+    local toc = t:read("*a"); t:close()
+    ck(toc:find("## SavedVariablesPerCharacter: DaseekiArmoryDB") ~= nil,
+       "the per-character SavedVariables is unchanged")
+    ck(toc:find("## SavedVariables: DaseekiArmoryScanDB") ~= nil,
+       "the scan cache is a NEW account-wide SavedVariables (additive)")
+    ck(toc:find("\nitemScan%.lua") ~= nil, "itemScan.lua is in the load order")
+    ck(toc:find("itemScan%.lua") < toc:find("goalPicker%.lua"),
+       "…before goalPicker.lua, which binds Addon.ItemScan at file scope")
+end)
+
+----------------------------------------------------------------------
 -- Every shipped file compiles (loadfile gate)
 ----------------------------------------------------------------------
 suite("loadfile-all-files", function(ck)
