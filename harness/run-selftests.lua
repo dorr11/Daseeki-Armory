@@ -3709,6 +3709,247 @@ suite("item-scan-capture-restamp", function(ck)
 end)
 
 ----------------------------------------------------------------------
+-- A FAILED RE-READ MAY NOT ERASE A LOCK IT DID NOT READ  (1.3.1)
+--
+-- THE DEFECT (pre-existing, found while reviewing the capture-stamp bump):
+-- recordItem wrote Scan.Put(…, classMask, faction, not read) unconditionally, and
+-- Scan.ReadRestrictions answers a tooltip that did not build with
+-- 0, FACTION_NONE, false. So a row whose RE-READ failed had its previously-good
+-- mask overwritten with 0 — correctly flagged unread, but with the evidence gone.
+--
+-- That matters because the pass most likely to hit it is the redundant one: a
+-- capture-stamp bump re-queues EVERY real row (state (b) of
+-- item-scan-capture-restamp), so a single transient tooltip failure over a
+-- healthy row downgrades good data, and Atiesh is back in a warrior's list until
+-- some later session happens to read it again.
+--
+-- Failing OPEN on an unreadable tooltip is policy and is unchanged. Destroying
+-- what an earlier read already established is not.
+----------------------------------------------------------------------
+suite("item-scan-mask-preserve", function(ck)
+    if type(Scan) ~= "table" then ck(false, "itemScan.lua did not load"); return end
+
+    local ROGUE   = Scan.CLASS_BIT.ROGUE
+    local WARRIOR = Scan.CLASS_BIT.WARRIOR
+    local MAGE    = Scan.CLASS_BIT.MAGE
+
+    -- ── 1. THE PRIMITIVE: Scan.Put's precedence, case by case ───────────────
+    local c = Scan.NewCache()
+    Scan.Put(c, 16905, "Bloodfang Chestpiece", 4, ROGUE, 0, false)   -- a tooltip that BUILT
+    ck(select(3, Scan.Get(c, 16905)) == ROGUE, "the row starts with the lock its tooltip named")
+
+    -- good mask + FAILED re-read: the mask survives, the row goes unread
+    Scan.Put(c, 16905, "Bloodfang Chestpiece", 4, 0, 0, true)
+    local nm, q, m, _, _, u = Scan.Get(c, 16905)
+    ck(m == ROGUE, "THE FIX: a failed re-read does NOT overwrite the stored class lock")
+    ck(u == true, "…while the row IS flagged unread, so the repair pass still owes it a look")
+    ck(q == 4 and nm == "Bloodfang Chestpiece", "…and name / quality are written as before")
+    ck(Scan.UnreadIds(c)[1] == 16905, "…so it is queued for the next pass, not written off")
+
+    -- good mask + a re-read that SUCCEEDS with a different answer: updated
+    Scan.Put(c, 16905, "Bloodfang Chestpiece", 4, MAGE, 0, false)
+    ck(select(3, Scan.Get(c, 16905)) == MAGE, "a successful re-read replaces the stored lock")
+    ck(select(6, Scan.Get(c, 16905)) == false, "…and clears the unread flag")
+
+    -- a READ write of 0 is EVIDENCE, and may still clear a lock
+    Scan.Put(c, 16905, "Bloodfang Chestpiece", 4, 0, 0, false)
+    ck(select(3, Scan.Get(c, 16905)) == 0,
+       "a tooltip that built and named no class clears the lock — a finding, not a gap")
+
+    -- no prior data + failed read: zeros and unread, exactly as 1.3.1 already did
+    Scan.Put(c, 22476, "Bonescythe Breastplate", 4, 0, 0, true)
+    local _, _, m2, f2, _, u2 = Scan.Get(c, 22476)
+    ck(m2 == 0 and f2 == Scan.FACTION_NONE and u2 == true,
+       "a row with nothing stored still lands 0 / FACTION_NONE / unread (fail-open, unchanged)")
+
+    -- the faction lock is preserved on the same rule, independently of the mask
+    Scan.Put(c, 12592, "Blackblade of Shahram", 4, 0, Scan.FACTION_HORDE, false)
+    Scan.Put(c, 12592, "Blackblade of Shahram", 4, 0, 0, true)
+    ck(select(4, Scan.Get(c, 12592)) == Scan.FACTION_HORDE,
+       "…and a failed re-read does not erase a stored FACTION lock either")
+    ck(select(6, Scan.Get(c, 12592)) == true, "…which is still flagged for the repair pass")
+
+    -- an UNREAD write that nonetheless carries a value still wins
+    Scan.Put(c, 9425, "Pendulum of Doom", 4, 0, 0, false)
+    Scan.Put(c, 9425, "Pendulum of Doom", 4, ROGUE, 0, true)
+    ck(select(3, Scan.Get(c, 9425)) == ROGUE,
+       "evidence is evidence: an unread write that DOES carry a mask is not thrown away")
+
+    -- the bookkeeping still adds up after all of that
+    local n = Scan.Normalize(c)
+    ck(n.count == 4, "the cache still holds its four rows")
+    ck(n.unreadCount == 3, "…with three of them owed a re-read (got " .. tostring(n.unreadCount) .. ")")
+
+    ----------------------------------------------------------------------
+    -- 2. BEHAVIOURAL: drive the REAL repair pass over a REAL refusing tooltip.
+    -- itemScan.lua touches the WoW API only from inside functions, so the whole
+    -- recorder — StartItemScan, ScanTick, recordItem, tooltipLines,
+    -- ReadRestrictions, Scan.Put, FinishItemScan — runs headlessly against stubs.
+    ----------------------------------------------------------------------
+    local function scanEnv()
+        local A = {}
+        local fnc = loadfile(P("itemScan.lua"))
+        if not fnc then return nil end
+        local okl = pcall(fnc, "Daseeki-Armory", A)
+        if not okl then return nil end
+        A.Tag  = function() return "[Armory]" end
+        A.Wrap = function(_, _, s) return s end
+        A.SLOT_INVTYPES = { chest = { INVTYPE_ROBE = true } }
+        return A
+    end
+
+    local NAMES = { [16905] = "Bloodfang Chestpiece", [9425] = "Pendulum of Doom" }
+    local NIL   = {}
+    local KEYS  = { "CreateFrame", "GetTime", "GetBuildInfo", "time", "UnitClass",
+                    "print", "UIParent", "C_Item", "C_CreatureInfo", "GetItemInfo",
+                    "GetItemInfoInstant", "LOCALIZED_CLASS_NAMES_MALE",
+                    "LOCALIZED_CLASS_NAMES_FEMALE", "ITEM_CLASSES_ALLOWED",
+                    "DaseekiArmoryScanDB" }
+    for i = 1, 8 do KEYS[#KEYS + 1] = "DaseekiArmoryItemScanTipTextLeft" .. i end
+
+    -- The hidden scanning tooltip, driven exactly as itemScan.lua drives it:
+    -- SetItemByID publishes the line font-strings under the tooltip's global name
+    -- and NumLines reports what is there. tipLines = nil IS the defect's own
+    -- condition — a tooltip that does not build at all.
+    local tipLines
+    local function withStubs(fn)
+        local saved = {}
+        for _, k in ipairs(KEYS) do
+            local v = _G[k]; saved[k] = (v == nil) and NIL or v
+        end
+        local frame = {}
+        function frame:Hide() end
+        function frame:Show() end
+        function frame:SetScript() end
+        function frame:RegisterEvent() end
+        function frame:UnregisterAllEvents() end
+        function frame:SetOwner() end
+        function frame:ClearLines() end
+        function frame:SetItemByID()
+            for i = 1, 8 do _G["DaseekiArmoryItemScanTipTextLeft" .. i] = nil end
+            for i, txt in ipairs(tipLines or {}) do
+                local t = txt
+                _G["DaseekiArmoryItemScanTipTextLeft" .. i] = { GetText = function() return t end }
+            end
+        end
+        function frame:NumLines() return tipLines and #tipLines or 0 end
+        _G.CreateFrame        = function() return frame end
+        _G.GetTime            = function() return 1000 end
+        _G.GetBuildInfo       = function() return "1.15.7", "60111" end
+        _G.time               = function() return 1786000000 end
+        _G.UnitClass          = function() return "Warrior", "WARRIOR" end
+        _G.UIParent           = frame
+        _G.C_Item             = nil
+        _G.C_CreatureInfo     = nil
+        _G.print              = function() end
+        _G.LOCALIZED_CLASS_NAMES_MALE   = { ROGUE = "Rogue", WARRIOR = "Warrior", MAGE = "Mage" }
+        _G.LOCALIZED_CLASS_NAMES_FEMALE = nil
+        _G.ITEM_CLASSES_ALLOWED = "Classes: %s"
+        _G.GetItemInfo        = function(id) return NAMES[id] or "Corehound Belt", nil, 4 end
+        _G.GetItemInfoInstant = function(id) return id, nil, nil, "INVTYPE_ROBE", 12345 end
+        local packed = { pcall(fn) }
+        for _, k in ipairs(KEYS) do
+            local v = saved[k]; _G[k] = (v ~= NIL) and v or nil
+        end
+        return unpack(packed)
+    end
+
+    local function runToIdle(A)
+        local t = 0
+        while A:IsScanning() and t < 40 do A:ScanTick(1); t = t + 1 end
+        A:StopItemScan()
+        return t
+    end
+
+    -- ── (a) the redundant pass over a HEALTHY row whose tooltip refuses ──────
+    local A1 = scanEnv()
+    ck(A1 ~= nil, "a headless itemScan environment loads with no WoW API present")
+    if A1 then
+        local sv = Scan.NewCache()
+        Scan.Put(sv, 16905, "Bloodfang Chestpiece", 4, ROGUE, 0, false)
+        sv.scannedAt     = 1785862751
+        sv.restrictStamp = 1              -- off disk on the old stamp: re-queued
+        tipLines = nil                    -- …and no tooltip builds this session
+        local ok, owed, ticks = withStubs(function()
+            _G.DaseekiArmoryScanDB = sv
+            A1:ItemScanCache()                       -- LOGIN: re-flags, keeps the mask
+            local n = Scan.UnreadCount(sv)
+            A1:StartItemScan({ repair = true })      -- PICKER OPEN: the redundant pass
+            return n, runToIdle(A1)
+        end)
+        ck(ok == true, "(a) the repair pass runs headlessly over a refusing tooltip")
+        ck(owed == 1, "(a) login leaves the healthy row owed a re-read (got " .. tostring(owed) .. ")")
+        ck(ticks == Scan.TOOLTIP_TRIES,
+           "…and it costs one tick per try, never all three inside one frame (got "
+           .. tostring(ticks) .. ")")
+        ck(select(3, Scan.Get(sv, 16905)) == ROGUE,
+           "(a) THE FIX, END TO END: three failed tooltip builds leave the class lock standing")
+        ck(select(6, Scan.Get(sv, 16905)) == true,
+           "…with the row still flagged unread, so a later session tries again")
+        ck(sv.restrictLocked == 1,
+           "…and the pass reports the lock as still held (got " .. tostring(sv.restrictLocked) .. ")")
+        ck(sv.restrictUnreadable == 1, "…alongside the read it could not make")
+        ck(sv.unreadCount == 1, "…so exactly one row remains owed on disk")
+    end
+
+    -- ── (b) the same pass with a tooltip that DOES build, saying something new ─
+    local A2 = scanEnv()
+    if A2 then
+        local sv2 = Scan.NewCache()
+        Scan.Put(sv2, 16905, "Bloodfang Chestpiece", 4, ROGUE, 0, false)
+        sv2.scannedAt     = 1785862751
+        sv2.restrictStamp = 1
+        tipLines = { "Bloodfang Chestpiece", "Binds when picked up", "Chest", "Leather",
+                     "Classes: Warrior" }
+        local ok2 = withStubs(function()
+            _G.DaseekiArmoryScanDB = sv2
+            A2:ItemScanCache()
+            A2:StartItemScan({ repair = true })
+            return runToIdle(A2)
+        end)
+        ck(ok2 == true, "(b) the same pass runs against a tooltip that builds")
+        ck(select(3, Scan.Get(sv2, 16905)) == WARRIOR,
+           "(b) a successful re-read OVERWRITES the stored lock with what it read (got "
+           .. tostring(select(3, Scan.Get(sv2, 16905))) .. ")")
+        ck(select(6, Scan.Get(sv2, 16905)) == false, "…and the row is no longer owed")
+        ck(sv2.unreadCount == 0, "…so the cache owes nothing at all")
+    end
+
+    -- ── (c) PHASE 2's FIRST read of an id: no prior data, behaviour unchanged ─
+    local A3 = scanEnv()
+    if A3 then
+        A3.ItemScan.RANGES = { { 9425, 9426 } }   -- a two-id id space: phase 1 is instant
+        local sv3 = Scan.NewCache()
+        tipLines = nil                            -- every tooltip refuses
+        local ok3 = withStubs(function()
+            _G.DaseekiArmoryScanDB = sv3
+            A3:ItemScanCache()
+            A3:StartItemScan()                    -- a FULL scan, not a repair
+            return runToIdle(A3)
+        end)
+        ck(ok3 == true, "(c) a full scan runs over a two-id space")
+        ck(sv3.count == 2, "…recording both ids the walk found (got " .. tostring(sv3.count) .. ")")
+        local _, _, m3, f3, _, u3 = Scan.Get(sv3, 9425)
+        ck(m3 == 0 and f3 == Scan.FACTION_NONE and u3 == true,
+           "(c) a first read has nothing to preserve, so it still lands 0 / FACTION_NONE / unread")
+        ck(sv3.unreadCount == 2, "…and both rows are owed the repair pass")
+    end
+
+    -- ── the rule lives in the primitive, so every writer inherits it ─────────
+    local fh = io.open(P("itemScan.lua"), "r")
+    ck(fh ~= nil, "itemScan.lua is readable")
+    if fh then
+        local s = fh:read("*a"); fh:close()
+        ck(s:find("A WRITE THAT CARRIES NO EVIDENCE MAY NOT ERASE EVIDENCE") ~= nil,
+           "the precedence is stated where the code enforces it")
+        local put = s:find("function Scan%.Put")
+        local rec = s:find("Scan%.Put%(ST%.cache")
+        ck(put ~= nil and rec ~= nil and rec > put,
+           "…and the scan's one and only writer goes through it")
+    end
+end)
+
+----------------------------------------------------------------------
 -- Every shipped file compiles (loadfile gate)
 ----------------------------------------------------------------------
 suite("loadfile-all-files", function(ck)

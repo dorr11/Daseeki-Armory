@@ -78,6 +78,12 @@
   nothing owed and would never be repaired again. Updating re-queues those caches once,
   so the pass runs on the fixed code; a scan that completed on this version is left alone.
 
+- **…and a failed re-read can no longer take a class lock down with it.** If an item's
+  tooltip refused to build while that pass was re-reading it, Armory wrote the empty
+  result over the lock it already held — so a moment's bad luck during a repair undid a
+  restriction it had read correctly the first time. A read that came back with nothing
+  now keeps whatever the item already had and simply asks to look again later.
+
 - **The picker no longer shows an item under the wrong name.** Armory merges your
   client's own scan with a bundled name list, the client always winning. Dropping an
   entry as a Blizzard placeholder used to release its id back to the bundled list, which

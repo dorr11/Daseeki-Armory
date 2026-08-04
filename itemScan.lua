@@ -554,12 +554,44 @@ function Scan.Normalize(cache)
     return cache
 end
 
+-- A WRITE THAT CARRIES NO EVIDENCE MAY NOT ERASE EVIDENCE (1.3.1).
+--
+-- `unread` means "the tooltip did not build", and Scan.ReadRestrictions answers
+-- that case with 0 / FACTION_NONE — placeholders, not findings. Writing those
+-- over a row whose lock an earlier pass DID read is how a single transient
+-- tooltip failure, or the redundant re-read a capture-stamp bump forces, quietly
+-- downgrades good data back to "unrestricted" and puts Atiesh in a warrior's
+-- list again. Flagging the row unread is right; destroying what is already known
+-- about it is not.
+--
+-- PRECEDENCE, exactly, applied to classMask and faction independently:
+--   1. a READ write (unread false/nil) always wins outright — a tooltip that
+--      built and named no class is real evidence of an unrestricted item, so it
+--      is allowed to clear a stored lock;
+--   2. an UNREAD write that nonetheless carries a value (classMask ~= 0 /
+--      faction ~= FACTION_NONE) wins — evidence is evidence, whatever flagged it;
+--   3. an UNREAD write of the empty value onto an EXISTING row keeps whatever
+--      that row already holds;
+--   4. anything else takes the empty value — a row with no prior data (or no row
+--      at all) still lands as 0 / FACTION_NONE / unread, which is the fail-open
+--      behaviour of 1.3.1 unchanged.
+-- The name, the quality and the unread flag itself are ALWAYS written: they come
+-- from GetItemInfo, which succeeded, and from the caller's own verdict.
 function Scan.Put(cache, id, name, quality, classMask, faction, unread)
     if type(cache) ~= "table" then return false end
     id = tonumber(id)
     if not id or type(name) ~= "string" or name == "" then return false end
     cache.names = cache.names or {}
     cache.meta  = cache.meta  or {}
+    if unread and cache.names[id] ~= nil then
+        local _, oldMask, oldFaction = Scan.UnpackMeta(cache.meta[id])
+        if (tonumber(classMask) or 0) == 0 and oldMask ~= 0 then
+            classMask = oldMask
+        end
+        if (tonumber(faction) or 0) == Scan.FACTION_NONE and oldFaction ~= Scan.FACTION_NONE then
+            faction = oldFaction
+        end
+    end
     if cache.names[id] == nil then cache.count = (cache.count or 0) + 1 end
     cache.names[id] = name
     -- The internal flag is DERIVED, never passed in: the name is the only
@@ -1081,6 +1113,12 @@ local function recordItem(id)
         end
     end
 
+    -- The write is unconditional, but it is NOT destructive: with read == false
+    -- the classMask / faction arguments are ReadRestrictions' placeholders, and
+    -- Scan.Put's precedence rule keeps whatever the row already holds rather than
+    -- letting a failed re-read overwrite a lock an earlier pass did read. What a
+    -- failed read is allowed to change is the unread flag — the row is owed
+    -- another look, and the repair pass finds it by that flag on a later session.
     Scan.Put(ST.cache, id, name, quality or 1, classMask, faction, not read)
     ST.doneIds[id] = true
     ST.resolved = ST.resolved + 1
