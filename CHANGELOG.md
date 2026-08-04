@@ -1,5 +1,41 @@
 # Changelog
 
+## 1.3.1 — 2026-08-04
+
+### Fixed
+
+- **The Goal picker no longer offers you items that do not exist.** 1.3.0 taught Armory
+  to read your client's own item list, which was a real improvement — but your client
+  also stores Blizzard's working records alongside the game's actual items: art
+  placeholders (`[PH] Brilliant Dawn Cap`), the gear worn by creatures
+  (`Monster - Sword, Katana`), designer test pieces (`Test Glaive A`,
+  `90 Epic Warrior Helm`) and retired duplicates (`Deprecated Dented Skullcap`). About
+  one in eight of everything the scan found is of that kind, and none of it can be
+  obtained by anyone. Armory now recognises those records and keeps them out of the
+  picker entirely.
+
+  They are **not** revealed by **Show unusable**, deliberately: that tick box is for
+  items *some other character* could equip, and these are not items at all. The name
+  rules were derived by reading a full scan of a live Era client — 10,504 equippable
+  items — and were checked against every one of the 9,241 real items that survive, so
+  nothing you can actually go and earn is hidden. Real gear whose name looks suspicious
+  is safe: *Testament of Hope*, *Contest Winner's Tabard*, *Old Blunderbuss*,
+  *Adept's Cloak*, *103 Pound Mightfish* and *Doomcaller's Footwraps* all still appear.
+
+  **You do not need to rescan.** The next time you log in, Armory re-reads the names
+  already in its cache and marks them; it takes a few hundredths of a second. If a
+  future update improves the rules, that too applies at the next login rather than
+  asking for another scan. The chat line at the end of a scan now also tells you how
+  many internal records it set aside.
+
+### Unchanged, and deliberately so
+
+- **An empty search box still lists the whole slot.** That is not a bug and it has
+  worked that way since 1.0.0 — the box filters a list you can browse, it is not a
+  search term you are required to type. The reason an "empty" picker looked wrong in
+  1.3.0 is simply that the rows at the top of that list were placeholders, which is what
+  the fix above removes.
+
 ## 1.3.0 — 2026-08-03
 The largest Armory release so far. Three new things you can *do* — search your whole
 client for a gear goal, swap weapons in the middle of a fight, and read a trinket's

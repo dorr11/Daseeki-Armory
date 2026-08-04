@@ -1905,6 +1905,312 @@ suite("item-scan-cache-roundtrip", function(ck)
 end)
 
 ----------------------------------------------------------------------
+-- INTERNAL / UNOBTAINABLE ITEM FILTER  (1.3.1)
+--
+-- The 1..32000 id walk is a walk of the CLIENT's item space, so it sweeps up
+-- Blizzard's own working records: "[PH] Brilliant Dawn Cap" (the item the owner
+-- screenshotted in an otherwise-empty picker), "Monster - Sword, Katana",
+-- "Test Glaive A", "90 Epic Warrior Helm", "Deprecated Dented Skullcap". None of
+-- them can be obtained by any player.
+--
+-- EVIDENCE BASE: every fixture below is a VERBATIM name from a real completed
+-- cache (10 504 equippable ids, Era build 68940) — the junk ones and the
+-- genuine ones alike. 1 263 of the 10 504 are internal; the surviving 9 241 were
+-- swept for collisions and there are none, so the survivor fixtures here are the
+-- near-misses that actually forced each pattern's anchoring.
+----------------------------------------------------------------------
+suite("item-scan-internal-filter", function(ck)
+    if type(Scan) ~= "table" then ck(false, "itemScan.lua did not load"); return end
+    ck(type(Scan.INTERNAL_PATTERNS) == "table" and #Scan.INTERNAL_PATTERNS > 0,
+       "the denylist is published as Scan.INTERNAL_PATTERNS")
+    ck(type(Scan.IsInternalName) == "function", "Scan.IsInternalName is published")
+
+    -- ── one fixture per pattern; the pattern must be the one that kills it ───
+    -- (InternalPattern returns the FIRST match, so this also proves no fixture is
+    -- being killed by some earlier, broader pattern instead.)
+    local KILLS = {
+        ["%[ph%]"]              = "[PH] Brilliant Dawn Cap",
+        ["monster %- "]         = "Monster - Sword, Katana",
+        ["%f[%a]test%f[%A]"]    = "Test Glaive A",
+        ["%f[%a]testing%f[%A]"] = "Ring of Critical Testing 2",
+        ["^testboots"]          = "TestBoots - Puffed Mail Green",
+        ["qatest"]              = "QATest +1000 Spell Dmg Ring",
+        ["jefftest"]            = "Fishing Pole (JEFFTEST)",
+        ["%(delete me%)"]       = "Shane (DELETE ME)",
+        ["^deprecated "]        = "Deprecated Dented Skullcap",
+        [" deprecated$"]        = "Thunderfury, Blessed Blade of the Windseeker DEPRECATED",
+        [" dep$"]               = "Lok'delar, Stave of the Ancient Keepers DEP",
+        ["^old%a"]              = "OLDThug Belt",
+        ["%(old%)"]             = "(OLD)Medium Throwing Knife",
+        ["%f[%a]unused%f[%A]"]  = "Unused Feathered Leggings",
+        ["%(dnd%)"]             = "Charm Pouch (DND)",
+        ["%f[%a]foo%f[%A]"]     = "Twain Random Sword FOO",
+        ["^pvp %a+ %a+ %a"]     = "PVP Plate Helm Alliance",
+        ["^%d+ epic %a"]        = "90 Epic Warrior Helm",
+        ["^%d+ green %a"]       = "63 Green Rogue Cap",
+        ["^%d+ blue %a"]        = "70 Blue Warrior Axe",
+        ["^%d+ purple %a"]      = "80 Purple Rogue Dagger",
+        ["^%d+ white %a"]       = "40 White Mage Robe",
+        ["^%d+ grey %a"]        = "40 Grey Mage Robe",
+        ["^%d+ gray %a"]        = "40 Gray Mage Robe",
+        ["%f[%a]%a%d%d "]       = "Black Leather D02 Boots",
+        ["%f[%a]%a%d%d$"]       = "Monster Shield Engineer A01",
+    }
+    local uncovered = {}
+    for _, p in ipairs(Scan.INTERNAL_PATTERNS) do
+        local fx = KILLS[p]
+        if not fx then uncovered[#uncovered + 1] = p
+        else
+            ck(Scan.InternalPattern(fx) == p,
+               "pattern " .. p .. " kills its fixture: " .. fx)
+        end
+    end
+    ck(#uncovered == 0, "every denylist pattern has a fixture (uncovered: "
+       .. table.concat(uncovered, " ") .. ")")
+
+    -- ── genuine Era names SURVIVE. Every one of these is in the real cache, and
+    -- the awkward ones are why the patterns are anchored the way they are. ────
+    local SURVIVORS = {
+        "Testament of Hope",          -- 'Test' + a letter, not the word "test"
+        "Contest Winner's Tabard",    -- "test" inside another word
+        "Old Blanchy's Blanket", "Old Blunderbuss", "Old Greatsword", "Old Leather Belt",
+        "Adept's Cloak", "Adept Short Staff", "Band of Icy Depths",   -- 'dep'
+        "10 Pound Mud Snapper", "103 Pound Mightfish", "15 Pound Salmon",
+        "Doomcaller's Footwraps", "Footpads of the Fang",             -- 'foo'
+        "Templar Crown", "Tempered Bracers",
+        "Boots of Prophecy", "Circlet of Prophecy",                   -- 'ph'
+        "Pendulum of Doom", "Corehound Belt", "Krol Blade", "Arcanite Reaper",
+        "Bloodfang Hood", "Onyxia Tooth Pendant",
+        "Thunderfury, Blessed Blade of the Windseeker",
+        "Lok'delar, Stave of the Ancient Keepers",
+        "Rhok'delar, Longbow of the Ancient Keepers",
+        "Sulfuras, Hand of Ragnaros", "Atiesh, Greatstaff of the Guardian",
+        "Zin'rokh, Destroyer of Worlds",
+        "The 1 Ring", "Engineer's Shield 1", "Digmaster 5000",
+        "Frostwolf Insignia Rank 4", "Techbot CPU Shell",
+        "Nat Pagle's Extreme Angler FC-5000", "Warglaive of Azzinoth (Left)",
+        "Seal of the Dawn", "Tabard of the Argent Dawn",
+        "BKP 42 \"Ultra\"", "Warlock Orb 35",
+    }
+    for _, nm in ipairs(SURVIVORS) do
+        ck(Scan.IsInternalName(nm) == false,
+           "genuine item survives: " .. nm .. " (killed by "
+           .. tostring(Scan.InternalPattern(nm)) .. ")")
+    end
+
+    -- the four twin pairs: the live item and the client's dead copy of it
+    local TWINS = {
+        { "Thunderfury, Blessed Blade of the Windseeker",
+          "Thunderfury, Blessed Blade of the Windseeker DEPRECATED" },
+        { "Lok'delar, Stave of the Ancient Keepers",
+          "Lok'delar, Stave of the Ancient Keepers DEP" },
+        { "Pendulum of Doom", "Monster - Axe, 2H Pendulum of Doom" },
+        { "Mandokir's Sting", "Mandokir's Sting DEPRECATED" },
+    }
+    for _, t in ipairs(TWINS) do
+        ck(Scan.IsInternalName(t[1]) == false and Scan.IsInternalName(t[2]) == true,
+           "the live item outlives its dead twin: " .. t[1])
+    end
+
+    -- degenerate inputs
+    ck(Scan.IsInternalName(nil) == false, "nil is not an internal name")
+    ck(Scan.IsInternalName("")  == false, "an empty name is not an internal name")
+    ck(Scan.IsInternalName(42)  == false, "a non-string is not an internal name")
+    ck(Scan.IsInternalName("test") == true, "the bare lowercase name 'test' is internal")
+    ck(Scan.IsInternalName("TEST SWORD") == true, "…and its uppercase sibling (matching is case-insensitive)")
+
+    -- ── the flag is CACHED, packed, and survives a logout ───────────────────
+    local q, m, f, i = Scan.UnpackMeta(Scan.PackMeta(4, Scan.CLASS_BIT.MAGE, 1, true))
+    ck(q == 4 and m == Scan.CLASS_BIT.MAGE and f == 1 and i == true,
+       "the internal bit round-trips alongside quality / mask / faction")
+    ck(select(4, Scan.UnpackMeta(Scan.PackMeta(4, 4095, 3, false))) == false,
+       "…and a full record with the bit clear reads back clear")
+    ck(Scan.PackMeta(15, 4095, 3, true) < 2 ^ 24, "a packed record is still a small integer")
+    ck(select(4, Scan.UnpackMeta(Scan.PackMeta(4, 0, 0))) == false,
+       "1.3.0's three-argument PackMeta still means 'not internal'")
+
+    local c = Scan.NewCache()
+    ck(c.internalStamp == Scan.INTERNAL_STAMP, "a fresh cache carries the current denylist stamp")
+    Scan.Put(c, 19162, "Corehound Belt", 3, 0, 0)
+    Scan.Put(c, 13789, "[PH] Brilliant Dawn Cap", 1, 0, 0)
+    ck(select(5, Scan.Get(c, 13789)) == true, "Put DERIVES the internal flag from the name")
+    ck(select(5, Scan.Get(c, 19162)) == false, "…and leaves a real item unflagged")
+    ck(c.count == 2, "internal rows stay IN the cache (a rescan must not re-fight them)")
+
+    -- ── a 1.3.0 cache is UPGRADED IN PLACE, never discarded ─────────────────
+    -- The bit did not exist in 1.3.0, so every meta value read back with it clear.
+    -- Normalize must re-derive rather than demand a minute-long rescan.
+    local old = {
+        version = Scan.CACHE_VERSION,
+        names = { [13789] = "[PH] Brilliant Dawn Cap", [19162] = "Corehound Belt",
+                  [9425] = "Pendulum of Doom", [11342] = "Monster - Axe, 2H Pendulum of Doom" },
+        meta  = { [13789] = Scan.PackMeta(1, 0, 0), [19162] = Scan.PackMeta(3, 0, 0),
+                  [9425] = Scan.PackMeta(4, 0, 0), [11342] = Scan.PackMeta(1, 0, 0) },
+        count = 4, scannedAt = 1754200000,
+    }
+    ck(old.internalStamp == nil, "…the 1.3.0 cache has no denylist stamp")
+    local up = Scan.Normalize(old)
+    ck(up.count == 4, "the upgrade keeps every row (no rescan is demanded)")
+    ck(up.internalStamp == Scan.INTERNAL_STAMP, "…and stamps the denylist it was derived with")
+    ck(up.internalCount == 2, "…having flagged exactly the two internal rows")
+    ck(select(5, Scan.Get(up, 13789)) == true and select(5, Scan.Get(up, 11342)) == true,
+       "the placeholder and the creature record are flagged on the way in")
+    ck(select(5, Scan.Get(up, 19162)) == false and select(5, Scan.Get(up, 9425)) == false,
+       "…and the real items are not")
+    ck(select(2, Scan.Get(up, 9425)) == 4, "the re-derive preserves quality")
+
+    -- an already-stamped cache is left alone (the pass is idempotent and one-shot)
+    up.meta[19162] = Scan.PackMeta(3, 0, 0, true)     -- a lie, deliberately planted
+    local again = Scan.Normalize(up)
+    ck(select(5, Scan.Get(again, 19162)) == true,
+       "a cache already on the current stamp is NOT re-derived (the pass runs once)")
+    again.internalStamp = "some-older-stamp"
+    again = Scan.Normalize(again)
+    ck(select(5, Scan.Get(again, 19162)) == false,
+       "…and a stamp change re-derives every flag, so a denylist fix reaches an old cache")
+
+    -- ── MUTATION ADEQUACY: each mutant is a plausible WRONG denylist. The
+    -- fixtures above must distinguish every one, or that regression ships green.
+    local FIX = {}
+    for _, nm in pairs(KILLS) do FIX[#FIX + 1] = nm end
+    for _, nm in ipairs(SURVIVORS) do FIX[#FIX + 1] = nm end
+    FIX[#FIX + 1] = "test Eric Shirt"
+    FIX[#FIX + 1] = "Mandokir's Sting DEPRECATED"
+    FIX[#FIX + 1] = "Monster - Axe, 2H Pendulum of Doom"
+
+    local function anyOf(pats)
+        return function(name)
+            local s = tostring(name or ""):lower()
+            for _, p in ipairs(pats) do if s:find(p) then return true end end
+            return false
+        end
+    end
+    local MUTANTS = {
+        ["N1 'test' as a loose substring"] = anyOf({ "test" }),
+        ["N2 'ph' as a loose substring"]   = anyOf({ "ph" }),
+        ["N3 'old' without the glue rule"] = anyOf({ "^old" }),
+        ["N4 'dep' as a loose substring"]  = anyOf({ "dep" }),
+        ["N5 'foo' as a loose substring"]  = anyOf({ "foo" }),
+        ["N6 level template without the quality word"] = anyOf({ "^%d%d " }),
+        ["N7 case-sensitive matching"] = function(name)
+            local s = tostring(name or "")
+            for _, p in ipairs(Scan.INTERNAL_PATTERNS) do if s:find(p) then return true end end
+            return false
+        end,
+        ["N8 only the first pattern is consulted"] = function(name)
+            return tostring(name or ""):lower():find(Scan.INTERNAL_PATTERNS[1]) ~= nil
+        end,
+        ["N9 the verdict is inverted"] = function(name) return not Scan.IsInternalName(name) end,
+        ["N10 nothing is ever internal"] = function() return false end,
+        ["N11 everything is internal"] = function() return true end,
+    }
+    local mnames = {}
+    for k in pairs(MUTANTS) do mnames[#mnames + 1] = k end
+    table.sort(mnames)
+    for _, name in ipairs(mnames) do
+        local mut, killed = MUTANTS[name], false
+        for _, fx in ipairs(FIX) do
+            local ok, got = pcall(mut, fx)
+            if not ok or (got and true or false) ~= Scan.IsInternalName(fx) then killed = true; break end
+        end
+        ck(killed, "mutation killed: " .. name)
+    end
+end)
+
+----------------------------------------------------------------------
+-- THE EMPTY-SEARCH STATE  (owner question, 1.3.1)
+--
+-- VERDICT: an empty search box lists the WHOLE slot — every item that fits it
+-- and that this character could equip. There is no minimum query length, no
+-- current-goal echo, and nothing about it changed in 1.3.0: the pre-scan picker
+-- (commit c602fb9) filtered on `query == "" or e.name:find(query)` and
+-- ShowGoalPicker opened with `filtered("", …)`, which is browse-the-slot. The
+-- box is a FILTER over a browsable list, not a required search term, so it
+-- stays that way.
+--
+-- What actually went wrong in 1.3.0 is that the client scan poured Blizzard's
+-- internal records into that browsable list, so a placeholder was what the owner
+-- saw sitting in an "empty" picker. The suite above removes those; this one pins
+-- the browse semantics so nobody "fixes" the empty state by mistake.
+----------------------------------------------------------------------
+suite("goal-picker-empty-query", function(ck)
+    if type(Scan) ~= "table" then ck(false, "itemScan.lua did not load"); return end
+    ck(type(Scan.Matches) == "function", "the row predicate is published as Scan.Matches")
+    ck(type(Scan.NormalizeQuery) == "function", "…and query normalisation with it")
+
+    local HEAD = { INVTYPE_HEAD = true }
+    local warrior = { class = "WARRIOR", classBit = Scan.CLASS_BIT.WARRIOR,
+                      faction = Scan.FACTION_HORDE, showUnusable = false }
+    local function row(name, loc, subclass, mask)
+        return { id = 1, name = name:lower(), display = name, equipLoc = loc or "INVTYPE_HEAD",
+                 classID = Scan.ITEM_CLASS_ARMOR, subclassID = subclass or 4,
+                 classMask = mask or 0, faction = Scan.FACTION_NONE }
+    end
+    local helm  = row("Lionheart Helm")
+    local coif  = row("Helm of Wrath")
+    local robe  = row("Robe of Volatile Power", "INVTYPE_ROBE", 1)
+    local mageOnly = row("Arcanist Crown", "INVTYPE_HEAD", 1, Scan.CLASS_BIT.MAGE)
+
+    -- ── the empty box ───────────────────────────────────────────────────────
+    ck(Scan.NormalizeQuery("") == "", "an empty box normalises to the empty query")
+    ck(Scan.NormalizeQuery("   ") == "", "…and so does a box holding only spaces")
+    ck(Scan.NormalizeQuery(nil) == "", "…and a nil text")
+    ck(Scan.NormalizeQuery("  LioNheart ") == "lionheart", "a real query is trimmed and folded")
+
+    ck(Scan.Matches(helm, "", HEAD, warrior) == true,
+       "EMPTY QUERY LISTS THE SLOT: a head item matches with no search term")
+    ck(Scan.Matches(coif, "", HEAD, warrior) == true, "…and so does every other head item")
+    ck(Scan.Matches(helm, Scan.NormalizeQuery("   "), HEAD, warrior) == true,
+       "…a whitespace-only box is the same empty query, not a failed search")
+    ck(Scan.Matches(robe, "", HEAD, warrior) == false,
+       "…but the slot filter still bites: a robe is not a head item")
+    ck(Scan.Matches(mageOnly, "", HEAD, warrior) == false,
+       "…and so does the usability filter: a mage-only crown stays hidden from a warrior")
+
+    -- there is no minimum length: one character filters, it does not reset to all
+    ck(Scan.Matches(helm, "n", HEAD, warrior) == true, "a one-character query filters")
+    ck(Scan.Matches(coif, "n", HEAD, warrior) == false, "…and it really does exclude")
+    ck(Scan.Matches(helm, "lionheart", HEAD, warrior) == true, "a full name matches")
+    ck(Scan.Matches(helm, "zzzz", HEAD, warrior) == false, "a query that matches nothing yields nothing")
+    ck(Scan.Matches(helm, "helm of", HEAD, warrior) == false,
+       "the query is a plain substring of THIS row's name, not a fuzzy match")
+
+    -- the search is a literal substring, so a Lua pattern character is not magic
+    local plus = row("Test Defense Ring +120")
+    ck(Scan.Matches(plus, "+120", HEAD, warrior) == true,
+       "'+' in the query is literal text, not a Lua pattern quantifier")
+
+    -- degenerate inputs
+    ck(Scan.Matches(nil, "", HEAD, warrior) == false, "a nil row never matches")
+    ck(Scan.Matches(helm, "", nil, warrior) == false,
+       "no slot map means no rows (the picker is always opened FOR a slot)")
+    ck(Scan.Matches(helm, "", {}, warrior) == false, "an empty slot map matches nothing")
+    ck(Scan.Matches(helm, "", HEAD, nil) == true, "with no viewer context nothing is usability-filtered")
+
+    -- 'show unusable' still works through the same predicate…
+    local shown = { class = "WARRIOR", classBit = Scan.CLASS_BIT.WARRIOR,
+                    faction = Scan.FACTION_HORDE, showUnusable = true }
+    ck(Scan.Matches(mageOnly, "", HEAD, shown) == true,
+       "'show unusable' reveals the mage-only crown")
+    -- …but it CANNOT reveal an internal record, because those never reach the index.
+    ck(Scan.IsInternalName("[PH] Brilliant Dawn Cap") == true,
+       "the screenshotted row is an internal record")
+    local src = io.open(P("goalPicker.lua"), "r")
+    ck(src ~= nil, "goalPicker.lua is readable")
+    if src then
+        local s = src:read("*a"); src:close()
+        ck(s:find("if internal then return end") ~= nil,
+           "the index builder drops internal rows before they become entries")
+        ck(s:find("Scan%.IsInternalName") ~= nil,
+           "…deriving the flag for the seed tables, which were never scanned")
+        ck(s:find("Scan%.Matches") ~= nil, "the row filter runs the shared predicate")
+        ck(s:find("Scan%.NormalizeQuery") ~= nil, "…over a normalised query")
+        ck(s:find("internalStamp") ~= nil,
+           "the index cache key includes the denylist stamp, so a pattern fix rebuilds it")
+    end
+end)
+
+----------------------------------------------------------------------
 -- ROW MODEL: the picker tints each result row by item RARITY, using the
 -- suite's quality-color chain rather than a private copy.
 ----------------------------------------------------------------------

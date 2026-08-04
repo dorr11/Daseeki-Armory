@@ -26,9 +26,19 @@
                               credit-limited window, then read name + quality and
                               scan a hidden tooltip once for the restriction lines.
 
-    Only name / quality / classMask / faction are persisted; everything else is
-    re-derived instantly from GetItemInfoInstant at load, which keeps the cache
-    small and immune to client data changes.
+    Only name / quality / classMask / faction / the internal flag are persisted;
+    everything else is re-derived instantly from GetItemInfoInstant at load,
+    which keeps the cache small and immune to client data changes.
+
+    THE ID WALK SWEEPS UP BLIZZARD'S OWN SCAFFOLDING (1.3.1). The client's item
+    space is not the game's item list: it also holds placeholders ("[PH] …"),
+    creature-equipment art ("Monster - Sword, Katana"), designer test gear and
+    retired duplicates. Roughly 12% of everything the walk finds is of that kind
+    and none of it can be obtained by any player, so each record carries an
+    `internal` flag (INTERNAL_PATTERNS, derived from a real 10 504-item cache)
+    and the goal picker's index drops those rows outright. They stay IN the
+    cache so a rescan does not have to re-fight them, and "Show unusable" does
+    not reveal them — see the INTERNAL / UNOBTAINABLE section below.
 
     Published surface:
         Addon.ItemScan            -- the PURE layer (no WoW API at load; harness-gated)
@@ -243,59 +253,212 @@ function Scan.ParseRestrictions(lines, loc)
 end
 
 ----------------------------------------------------------------------
+-- INTERNAL / UNOBTAINABLE ITEM NAMES
+--
+-- The 1..32000 id walk is a walk of the CLIENT's item space, and the client
+-- ships Blizzard's own working records alongside the live game's items:
+-- placeholder art ("[PH] Brilliant Dawn Cap"), creature-equipment records
+-- ("Monster - Sword, Katana"), designer test gear ("Test Glaive A", "90 Epic
+-- Warrior Helm"), retired duplicates ("Deprecated Dented Skullcap") and a
+-- handful of one-off dev scraps. None of them exists on a live realm; no
+-- player can obtain any of them. They are not "unusable" — they are not real —
+-- so "Show unusable" deliberately does NOT reveal them. That tick box is about
+-- items a DIFFERENT character could equip; there is no character, anywhere,
+-- that can equip these.
+--
+-- THE PATTERN LIST IS EVIDENCE-DERIVED, NOT GUESSED. It was built by sweeping a
+-- real completed scan cache (10 504 equippable ids, Era build 68940) and reading
+-- every match; each pattern below is followed by its hit count in that sweep.
+-- 1 263 of the 10 504 (12.0%) are internal; the 9 241 survivors were checked for
+-- collisions against genuine Era names and there are none. Conservatism rule:
+-- letting one placeholder through is cheaper than hiding one real item, so every
+-- pattern is anchored or word-bounded rather than a loose substring.
+--
+-- The near-misses that FORCED the anchoring (all real, all must survive):
+--   "Testament of Hope"        vs  the word "test"      -> %f[%a]test%f[%A]
+--   "Contest Winner's Tabard"  vs  the word "test"      -> ditto
+--   "Old Blanchy's Blanket"    vs  the OLD prefix       -> ^old%a (glued, no space)
+--   "Adept's Cloak"            vs  "dep"                -> ^deprecated / " dep$"
+--   "10 Pound Mud Snapper"     vs  the level templates  -> ^%d+ <quality> %a
+--   "Doomcaller's Footwraps"   vs  "foo"                -> %f[%a]foo%f[%A]
+--
+-- Matching is CASE-INSENSITIVE: every pattern is written lowercase and tested
+-- against name:lower().
+----------------------------------------------------------------------
+
+-- Bump when the pattern list changes; Normalize re-derives every cached flag on
+-- a mismatch, so a pattern fix reaches an existing cache WITHOUT a rescan.
+Scan.INTERNAL_STAMP = 1
+
+Scan.INTERNAL_PATTERNS = {
+    "%[ph%]",              --  79  "[PH] Brilliant Dawn Cap" — Blizzard's placeholder tag
+    "monster %- ",         -- 515  creature-equipment art records (incl. "OLDMonster - …")
+    "%f[%a]test%f[%A]",    -- 248  the WORD test: "Test Glaive A", "JEFF TEST SWORD", "(Test)"
+    "%f[%a]testing%f[%A]", --   4  "Ring of Critical Testing 2"
+    "^testboots",          --   1  "TestBoots - Puffed Mail Green" (glued, so the word misses it)
+    "qatest",              --   1  "QATest +1000 Spell Dmg Ring"
+    "jefftest",            --   1  "Fishing Pole (JEFFTEST)"
+    "%(delete me%)",       --   1  "Shane Test (DELETE ME)" (already caught; kept as intent)
+    "^deprecated ",        -- 219  "Deprecated Dented Skullcap"
+    " deprecated$",        --   7  "Thunderfury, Blessed Blade of the Windseeker DEPRECATED"
+    " dep$",               --   2  "Lok'delar, Stave of the Ancient Keepers DEP"
+    "^old%a",              --  27  "OLDThug Belt" — GLUED prefix; "Old Blunderbuss" is real
+    "%(old%)",             --   4  "(OLD)Medium Throwing Knife"
+    "%f[%a]unused%f[%A]",  --  20  "Unused Feathered Leggings", "…Staff UNUSED", "[UNUSED]"
+    "%(dnd%)",             --   2  "Charm Pouch (DND)"
+    "%f[%a]foo%f[%A]",     --   1  "Twain Random Sword FOO"
+    "^pvp %a+ %a+ %a",     --  12  "PVP Plate Helm Alliance" — the internal set templates
+    -- the "<level> <quality> <spec> <slot>" balance templates. Anchored on the
+    -- QUALITY word, because "<number> <word> …" alone is also how vanilla names
+    -- its fish ("103 Pound Mightfish").
+    "^%d+ epic %a",        --  39  "90 Epic Warrior Helm"
+    "^%d+ green %a",       --  78  "63 Green Rogue Cap"
+    "^%d+ blue %a",        --   0  (not present in the sweep; the family's other colours)
+    "^%d+ purple %a",      --   0
+    "^%d+ white %a",       --   0
+    "^%d+ grey %a",        --   0
+    "^%d+ gray %a",        --   0
+    -- art-variant tokens: a lone letter plus two digits ("Black Leather D02 Boots",
+    -- "Unused Cloth Shoulder A01 Gray"). %f[%a] keeps it a whole token, so
+    -- "TEST GUN Horde50" and "BKP 42 \"Ultra\"" are not what trips it.
+    "%f[%a]%a%d%d ",       --  74  (10 of them caught by nothing else)
+    "%f[%a]%a%d%d$",       --  16
+}
+
+-- -> the pattern that condemned this name, or nil when the name is a real item.
+-- Returning the pattern (not just a boolean) is what lets the harness prove that
+-- every pattern in the list is the one doing the work on its own fixture.
+function Scan.InternalPattern(name)
+    if type(name) ~= "string" or name == "" then return nil end
+    local s = name:lower()
+    for _, p in ipairs(Scan.INTERNAL_PATTERNS) do
+        if s:find(p) then return p end
+    end
+    return nil
+end
+
+function Scan.IsInternalName(name)
+    return Scan.InternalPattern(name) ~= nil
+end
+
+----------------------------------------------------------------------
+-- THE PICKER ROW PREDICATE
+--
+-- Lifted out of goalPicker.lua's local `filtered` so the EMPTY-SEARCH state is
+-- pinned by a test rather than by reading the source.
+--
+-- EMPTY-QUERY VERDICT (owner question, 1.3.1): an empty search box lists EVERY
+-- item that fits the slot and that this character could equip. That is not a
+-- bug and not a min-length gate that failed to fire — it is what the picker has
+-- done since 1.0.0 (the pre-scan picker's own filter read
+-- `query == "" or e.name:find(query)`, and ShowGoalPicker opened with
+-- `filtered("", …)`). The box is a FILTER over a browsable list, not a
+-- required search term, so it stays that way. What was actually wrong is that
+-- the 1.3.0 client scan poured Blizzard's internal records into that browsable
+-- list, so the first rows of it were placeholder junk — which is what the
+-- denylist above removes. No row is ever the "current goal" echoed back; the
+-- picker has never done that.
+--
+-- `query` must already be normalised (Scan.NormalizeQuery); the caller does it
+-- once per keystroke instead of once per row.
+----------------------------------------------------------------------
+function Scan.NormalizeQuery(q)
+    return trim(tostring(q or "")):lower()
+end
+
+function Scan.Matches(e, query, validLoc, ctx)
+    if type(e) ~= "table" then return false end
+    if not (validLoc and validLoc[e.equipLoc]) then return false end
+    if query and query ~= "" and not tostring(e.name or ""):find(query, 1, true) then return false end
+    return Scan.Usable(e, ctx) and true or false
+end
+
+----------------------------------------------------------------------
 -- CACHE CODEC
 --
 -- Layout (SavedVariables):
---   { version, build, ranges, scannedAt, count, autoScanTried,
+--   { version, build, ranges, scannedAt, count, internalCount, internalStamp,
+--     autoScanTried,
 --     names = { [id] = "Corehound Belt" },
 --     meta  = { [id] = packedNumber } }
 --
--- meta packs quality (4 bits) + classMask (12 bits) + faction (2 bits) into a
--- single integer well inside Lua's exact-double range. equipLoc / icon /
--- classID / subclassID are deliberately NOT stored: GetItemInfoInstant answers
--- them offline and instantly for any id, so persisting them would only let the
--- cache go stale against a client data change.
+-- meta packs quality (4 bits) + classMask (12 bits) + faction (2 bits) + the
+-- internal/unobtainable flag (1 bit) into a single integer well inside Lua's
+-- exact-double range. equipLoc / icon / classID / subclassID are deliberately
+-- NOT stored: GetItemInfoInstant answers them offline and instantly for any id,
+-- so persisting them would only let the cache go stale against a client data
+-- change.
+--
+-- The internal bit is the TOP bit, so every meta value written by 1.3.0 (which
+-- had no such bit) reads back as internal=false — an old cache is stale, not
+-- corrupt, and Normalize re-derives it in place rather than forcing a rescan.
 ----------------------------------------------------------------------
 Scan.CACHE_VERSION = 1
 
 local Q_BITS, M_BITS = 16, 4096      -- quality < 16, classMask < 4096
 local F_SHIFT = Q_BITS * M_BITS      -- 65536
+local I_SHIFT = F_SHIFT * 4          -- 262144
 
-function Scan.PackMeta(quality, classMask, faction)
+function Scan.PackMeta(quality, classMask, faction, internal)
     local q = math.floor(tonumber(quality)   or 0)
     local m = math.floor(tonumber(classMask) or 0)
     local f = math.floor(tonumber(faction)   or 0)
     if q < 0 then q = 0 elseif q > Q_BITS - 1 then q = Q_BITS - 1 end
     if m < 0 then m = 0 elseif m > M_BITS - 1 then m = M_BITS - 1 end
     if f < 0 then f = 0 elseif f > 3 then f = 3 end
-    return q + m * Q_BITS + f * F_SHIFT
+    return q + m * Q_BITS + f * F_SHIFT + (internal and I_SHIFT or 0)
 end
 
+-- -> quality, classMask, faction, internal(boolean)
 function Scan.UnpackMeta(n)
     n = math.floor(tonumber(n) or 0)
     if n < 0 then n = 0 end
     local q = n % Q_BITS
     local m = math.floor(n / Q_BITS) % M_BITS
     local f = math.floor(n / F_SHIFT) % 4
-    return q, m, f
+    local i = math.floor(n / I_SHIFT) % 2 == 1
+    return q, m, f, i
 end
 
 function Scan.NewCache()
-    return { version = Scan.CACHE_VERSION, names = {}, meta = {}, count = 0 }
+    return { version = Scan.CACHE_VERSION, names = {}, meta = {}, count = 0,
+             internalCount = 0, internalStamp = Scan.INTERNAL_STAMP }
 end
 
 -- Bind / repair a table that came back off disk. A version bump discards the old
 -- payload rather than trying to migrate it — the cache is a derived artefact and
 -- a rescan rebuilds it, so there is nothing of the user's to lose.
+--
+-- The internal flag is re-derived here whenever the cache's internalStamp does
+-- not match the current pattern list. That is the whole reason the flag is a
+-- cheap derived bit rather than a rescan trigger: a placeholder the denylist
+-- learns about tomorrow is filtered on the NEXT LOGIN of an existing cache,
+-- with no minute-long walk of the id space, and a rescan re-derives it anyway
+-- (Scan.Put reads the name), so the two paths can never disagree.
 function Scan.Normalize(cache)
     if type(cache) ~= "table" or cache.version ~= Scan.CACHE_VERSION then
         return Scan.NewCache()
     end
     if type(cache.names) ~= "table" then cache.names = {} end
     if type(cache.meta)  ~= "table" then cache.meta  = {} end
-    local n = 0
-    for _ in pairs(cache.names) do n = n + 1 end
-    cache.count = n
+
+    local restamp = cache.internalStamp ~= Scan.INTERNAL_STAMP
+    local n, internal = 0, 0
+    for id, nm in pairs(cache.names) do
+        n = n + 1
+        local flag
+        if restamp then
+            local q, m, f = Scan.UnpackMeta(cache.meta[id])
+            flag = Scan.IsInternalName(nm)
+            cache.meta[id] = Scan.PackMeta(q, m, f, flag)
+        else
+            flag = select(4, Scan.UnpackMeta(cache.meta[id]))
+        end
+        if flag then internal = internal + 1 end
+    end
+    cache.count         = n
+    cache.internalCount = internal
+    cache.internalStamp = Scan.INTERNAL_STAMP
     return cache
 end
 
@@ -307,18 +470,21 @@ function Scan.Put(cache, id, name, quality, classMask, faction)
     cache.meta  = cache.meta  or {}
     if cache.names[id] == nil then cache.count = (cache.count or 0) + 1 end
     cache.names[id] = name
-    cache.meta[id]  = Scan.PackMeta(quality, classMask, faction)
+    -- The internal flag is DERIVED, never passed in: the name is the only
+    -- evidence there is, so a rescan cannot lose the flag and a caller cannot
+    -- disagree with the denylist.
+    cache.meta[id]  = Scan.PackMeta(quality, classMask, faction, Scan.IsInternalName(name))
     return true
 end
 
--- -> name, quality, classMask, faction   (nil when the id was never scanned)
+-- -> name, quality, classMask, faction, internal   (nil when the id was never scanned)
 function Scan.Get(cache, id)
     if type(cache) ~= "table" or type(cache.names) ~= "table" then return nil end
     id = tonumber(id)
     local nm = id and cache.names[id]
     if not nm then return nil end
-    local q, m, f = Scan.UnpackMeta(cache.meta and cache.meta[id])
-    return nm, q, m, f
+    local q, m, f, i = Scan.UnpackMeta(cache.meta and cache.meta[id])
+    return nm, q, m, f, i
 end
 
 -- True once a scan has run to completion at least once on this account.
@@ -784,20 +950,27 @@ function Addon:FinishItemScan()
     cache.ranges    = Scan.RangesLabel(st.ranges)
     cache.build     = select(2, GetBuildInfo())
     cache.autoScanTried = nil        -- a completed scan re-arms the auto path for a future reset
-    local n, restricted = 0, 0
+    local n, restricted, internal = 0, 0, 0
     for id in pairs(cache.names) do
         n = n + 1
-        local _, m, f = Scan.UnpackMeta(cache.meta[id])
-        if m > 0 or f ~= Scan.FACTION_NONE then restricted = restricted + 1 end
+        local _, m, f, i = Scan.UnpackMeta(cache.meta[id])
+        if i then internal = internal + 1
+        elseif m > 0 or f ~= Scan.FACTION_NONE then restricted = restricted + 1 end
     end
-    cache.count = n
+    cache.count         = n
+    cache.internalCount = internal
+    cache.internalStamp = Scan.INTERNAL_STAMP
 
     -- the picker's index is derived from the cache; force a rebuild
     Addon.GoalItemDB, Addon._goalDBStamp = nil, nil
 
     local secs = Scan.FormatDuration(GetTime() - st.started) or "?"
-    print(string.format("%s item scan complete — %d equippable items cached (%d restricted) in %s.%s",
-        Addon:Tag(), n, restricted, secs,
+    -- The internal count is reported, not hidden: the owner should be able to see
+    -- that ~12% of what the client holds is Blizzard's own scaffolding, and that
+    -- Armory kept it out of the picker on purpose.
+    print(string.format("%s item scan complete — %d equippable items cached (%d restricted, "
+        .. "%d internal/unobtainable hidden) in %s.%s",
+        Addon:Tag(), n - internal, restricted, internal, secs,
         st.failed > 0 and (" " .. st.failed .. " could not be loaded.") or ""))
 
     if st.onDone then st.onDone(cache, st, false) end

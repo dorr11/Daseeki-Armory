@@ -22,6 +22,15 @@
     armor/weapon proficiency — are hidden by default; "Show unusable" in the footer
     turns the filter off for edge cases.
 
+    Rows that are not ITEMS at all — Blizzard's placeholders, creature-equipment art,
+    designer test gear, retired duplicates — never enter the index (Scan.IsInternalName /
+    the cached internal flag). "Show unusable" does NOT bring them back: they are not
+    unusable, they are not real, and no character anywhere can obtain one.
+
+    An EMPTY search box lists the whole slot (browse mode), exactly as it has since
+    1.0.0. There is no minimum query length and no row is ever the current goal echoed
+    back; see Scan.Matches in itemScan.lua.
+
     Addon:ShowGoalPicker(slotId, onPick)   -- onPick(itemId)
 --]]
 
@@ -54,12 +63,22 @@ end
 -- Rebuilt whenever the scan cache changes (stamp = completion time + item count).
 function Addon:BuildGoalItemDB()
     local cache = Addon:ItemScanCache()
+    -- the denylist stamp is part of the key: growing INTERNAL_PATTERNS must rebuild
+    -- the index, not wait for the next scan.
     local stamp = tostring(cache.scannedAt or 0) .. "/" .. tostring(cache.count or 0)
+                  .. "/" .. tostring(cache.internalStamp or 0)
     if Addon.GoalItemDB and Addon._goalDBStamp == stamp then return Addon.GoalItemDB end
 
     local list, byId = {}, {}
-    local function add(id, name, quality, classMask, faction, scanned)
+    -- `internal` is the cached flag when the caller has one (the scan already
+    -- derived it) and nil for the seed tables, where it is derived here. Internal
+    -- rows never enter the index at ALL, which is why "Show unusable" cannot
+    -- reveal them: that tick box is about items some OTHER character could equip,
+    -- and these are not items — they are Blizzard's placeholders and test records.
+    local function add(id, name, quality, classMask, faction, scanned, internal)
         if not id or byId[id] or type(name) ~= "string" or name == "" then return end
+        if internal == nil then internal = Scan.IsInternalName(name) end
+        if internal then return end
         local _, _, _, equipLoc, icon, classID, subclassID = GetItemInfoInstant(id)
         if not (icon and equipLoc and equipLoc ~= "" and equipLoc ~= "INVTYPE_NON_EQUIP") then return end
         local e = {
@@ -74,8 +93,8 @@ function Addon:BuildGoalItemDB()
 
     -- 1 — the scan (authoritative)
     for id in pairs(cache.names) do
-        local nm, q, m, f = Scan.Get(cache, id)
-        add(id, nm, q, m, f, true)
+        local nm, q, m, f, internal = Scan.Get(cache, id)
+        add(id, nm, q, m, f, true, internal)
     end
 
     -- 2 — the bundled seed, for anything the scan has not covered yet
@@ -127,13 +146,15 @@ local function qualityOf(e)
     return q
 end
 
+-- EMPTY SEARCH BOX = BROWSE THE WHOLE SLOT. Unchanged since 1.0.0 and kept
+-- deliberately: the box filters a browsable list, it is not a required search
+-- term, and there is no minimum length. The row predicate itself now lives in
+-- itemScan.lua (Scan.Matches) so that promise is pinned by the harness.
 local function filtered(query, validLoc, ctx)
-    query = strtrim((query or "")):lower()
+    query = Scan.NormalizeQuery(query)
     local out = {}
     for _, e in ipairs(Addon:BuildGoalItemDB()) do
-        if validLoc[e.equipLoc]
-           and (query == "" or e.name:find(query, 1, true))
-           and Scan.Usable(e, ctx) then
+        if Scan.Matches(e, query, validLoc, ctx) then
             out[#out + 1] = e
         end
     end
