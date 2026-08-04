@@ -446,11 +446,33 @@ end
 ----------------------------------------------------------------------
 Scan.CACHE_VERSION = 1
 
--- Bump when the RESTRICTION CAPTURE changes (as opposed to the denylist).
--- Normalize flags every real row unread on a mismatch, which is how a cache
--- written by a scan whose tooltip pass could silently read nothing gets repaired
--- without a full id walk. 1 = the first capture we are prepared to believe.
-Scan.RESTRICT_STAMP = 1
+-- Bump when the RESTRICTION CAPTURE changes (as opposed to the denylist) — OR
+-- when a shipped build could have CONSUMED the unread flags without writing back
+-- the locks they stood for. Normalize flags every real row unread on a mismatch,
+-- which is how a cache written by a scan whose tooltip pass could silently read
+-- nothing gets repaired without a full id walk.
+--
+--   1  the first capture we were prepared to believe.
+--   2  THE FORCING BUMP. The first cut of the repair pass latched its one-shot
+--      BEFORE the pass had started and burned all three tooltip tries inside a
+--      single frame, so on every cache it touched it cleared the unread flags
+--      while writing nothing back. Those caches now say "nothing is owed" — 0
+--      unread, a "last repair" line, capture stamp 1 — and the FIXED pipeline
+--      would therefore never run on them again, in silence, for ever. The unread
+--      flags are the only record of the debt and they were spent, so the stamp
+--      is the only thing left that can re-arm them.
+--
+--      What the bump costs each cache state, on the next login:
+--        consumed  every real row is re-flagged and one repair pass is owed —
+--                  round one's mechanism, now on machinery that works.
+--        repaired  the same, for a cache whose repair was healthy: one redundant
+--                  re-read. Its locks survive the migration untouched (Normalize
+--                  rewrites the flag bit only), so the picker is correct the
+--                  whole time; the pass merely reads them again.
+--        rescanned a scan that COMPLETES under this build is stamped 2 by
+--                  FinishItemScan, so it is never re-flagged and no repair
+--                  follows it.
+Scan.RESTRICT_STAMP = 2
 
 local Q_BITS, M_BITS = 16, 4096      -- quality < 16, classMask < 4096
 local F_SHIFT = Q_BITS * M_BITS      -- 65536

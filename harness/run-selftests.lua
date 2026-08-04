@@ -3425,6 +3425,290 @@ suite("item-scan-auto-arm", function(ck)
 end)
 
 ----------------------------------------------------------------------
+-- THE CAPTURE-STAMP RE-ARM  (1.3.1, the forcing bump)
+--
+-- THE SITUATION (owner's live /darmory scanstatus, capture stamp 1):
+--     restrictions: 833 class-locked, 0 still unread
+--     last repair:  11:06 — 0 locked, 0 unreadable
+-- The first cut of the repair pass latched its one-shot before the pass had
+-- started and burned all three tooltip tries inside a single frame. It therefore
+-- SPENT the unread flags — the only record that a re-read was owed — without
+-- writing back the locks they stood for. A cache in that state is indistinguishable,
+-- to the fixed pipeline, from a cache that has nothing left to do: UnreadCount is
+-- 0, so MaybeRepairRestrictions declines, silently, on every future login.
+--
+-- The flags cannot re-arm themselves. Scan.RESTRICT_STAMP is the one thing left
+-- that can: Normalize re-flags every real row on a stamp mismatch, which is the
+-- exact mechanism the 1.3.0 -> 1.3.1 migration used, so bumping the constant runs
+-- round one again on machinery that now works.
+--
+-- This suite pins the re-arm on the three cache states an upgrader can be in.
+----------------------------------------------------------------------
+suite("item-scan-capture-restamp", function(ck)
+    if type(Scan) ~= "table" then ck(false, "itemScan.lua did not load"); return end
+
+    ck(Scan.RESTRICT_STAMP == 2,
+       "the capture stamp has MOVED (got " .. tostring(Scan.RESTRICT_STAMP)
+       .. ") — nothing below can re-arm a consumed cache without it")
+
+    local ROGUE = Scan.CLASS_BIT.ROGUE
+    local MAGE  = Scan.CLASS_BIT.MAGE + Scan.CLASS_BIT.PRIEST
+                + Scan.CLASS_BIT.WARLOCK + Scan.CLASS_BIT.DRUID
+
+    -- The owner's cache in miniature, written through the real codec: one row
+    -- whose lock WAS read, one Atiesh whose lock was lost, one unrestricted row,
+    -- one internal row. `stamp` is what the cache carries off disk; `atieshMask`
+    -- is 0 for the consumed state and the true lock for the healthy one. Every
+    -- row is flagged READ — that is the poisoning.
+    local function ownerCache(stamp, atieshMask)
+        local c = Scan.NewCache()
+        Scan.Put(c, 16905, "Bloodfang Chestpiece",              4, ROGUE, 0, false)
+        Scan.Put(c, 22589, "Atiesh, Greatstaff of the Guardian", 5, atieshMask or 0, 0, false)
+        Scan.Put(c, 9425,  "Pendulum of Doom",                   4, 0, 0, false)
+        Scan.Put(c, 13789, "[PH] Brilliant Dawn Cap",            1, 0, 0, false)   -- internal
+        c.scannedAt          = 1785862751
+        c.restrictStamp      = stamp
+        c.restrictRepairedAt = 1785899160          -- the 11:06 line on his report
+        c.restrictLocked, c.restrictUnreadable = 0, 0
+        return c
+    end
+
+    -- ── THE POISONED STATE, stated exactly ──────────────────────────────────
+    -- On the CURRENT stamp a consumed cache is dead to the repair. This is not a
+    -- defect in Normalize or in MaybeRepairRestrictions — both are behaving —
+    -- it is why the constant had to move.
+    local dead = ownerCache(Scan.RESTRICT_STAMP, 0)
+    ck(Scan.UnreadCount(dead) == 0, "a consumed cache believes nothing is owed")
+    local deadN = Scan.Normalize(dead)
+    ck(deadN.unreadCount == 0,
+       "…and a login on the SAME stamp re-flags nothing — the debt is unrecoverable from the flags")
+    ck(#Scan.UnreadIds(deadN) == 0, "…so the repair queue is empty and no pass can start")
+    ck(select(3, Scan.Get(deadN, 22589)) == 0,
+       "…while Atiesh still carries no class lock: the picker keeps offering it to a warrior")
+
+    -- ── (a) THE POISONED CACHE, re-armed by the bump ────────────────────────
+    local poisoned = ownerCache(1, 0)                      -- off disk on the OLD stamp
+    ck(poisoned.restrictStamp ~= Scan.RESTRICT_STAMP, "(a) the poisoned cache is on the old capture stamp")
+    local a = Scan.Normalize(poisoned)
+    ck(a.restrictStamp == Scan.RESTRICT_STAMP, "(a) the login migration re-stamps it to the current capture")
+    ck(a.unreadCount == 3,
+       "…having re-flagged every REAL row unread (got " .. tostring(a.unreadCount) .. " of 3)")
+    ck(select(6, Scan.Get(a, 13789)) == false,
+       "…and left the internal row out of it: nothing ever asks it for a class lock")
+    ck(a.count == 4, "…keeping every row (no rescan is demanded of him)")
+    ck(select(3, Scan.Get(a, 16905)) == ROGUE,
+       "…and preserving the locks it DID hold — the migration rewrites the flag bit, not the mask")
+    local q = Scan.UnreadIds(a)
+    ck(#q == 3 and q[1] == 9425 and q[2] == 16905 and q[3] == 22589,
+       "…so the repair queue is the three real rows, in id order")
+
+    -- ── (b) A HEALTHY e145ecb REPAIR: one redundant re-read, no loss ────────
+    local healthy = ownerCache(1, MAGE)                    -- its repair DID land the locks
+    local b = Scan.Normalize(healthy)
+    ck(b.unreadCount == 3,
+       "(b) a cache whose repair was HEALTHY is re-queued too — one redundant re-read is the price")
+    ck(select(3, Scan.Get(b, 22589)) == MAGE,
+       "…but it carries its correct locks through the migration untouched")
+    ck(select(3, Scan.Get(b, 16905)) == ROGUE, "…every one of them")
+    -- and that is what makes the redundant pass harmless: the picker is right the
+    -- whole time it runs, so the owner sees no regression while it re-reads
+    local warrior = { class = "WARRIOR", classBit = Scan.CLASS_BIT.WARRIOR,
+                      faction = Scan.FACTION_NONE, showUnusable = false }
+    local row = { id = 22589, name = "atiesh", display = "Atiesh",
+                  equipLoc = "INVTYPE_2HWEAPON",
+                  classID = Scan.ITEM_CLASS_WEAPON, subclassID = 10,
+                  classMask = select(3, Scan.Get(b, 22589)), faction = Scan.FACTION_NONE }
+    ck(Scan.Matches(row, "", { INVTYPE_2HWEAPON = true }, warrior) == false,
+       "…so a warrior's list still drops Atiesh WHILE the redundant pass is running")
+
+    -- ── (c) A CACHE WRITTEN BY THIS BUILD IS NEVER RE-FLAGGED ───────────────
+    local fresh = Scan.NewCache()
+    Scan.Put(fresh, 16905, "Bloodfang Chestpiece", 4, ROGUE, 0, false)
+    Scan.Put(fresh, 22589, "Atiesh, Greatstaff of the Guardian", 5, MAGE, 0, false)
+    fresh.scannedAt = 1785999999
+    ck(fresh.restrictStamp == Scan.RESTRICT_STAMP, "(c) a cache built by THIS build carries the current stamp")
+    local cN = Scan.Normalize(fresh)
+    ck(cN.unreadCount == 0, "…so the next login re-flags nothing")
+    ck(Scan.UnreadCount(cN) == 0, "…and owes no repair pass at all")
+    ck(select(3, Scan.Get(cN, 22589)) == MAGE, "…with the locks its own tooltips read left alone")
+    -- a genuine failure inside that scan is still owed, and only it
+    Scan.Put(cN, 9425, "Pendulum of Doom", 4, 0, 0, true)
+    local cN2 = Scan.Normalize(cN)
+    ck(cN2.unreadCount == 1 and Scan.UnreadIds(cN2)[1] == 9425,
+       "…while a row whose tooltip genuinely refused is queued, and it alone")
+
+    ----------------------------------------------------------------------
+    -- BEHAVIOURAL: drive the real login -> picker-open path, all three states.
+    -- itemScan.lua touches the WoW API only from inside functions, so the whole
+    -- pipeline runs headlessly against stubs. The scan RUNNER is never ticked —
+    -- what is under test is which passes start, and what gets stamped.
+    ----------------------------------------------------------------------
+    local function scanEnv()
+        local A = {}
+        local fnc, e = loadfile(P("itemScan.lua"))
+        if not fnc then return nil, "compile: " .. tostring(e) end
+        local okl, el = pcall(fnc, "Daseeki-Armory", A)
+        if not okl then return nil, "load: " .. tostring(el) end
+        A.Tag  = function() return "[Armory]" end
+        A.Wrap = function(_, _, s) return s end
+        return A
+    end
+
+    local NIL  = {}
+    local KEYS = { "CreateFrame", "GetTime", "GetBuildInfo", "time", "UnitClass",
+                   "print", "UIParent", "C_Item", "DaseekiArmoryScanDB" }
+    local function withStubs(fn)
+        local saved = {}
+        for _, k in ipairs(KEYS) do
+            local v = _G[k]
+            saved[k] = (v == nil) and NIL or v
+        end
+        local frame = {}
+        function frame:Hide() end
+        function frame:Show() end
+        function frame:SetScript() end
+        function frame:RegisterEvent() end
+        function frame:UnregisterAllEvents() end
+        _G.CreateFrame   = function() return frame end
+        _G.GetTime       = function() return 1000 end
+        _G.GetBuildInfo  = function() return "1.15.7", "60111" end
+        _G.time          = function() return 1786000000 end
+        _G.UnitClass     = function() return "Warrior", "WARRIOR" end
+        _G.UIParent      = frame
+        _G.C_Item        = nil
+        _G.print         = function() end
+        local packed = { pcall(fn) }
+        for _, k in ipairs(KEYS) do
+            local v = saved[k]
+            _G[k] = (v ~= NIL) and v or nil
+        end
+        return unpack(packed)
+    end
+
+    -- (a) poisoned cache: login normalises it, the picker's call starts a pass
+    local A1 = scanEnv()
+    ck(A1 ~= nil, "a headless itemScan environment loads with no WoW API present")
+    if A1 then
+        local sv = ownerCache(1, 0)
+        local ok, started, queued, owed = withStubs(function()
+            _G.DaseekiArmoryScanDB = sv
+            A1:ItemScanCache()                       -- LOGIN: the migration runs here
+            local n = Scan.UnreadCount(sv)
+            local s = A1:MaybeRepairRestrictions()   -- PICKER OPEN
+            local st = A1:ItemScanStatus()
+            A1:StopItemScan()
+            return s, st and st.total or -1, n
+        end)
+        ck(ok == true, "(a) the poisoned cache drives the real login->picker path (" .. tostring(started) .. ")")
+        ck(owed == 3, "(a) login leaves three rows owed again (got " .. tostring(owed) .. ")")
+        ck(started == true, "(a) THE FORCING FIX: a repair pass starts on the owner's own cache state")
+        ck(queued == 3, "…queued with exactly the re-flagged rows (got " .. tostring(queued) .. ")")
+        ck(sv.restrictStamp == Scan.RESTRICT_STAMP, "…and the cache is on the new stamp on disk")
+    end
+
+    -- the counterfactual: the SAME cache already on the current stamp starts nothing
+    local A0 = scanEnv()
+    if A0 then
+        local sv0 = ownerCache(Scan.RESTRICT_STAMP, 0)
+        local ok0, started0 = withStubs(function()
+            _G.DaseekiArmoryScanDB = sv0
+            A0:ItemScanCache()
+            local s = A0:MaybeRepairRestrictions()
+            A0:StopItemScan()
+            return s
+        end)
+        ck(ok0 == true, "the counterfactual runs")
+        ck(started0 == false,
+           "WITHOUT the bump the same consumed cache starts nothing — that is the bug being forced open")
+    end
+
+    -- (b) healthy cache: one pass, and its locks are intact going into it
+    local A2 = scanEnv()
+    if A2 then
+        local sv2 = ownerCache(1, MAGE)
+        local ok2, started2, mask = withStubs(function()
+            _G.DaseekiArmoryScanDB = sv2
+            A2:ItemScanCache()
+            local s = A2:MaybeRepairRestrictions()
+            A2:StopItemScan()
+            return s, select(3, Scan.Get(sv2, 22589))
+        end)
+        ck(ok2 == true, "(b) the healthy cache drives the same path")
+        ck(started2 == true, "(b) …and pays one redundant re-read (accepted, not a defect)")
+        ck(mask == MAGE, "…with every lock it already held still in the cache")
+    end
+
+    -- (c) a FULL rescan finishing under this build stamps itself, and is not
+    --     followed by a repair — the owner's manual rescan must be the end of it
+    local A3 = scanEnv()
+    if A3 then
+        local sv3 = Scan.NewCache()
+        sv3.restrictStamp = 1                        -- it began life poisoned
+        local ok3, stamp, scanned, unread, after = withStubs(function()
+            _G.DaseekiArmoryScanDB = sv3
+            local cache = A3:ItemScanCache()         -- login: re-flagged (nothing in it yet)
+            A3:StartItemScan()                       -- the owner's Rescan Items
+            Scan.Put(cache, 16905, "Bloodfang Chestpiece", 4, ROGUE, 0, false)
+            Scan.Put(cache, 22589, "Atiesh, Greatstaff of the Guardian", 5, MAGE, 0, false)
+            A3:FinishItemScan()                      -- …runs to completion
+            local s = A3:MaybeRepairRestrictions()   -- picker opens afterwards
+            A3:StopItemScan()
+            return cache.restrictStamp, cache.scannedAt, cache.unreadCount, s
+        end)
+        ck(ok3 == true, "(c) a full scan runs to completion headlessly (" .. tostring(stamp) .. ")")
+        ck(stamp == Scan.RESTRICT_STAMP,
+           "(c) FinishItemScan stamps a COMPLETED FULL SCAN with the current capture (got "
+           .. tostring(stamp) .. ")")
+        ck(scanned == 1786000000, "…and marks it complete")
+        ck(unread == 0, "…with nothing left unread — its own tooltips were read")
+        ck(after == false,
+           "(c) …so his manual rescan is NOT followed by a pointless repair pass")
+        ck(Scan.Normalize(sv3).unreadCount == 0, "…and the NEXT login re-flags nothing either")
+    end
+
+    -- and the repair path stamps too, so a completed repair is terminal
+    local A4 = scanEnv()
+    if A4 then
+        local sv4 = ownerCache(1, 0)
+        local ok4, stamp4, repaired, unread4 = withStubs(function()
+            _G.DaseekiArmoryScanDB = sv4
+            local cache = A4:ItemScanCache()
+            A4:MaybeRepairRestrictions()
+            for _, id in ipairs({ 9425, 16905, 22589 }) do          -- the pass reads them
+                local nm, qq = Scan.Get(cache, id)
+                Scan.Put(cache, id, nm, qq, id == 22589 and MAGE or 0, 0, false)
+            end
+            A4:FinishItemScan()
+            return cache.restrictStamp, cache.restrictRepairedAt, cache.unreadCount
+        end)
+        ck(ok4 == true, "a finished repair pass runs headlessly")
+        ck(stamp4 == Scan.RESTRICT_STAMP, "…and carries the current capture stamp")
+        ck(repaired == 1786000000, "…records when it ran")
+        ck(unread4 == 0, "…and leaves nothing owed")
+        ck(sv4.restrictLocked == 1 and sv4.restrictUnreadable == 0,
+           "…with the result persisted for /darmory scanstatus to read back")
+        ck(Scan.Normalize(sv4).unreadCount == 0, "…so the next login does not repeat it")
+    end
+
+    -- ── source contract: the comparison is against the CONSTANT ─────────────
+    local fh = io.open(P("itemScan.lua"), "r")
+    ck(fh ~= nil, "itemScan.lua is readable")
+    if fh then
+        local s = fh:read("*a"); fh:close()
+        ck(s:find("Scan%.RESTRICT_STAMP%s*=%s*2") ~= nil,
+           "the capture constant is at 2 in the source")
+        ck(s:find("cache%.restrictStamp%s*~=%s*Scan%.RESTRICT_STAMP") ~= nil,
+           "Normalize compares against the CONSTANT, so the next bump needs one edit and no other")
+        ck(s:find("restrictStamp%s*~=%s*1") == nil and s:find("restrictStamp%s*==%s*1") == nil,
+           "…and nothing anywhere tests the stamp against a literal")
+        ck(s:find("if reread%s+then unflag = not flag end") ~= nil,
+           "a stamp mismatch re-flags every non-internal row unread")
+        ck(s:find("cache%.unreadCount%s*=%s*unread%s*\n%s*cache%.restrictStamp%s*=%s*Scan%.RESTRICT_STAMP") ~= nil,
+           "FinishItemScan stamps in the UNCONDITIONAL recount block, so a full scan records it too")
+    end
+end)
+
+----------------------------------------------------------------------
 -- Every shipped file compiles (loadfile gate)
 ----------------------------------------------------------------------
 suite("loadfile-all-files", function(ck)

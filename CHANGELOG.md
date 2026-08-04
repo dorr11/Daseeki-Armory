@@ -72,6 +72,12 @@
   background — names, rarities and everything else in your cache are left alone, and you
   can keep using the picker while it runs. It happens once.
 
+- **…and that repair re-arms itself for the caches an earlier build skipped in silence.**
+  A first cut of the repair pass could tick every item off its own to-do list without
+  writing back the class locks it was supposed to read, leaving a cache that reports
+  nothing owed and would never be repaired again. Updating re-queues those caches once,
+  so the pass runs on the fixed code; a scan that completed on this version is left alone.
+
 - **The picker no longer shows an item under the wrong name.** Armory merges your
   client's own scan with a bundled name list, the client always winning. Dropping an
   entry as a Blizzard placeholder used to release its id back to the bundled list, which
