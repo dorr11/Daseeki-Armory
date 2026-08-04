@@ -5,9 +5,17 @@
         /darmory widget     toggle the on-screen set switcher
         /darmory list       print this character's sets
         /darmory stats      toggle the stats panel attached to the character window
+        /darmory scanstatus what the item scan knows, right now
 
     `stats` exists so the attach setting stays reachable when Daseeki-Core is absent
     (the options hub needs Core; this command does not).
+
+    `scanstatus` exists because the scan and the restriction-repair pass announce
+    themselves in chat exactly once and then scroll away. "Is it still running?",
+    "did the repair read anything?" and "how many rows are still unread?" are
+    questions with real answers sitting in the cache, so they are queryable rather
+    than something the owner has to have witnessed. The lines come from
+    Scan.StatusReport, which is pure and harness-gated.
 --]]
 
 local _, Addon = ...
@@ -39,6 +47,17 @@ SlashCmdList["DASEEKIARMORY"] = function(msg)
             msg = "stats panel needs Daseeki-Core — setting is on, but nothing will show."
         end
         print(Addon:Tag() .. " " .. msg)
+        return
+    elseif cmd == "scanstatus" or cmd == "scan" then
+        local Scan = Addon.ItemScan
+        if not (Scan and Scan.StatusReport) then
+            print(Addon:Tag() .. " item scan module is not loaded.")
+            return
+        end
+        print(Addon:Tag() .. " item scan status:")
+        for _, line in ipairs(Scan.StatusReport(Addon:ItemScanCache(), Addon:ItemScanStatus())) do
+            print("  " .. line)
+        end
         return
     elseif cmd == "list" then
         local sets = Addon:GetSetsSorted()

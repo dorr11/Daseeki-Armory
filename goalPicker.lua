@@ -7,7 +7,8 @@
       1. the SCANNED cache (itemScan.lua / DaseekiArmoryScanDB) — real client names,
          real qualities, and the class/faction locks read off each item's tooltip;
       2. the bundled AtlasLoot-derived name table (itemDB.lua) as the seed/fallback
-         while no scan has completed, with itemDB's ItemClassMask as its lock source;
+         ONLY WHILE NO SCAN HAS COMPLETED, with itemDB's ItemClassMask as its lock
+         source (see SEED RETIREMENT below);
       3. the vanilla PvP rank-set ids (pvpItems.lua), whose names only exist at runtime.
 
     Icons and equip locations always come from GetItemInfoInstant (synchronous,
@@ -33,9 +34,39 @@
     location. The bundled seed is an AtlasLoot snapshot whose ids do not all agree
     with this client, so it may only speak for ids the scan never saw.
 
+    SEED RETIREMENT (1.3.1). Once a scan has COMPLETED, the seed is not consulted at
+    all. The id walk is GetItemInfoInstant over the client's own item space, so it is
+    ground truth for what this client knows: an id the completed scan never found is
+    an id the client does not have, and no character on this realm can obtain it. The
+    seed's leftovers are not "items the scan missed", they are ids that mean something
+    else (or nothing) here. Census against the owner's real completed cache (10 504 ids,
+    Era build 68940): 1 889 of the bundled 5 289 rows have no id in this client at all.
+    95 of those sit ABOVE the scanned range entirely — Wrath and Cataclysm gear
+    (Wrathful Gladiator's Tabard, Tabard of the Argent Crusade, Gilneas Tabard), the TBC
+    city tabards (Exodar, Silvermoon City), TBC holiday gear (Hallowed Helm, Swift
+    Brewfest Ram) and 24 AtlasLoot SECTION HEADINGS ("Warrior", "Rogue", "Mage") parked
+    on 300000-325000 ids. The seed therefore exists for exactly one purpose: naming rows
+    before the first scan finishes. Addon.GoalSeedAllowed(cache) is that rule, pure and
+    harness-gated.
+
+    NOTE what seed retirement does NOT do: ids 18582-18584 (The Twin Blades of
+    Azzinoth, both Warglaives), 22736 (Andonisus) and 23054 (Gressil) ARE in this
+    client's item space and the scan finds them, so they stay. They are unobtainable
+    by history, not by client data, and this addon does not keep a hand-written list
+    of what Blizzard has retired.
+
     The class/faction locks the scan could not read are re-read lazily the first time
     the picker opens in a session (Addon:MaybeRepairRestrictions) — a throttled pass
-    over only the flagged rows, no rescan, no id walk.
+    over only the flagged rows, no rescan, no id walk. When that pass finishes it
+    calls Addon:RefreshGoalPicker, so a repaired class lock reaches an OPEN picker
+    immediately instead of waiting for the next time it is opened.
+
+    SCROLL POSITION SURVIVES A REFRESH (1.3.1). A background refresh — item names
+    streaming in, the repair pass finishing — re-filters the list under the reader.
+    It must not throw them back to the top; Rows.NextOffset keeps the current offset,
+    clamped to the new list. A refresh the READER asked for (a new query, toggling
+    "Show unusable", opening the picker) does go back to the top, because row 400 of
+    the previous list means nothing in the new one.
 
     An EMPTY search box lists the whole slot (browse mode), exactly as it has since
     1.0.0. There is no minimum query length and no row is ever the current goal echoed
@@ -99,6 +130,24 @@ function Rows.ClampOffset(offset, n)
     return offset
 end
 
+-- WHERE A REFRESH LANDS.
+--
+-- RefreshList used to be reached only through Requery, and Requery always wrote
+-- `self._offset = 0`. Every background refresh therefore yanked the reader back
+-- to row 1 — and during the restriction-repair pass those refreshes arrive in a
+-- stream (each visible row asks the client to load its item so it can be tinted,
+-- every reply raises GET_ITEM_INFO_RECEIVED, and the debounced handler re-queried),
+-- so the list was unscrollable for as long as the repair ran.
+--
+--   preserve = true   a refresh nobody asked for: keep the reader where they are,
+--                     clamped, because the list may have got shorter under them
+--   preserve = false  a refresh the reader asked for (new query, filter toggle,
+--                     a fresh open): the old position has no meaning, go to the top
+function Rows.NextOffset(prevOffset, newCount, preserve)
+    if not preserve then return 0 end
+    return Rows.ClampOffset(prevOffset, newCount)
+end
+
 -- Which result index each of the VISIBLE rows shows at this offset; false for a
 -- row that must be hidden. Always exactly ROWS entries — the list is a fixed
 -- pool, so every refresh has to say something about every row in it.
@@ -137,6 +186,22 @@ end
 local function seedClassMask(id)
     local m = Addon.ItemClassMask and Addon.ItemClassMask[id]
     return tonumber(m) or 0
+end
+
+-- ── SEED RETIREMENT ───────────────────────────────────────────────────────────
+-- May the bundled AtlasLoot table speak at all? Only before a scan has completed.
+--
+-- The scan is a GetItemInfoInstant walk of ids 1..32000 — a purely local lookup
+-- against the client's own item database — so a completed scan is an exhaustive
+-- census of what this client knows. An id it never found is an id this client
+-- does not have; a name the seed offers for such an id is a name from a different
+-- game (the bundled table is an AtlasLoot snapshot that reaches into TBC and
+-- beyond) or, more often, not an item name at all. Either way nothing a player
+-- can obtain here is behind it, so it must not be offered as a goal.
+--
+-- Pure on purpose: this is the whole rule, and the harness drives it directly.
+function Addon.GoalSeedAllowed(cache)
+    return not Scan.IsComplete(cache)
 end
 
 -- ── The merged item index ─────────────────────────────────────────────────────
@@ -191,14 +256,19 @@ function Addon:BuildGoalItemDB()
         add(id, nm, q, m, f, true, internal)
     end
 
-    -- 2 — the bundled seed, for anything the scan has not covered yet
-    if Addon.ItemNameDB then
+    -- 2 — the bundled seed, ONLY while the scan has not yet spoken for this client.
+    -- Once it has, the cache is the whole index: see SEED RETIREMENT at the top.
+    local seedAllowed = Addon.GoalSeedAllowed(cache)
+    if seedAllowed and Addon.ItemNameDB then
         for id, nm in pairs(Addon.ItemNameDB) do
             add(id, nm, nil, seedClassMask(id), Scan.FACTION_NONE, false)
         end
     end
 
-    -- 3 — PvP rank pieces: no bundled name, so ask the client for one
+    -- 3 — PvP rank pieces: no bundled name, so ask the CLIENT for one. This pass
+    -- survives seed retirement because its evidence is GetItemInfo, not the seed —
+    -- a name only comes back for an id this client actually has. After a completed
+    -- scan every one of these ids is already settled, so it is a no-op anyway.
     local missing = 0
     for _, id in ipairs(Addon.PvPItemIDs or {}) do
         if not settled[id] then
@@ -427,15 +497,20 @@ local function ensure()
                 if (Addon._goalPvPMissing or 0) > 0 then
                     Addon.GoalItemDB, Addon._goalDBStamp = nil, nil
                 end
-                self:Requery()
+                -- NOBODY ASKED FOR THIS ONE. It is the item-info stream catching up,
+                -- and it arrives in bursts — so it keeps the reader's scroll position.
+                self:Requery(true)
             end
         end)
     end)
 
-    function f:Requery()
+    -- preserveScroll: see Rows.NextOffset. Absent/false = a refresh the reader
+    -- asked for, which starts at the top.
+    function f:Requery(preserveScroll)
+        local prev   = self._offset or 0
         self._ctx    = Addon:ScanContext(pickerSettings().showUnusable)
         self._list   = filtered(self.search:GetText(), self._validLoc or {}, self._ctx)
-        self._offset = 0
+        self._offset = Rows.NextOffset(prev, #self._list, preserveScroll)
         self:RefreshList()
     end
 
@@ -483,7 +558,7 @@ local function ensure()
 
     function f:ScanFinished()
         self:SyncScanUI()
-        if self:IsShown() then self:Requery() end
+        if self:IsShown() then self:Requery(true) end
     end
 
     function f:RefreshList()
@@ -526,6 +601,26 @@ local function ensure()
 
     picker = f
     return f
+end
+
+-- ── THE REPAIR → RE-FILTER SEAM (1.3.1) ──────────────────────────────────────
+-- Called by itemScan.lua the moment a scan or a restriction-repair finishes.
+--
+-- Before this existed, the ONLY thing that re-filtered an open picker after a
+-- repair was the picker's own 0.25s poll (f:SyncScanUI -> f:ScanFinished), and
+-- that poll is armed only when SyncScanUI happens to be called while a scan is
+-- already running. So the repair could land every class lock it read and the open
+-- list would keep showing the rows it had at open time — Atiesh on a warrior, all
+-- eight Tier-3 sets on everybody — until the picker was closed and reopened. The
+-- fix is a push, not a poll: FinishItemScan invalidates the index and then calls
+-- this, so a completed repair is visible in the frame that is already on screen.
+--
+-- Scroll position is preserved: this refresh is not one the reader asked for.
+function Addon:RefreshGoalPicker(preserveScroll)
+    if not picker or not picker.Requery then return false end
+    if not picker:IsShown() then return false end
+    picker:Requery(preserveScroll ~= false)
+    return true
 end
 
 -- Warm the client cache for set-piece ids so their names resolve (called once,

@@ -2415,6 +2415,60 @@ suite("goal-picker-row-pool", function(ck)
     local _, sOver = shown(500, 9999)
     ck(sOver[12] == 500, "the clamped bottom really shows the last result")
 
+    -- ── SCROLL SURVIVES A REFRESH NOBODY ASKED FOR (1.3.1) ──────────────────
+    -- THE DEFECT (owner, round two): scrolling the list jumped back to the top
+    -- over and over. Requery unconditionally wrote _offset = 0, and Requery is
+    -- what the GET_ITEM_INFO_RECEIVED handler calls — which during the
+    -- restriction-repair pass fires in a continuous stream, because every visible
+    -- row that is not yet tinted asks the client to load its item and every reply
+    -- schedules another refresh. The list was effectively unscrollable.
+    ck(type(R.NextOffset) == "function", "the pool decides where a refresh lands")
+    ck(R.NextOffset(0, 500, false) == 0, "a reader-initiated refresh starts at the top")
+    ck(R.NextOffset(240, 500, false) == 0, "…however far down the reader was")
+    ck(R.NextOffset(240, 500, true) == 240,
+       "THE FIX: a background refresh leaves the reader exactly where they were")
+    ck(R.NextOffset(0, 500, true) == 0, "…including at the top")
+    ck(R.NextOffset(488, 500, true) == 488, "…and at the very bottom")
+    -- the list can SHRINK under the reader (a repair lands class locks and rows
+    -- disappear); the kept offset is clamped, never left past the end
+    ck(R.NextOffset(488, 500, true) == R.MaxOffset(500),
+       "the bottom of a 500-row list is the last screenful")
+    ck(R.NextOffset(488, 20, true) == R.MaxOffset(20),
+       "a list that shrank under the reader clamps to ITS last screenful, not the old one")
+    ck(R.NextOffset(488, 5, true) == 0, "…and a list shorter than the pool collapses to the top")
+    ck(R.NextOffset(488, 0, true) == 0, "…as does an empty one")
+    ck(R.NextOffset(-3, 500, true) == 0, "a negative carried offset is still clamped")
+    ck(R.NextOffset(nil, 500, true) == 0, "…and a missing one reads as the top")
+    -- the kept offset always produces a full slice where one is available
+    local _, keep = shown(500, R.NextOffset(240, 500, true))
+    ck(keep[1] == 241 and keep[12] == 252,
+       "the preserved offset really shows the same twelve rows again")
+    local _, kept2 = shown(20, R.NextOffset(488, 20, true))
+    ck(kept2[1] == 9 and kept2[12] == 20,
+       "…and after a shrink it shows the new last screenful, fully populated")
+
+    local OFFSET_MUTANTS = {
+        ["O1 every refresh goes to the top (THE ROUND-TWO DEFECT)"] = function()
+            return R.NextOffset(240, 500, true) == 0
+        end,
+        ["O2 every refresh keeps the offset, even a new query"] = function()
+            return R.NextOffset(240, 500, false) ~= 0
+        end,
+        ["O3 the kept offset is not clamped to the new list"] = function()
+            return R.NextOffset(488, 20, true) == 488
+        end,
+        ["O4 the preserve flag is ignored entirely"] = function()
+            return R.NextOffset(240, 500, true) == R.NextOffset(240, 500, false)
+        end,
+    }
+    local onames = {}
+    for k in pairs(OFFSET_MUTANTS) do onames[#onames + 1] = k end
+    table.sort(onames)
+    for _, name in ipairs(onames) do
+        local okm, holds = pcall(OFFSET_MUTANTS[name])
+        ck(okm and holds == false, "mutation killed: " .. name)
+    end
+
     -- ── THE TINT CONTRACT: all three components, or none ────────────────────
     local Bd = {}
     local bfn = loadfile(P("borders.lua"))
@@ -2538,6 +2592,38 @@ suite("goal-picker-row-pool", function(ck)
     ck(src:find("Rows%.Slice") ~= nil, "…over the slice, which speaks for every row")
     ck(src:find("Rows%.ClampOffset") ~= nil, "the mouse wheel clamps through the same module")
     ck(src:find("%-Rows%.RowY%(i%)") ~= nil, "…and the rows are anchored by Rows.RowY")
+
+    -- Requery must route its offset through the pool, and must NOT hard-zero it.
+    ck(src:find("self%._offset = Rows%.NextOffset%(prev, #self%._list, preserveScroll%)") ~= nil,
+       "Requery lands its offset through Rows.NextOffset")
+    -- The defect line is QUOTED in the file's own comment (that is the record of
+    -- why NextOffset exists), so the check has to look at code, not at prose.
+    local zeroing
+    for line in (src .. "\n"):gmatch("([^\n]*)\n") do
+        local body = line:gsub("^%s+", "")
+        if body:sub(1, 2) ~= "--" and body:find("^self%._offset%s*=%s*0") then
+            zeroing = line
+        end
+    end
+    ck(zeroing == nil,
+       "THE DEFECT LINE IS GONE: nothing writes the offset straight to zero ("
+       .. tostring(zeroing) .. ")")
+    ck(src:find("function f:Requery%(preserveScroll%)") ~= nil,
+       "…and the caller says whether the reader asked for this refresh")
+    -- the two background refresh paths both preserve, and the reader-driven ones
+    -- do not: search box, "Show unusable" and a fresh open all call Requery()
+    local evt = src:find("GET_ITEM_INFO_RECEIVED\"%)")
+    local evtRequery = evt and src:find("self:Requery%(true%)", evt)
+    ck(evtRequery ~= nil,
+       "the item-info stream refresh preserves the scroll position")
+    ck(src:find("if self:IsShown%(%) then self:Requery%(true%) end") ~= nil,
+       "…and so does the one that runs when a scan or repair finishes")
+    ck(src:find("picker:Requery%(%)\n%s*end%)\n%s*search:SetScript%(\"OnEscapePressed") ~= nil,
+       "…while typing in the search box goes back to the top")
+    ck(src:find("if picker then picker:Requery%(%) end") ~= nil,
+       "…as does toggling Show unusable")
+    ck(src:find("f:SyncScanUI%(%)\n%s*f:Requery%(%)") ~= nil,
+       "…and as does opening the picker")
 end)
 
 ----------------------------------------------------------------------
@@ -2728,49 +2814,129 @@ suite("goal-picker-source-precedence", function(ck)
     -- builder can be run headlessly against stubs. The fixture is the owner's own
     -- id 13794: "[PH] Shining Dawn Coif" in the client, "Enchant Cloak -
     -- Resistance" in the bundled seed.
-    if type(Scan) == "table" then
+    --
+    -- `scanned` switches the fixture between the two regimes the 1.3.1 SEED
+    -- RETIREMENT rule distinguishes: before the first completed scan the seed is
+    -- the only name source there is, after it the cache is the whole index.
+    local function buildFixture(scanned)
         local A = { ItemScan = Scan }
         local fn = loadfile(P("goalPicker.lua"))
-        ck(fn ~= nil, "goalPicker.lua compiles for the index-builder fixture")
-        if fn and pcall(fn, "Daseeki-Armory", A) then
-            local cache = Scan.NewCache()
-            Scan.Put(cache, 13794, "[PH] Shining Dawn Coif", 3, 0, 0)      -- internal
-            Scan.Put(cache, 18419, "Monster - Axe, 2H Horde Red War Axe", 2, 0, 0)
-            Scan.Put(cache, 19019, "Thunderfury, Blessed Blade of the Windseeker", 5, 0, 0)
-            cache.scannedAt = 1785862751
-            A.ItemScanCache = function() return cache end
-            -- the seed's disagreeing names for the SAME ids, verbatim from itemDB.lua
-            A.ItemNameDB = {
-                [13794] = "Enchant Cloak - Resistance",
-                [18419] = "Felcloth Pants",
-                [21134] = "Zandalar Freethinker's Breastplate",   -- seed-only, genuine
+        if not fn then return nil, "goalPicker.lua does not compile" end
+        local okl = pcall(fn, "Daseeki-Armory", A)
+        if not okl then return nil, "goalPicker.lua raised at load" end
+
+        local cache = Scan.NewCache()
+        Scan.Put(cache, 13794, "[PH] Shining Dawn Coif", 3, 0, 0)      -- internal
+        Scan.Put(cache, 18419, "Monster - Axe, 2H Horde Red War Axe", 2, 0, 0)
+        Scan.Put(cache, 19019, "Thunderfury, Blessed Blade of the Windseeker", 5, 0, 0)
+        if scanned then cache.scannedAt = 1785862751 end
+        A.ItemScanCache = function() return cache end
+        -- the seed's disagreeing names for the SAME ids, verbatim from itemDB.lua
+        A.ItemNameDB = {
+            [13794] = "Enchant Cloak - Resistance",
+            [18419] = "Felcloth Pants",
+            [21134] = "Zandalar Freethinker's Breastplate",   -- seed-only, genuine
+            [22737] = "Atiesh, Greatstaff of the Guardian",   -- seed-only, NOT in this client
+        }
+        A.ItemClassMask = {}
+        A.PvPItemIDs = {}
+
+        local savedI, savedG = _G.GetItemInfoInstant, _G.GetItemInfo
+        _G.GetItemInfoInstant = function(id)
+            return id, nil, nil, "INVTYPE_HEAD", "icon" .. tostring(id), 4, 1
+        end
+        _G.GetItemInfo = function() return nil end
+        local okb, list = pcall(A.BuildGoalItemDB, A)
+        _G.GetItemInfoInstant, _G.GetItemInfo = savedI, savedG
+        if not okb then return nil, "BuildGoalItemDB raised: " .. tostring(list) end
+
+        local byId, byName = {}, {}
+        for _, e in ipairs(list) do byId[e.id] = e; byName[e.display] = true end
+        return { A = A, cache = cache, list = list, byId = byId, byName = byName }
+    end
+
+    if type(Scan) == "table" then
+        -- ── AFTER a completed scan: the cache is the WHOLE index ─────────────
+        local post, perr = buildFixture(true)
+        ck(post ~= nil, "the index builds against a completed-scan cache (" .. tostring(perr) .. ")")
+        if post then
+            ck(post.byName["Enchant Cloak - Resistance"] == nil,
+               "THE 1.3.1 DEFECT: the seed cannot re-name an id the scan dropped as internal")
+            ck(post.byId[13794] == nil, "…id 13794 is out of the index entirely")
+            ck(post.byName["Felcloth Pants"] == nil,
+               "…and neither can it re-name a dropped creature-art record")
+            ck(post.byId[19019] ~= nil and post.byId[19019].display
+               == "Thunderfury, Blessed Blade of the Windseeker",
+               "a real scanned item is still in the index, under the CLIENT's name")
+            -- ── SEED RETIREMENT (round two) ──────────────────────────────────
+            ck(post.byId[21134] == nil,
+               "SEED RETIREMENT: a seed-only id the completed scan never found is gone")
+            ck(post.byId[22737] == nil,
+               "…including the fifth Atiesh the bundled snapshot carries and this client does not")
+            ck(post.byName["Zandalar Freethinker's Breastplate"] == nil,
+               "…by name as well as by id")
+            ck(#post.list == 1,
+               "exactly the one scanned survivor, no seed rows at all (got " .. #post.list .. ")")
+            ck(post.A.GoalSeedAllowed(post.cache) == false,
+               "the rule itself says so: a completed scan retires the seed")
+        end
+
+        -- ── BEFORE any scan: the seed is all there is, and it still speaks ───
+        local pre, prerr = buildFixture(false)
+        ck(pre ~= nil, "the index builds against a never-scanned cache (" .. tostring(prerr) .. ")")
+        if pre then
+            ck(pre.A.GoalSeedAllowed(pre.cache) == true,
+               "…and an incomplete scan does NOT retire it")
+            ck(pre.byId[21134] ~= nil,
+               "PRE-SCAN: the same seed-only row IS offered, because nothing better exists yet")
+            ck(pre.byId[22737] ~= nil, "…as is the seed's fifth Atiesh")
+            ck(pre.byId[19019] ~= nil,
+               "…while the partial cache still outranks the seed on ids it does cover")
+            ck(pre.byId[13794] == nil and pre.byName["Enchant Cloak - Resistance"] == nil,
+               "…and precedence is unchanged: a dropped internal row is still not the seed's to name")
+            ck(#pre.list > #post.list,
+               "the pre-scan list is the longer one — retirement is what shortens it")
+        end
+
+        -- ── MUTATION ADEQUACY over the precedence rule itself ────────────────
+        -- Each mutant is the rule written wrong; every one must disagree with the
+        -- real Addon.GoalSeedAllowed on at least one of the four cache shapes.
+        local none   = Scan.NewCache()
+        local part   = Scan.NewCache(); Scan.Put(part, 19019, "Thunderfury", 5, 0, 0)
+        local done   = Scan.NewCache(); Scan.Put(done, 19019, "Thunderfury", 5, 0, 0)
+        done.scannedAt = 1785862751
+        local hollow = Scan.NewCache(); hollow.scannedAt = 1785862751   -- stamped, zero rows
+        local SHAPES = { none, part, done, hollow }
+        local real = (post and post.A.GoalSeedAllowed) or nil
+        ck(type(real) == "function", "the seed rule is published as a pure function")
+        if type(real) == "function" then
+            ck(real(none) == true,   "an empty cache keeps the seed")
+            ck(real(part) == true,   "a cache with rows but no completion stamp keeps it")
+            ck(real(done) == false,  "a completed scan retires it")
+            ck(real(hollow) == true,
+               "a completion stamp over ZERO rows is not a completed scan — the seed stays")
+            local RULE_MUTANTS = {
+                ["P1 the seed is always consulted (the shipped 1.3.0 behaviour)"] =
+                    function() return true end,
+                ["P2 the seed is never consulted, even before the first scan"] =
+                    function() return false end,
+                ["P3 'complete' means only that the stamp is present"] =
+                    function(c) return not c.scannedAt end,
+                ["P4 'complete' means only that the cache has rows"] =
+                    function(c) return (c.count or 0) == 0 end,
+                ["P5 the rule is inverted"] =
+                    function(c) return Scan.IsComplete(c) end,
             }
-            A.ItemClassMask = {}
-            A.PvPItemIDs = {}
-
-            local savedI, savedG = _G.GetItemInfoInstant, _G.GetItemInfo
-            _G.GetItemInfoInstant = function(id)
-                return id, nil, nil, "INVTYPE_HEAD", "icon" .. tostring(id), 4, 1
-            end
-            _G.GetItemInfo = function() return nil end
-            local okb, list = pcall(A.BuildGoalItemDB, A)
-            _G.GetItemInfoInstant, _G.GetItemInfo = savedI, savedG
-
-            ck(okb and type(list) == "table", "the index builds (" .. tostring(list) .. ")")
-            if okb and type(list) == "table" then
-                local byId, byName = {}, {}
-                for _, e in ipairs(list) do byId[e.id] = e; byName[e.display] = true end
-                ck(byName["Enchant Cloak - Resistance"] == nil,
-                   "THE DEFECT: the seed cannot re-name an id the scan dropped as internal")
-                ck(byId[13794] == nil, "…id 13794 is out of the index entirely")
-                ck(byName["Felcloth Pants"] == nil,
-                   "…and neither can it re-name a dropped creature-art record")
-                ck(byId[19019] ~= nil and byId[19019].display
-                   == "Thunderfury, Blessed Blade of the Windseeker",
-                   "a real scanned item is still in the index, under the CLIENT's name")
-                ck(byId[21134] ~= nil,
-                   "…and the seed still fills ids the scan never covered")
-                ck(#list == 2, "exactly the two survivors, no resurrections (got " .. #list .. ")")
+            local rnames = {}
+            for k in pairs(RULE_MUTANTS) do rnames[#rnames + 1] = k end
+            table.sort(rnames)
+            for _, name in ipairs(rnames) do
+                local mut, killed = RULE_MUTANTS[name], false
+                for _, c in ipairs(SHAPES) do
+                    local okm, got = pcall(mut, c)
+                    if not okm or got ~= real(c) then killed = true; break end
+                end
+                ck(killed, "mutation killed: " .. name)
             end
         end
     end
@@ -2800,12 +2966,287 @@ suite("goal-picker-source-precedence", function(ck)
     ck(scanLoop and seedLoop and pvpLoop and scanLoop < seedLoop and seedLoop < pvpLoop,
        "the CLIENT scan is consulted before the bundled snapshot, always")
 
+    -- seed retirement is a GATE on that loop, not a filter inside it
+    ck(src:find("function Addon%.GoalSeedAllowed%(cache%)") ~= nil,
+       "the seed-retirement rule is published, pure, and named")
+    ck(src:find("local seedAllowed = Addon%.GoalSeedAllowed%(cache%)") ~= nil,
+       "…and the index builder asks it before opening the seed at all")
+    ck(src:find("if seedAllowed and Addon%.ItemNameDB then") ~= nil,
+       "…gating the whole seed loop rather than each row")
+    ck(src:find("if Addon%.ItemNameDB then\n") == nil,
+       "THE OLD UNGATED SEED LOOP IS GONE")
+
     -- and the family that exposed it can no longer be named at all
     if type(Scan) == "table" then
         ck(Scan.IsInternalName("Enchant Cloak - Resistance") == true,
            "belt and braces: the seed's own name for 13794 is on the denylist too")
         ck(Scan.IsInternalName("[PH] Shining Dawn Coif") == true,
            "…as is what the client actually calls that id")
+    end
+end)
+
+----------------------------------------------------------------------
+-- THE REPAIR REACHES THE OPEN PICKER  (1.3.1, round two)
+--
+-- THE DEFECT (owner, on a warrior): four copies of Atiesh — the Naxxramas
+-- legendary staff, locked to mage/priest/warlock/druid — and all eight Tier-3
+-- sets were still in the list. Their class locks are the ones the pre-1.3.1
+-- capture never read (classMask 0 across the whole 22314-22821 band, 0 of 224
+-- rows restricted, verified in the owner's real cache), so the repair pass is
+-- what fixes them.
+--
+-- THE WIRING GAP: the repair wrote the masks and cleared the index, and then
+-- nothing told the picker. The ONLY re-filter was f:ScanFinished, reached from a
+-- 0.25s poll that f:SyncScanUI arms — and only when SyncScanUI happens to run
+-- while a scan is already going. A repair that finished with the picker open but
+-- the poll unarmed, or with the picker hidden and then re-shown from a cached
+-- frame, left the pre-repair rows on screen. FinishItemScan now PUSHES the
+-- refresh (Addon:RefreshGoalPicker) instead of waiting to be polled.
+--
+-- The second gap was the one-shot: MaybeRepairRestrictions stamped
+-- Addon._restrictRepairTried and printed its notice BEFORE asking whether the
+-- pass had actually started, so a session could burn its only attempt (and say so
+-- in chat) on a repair that never ran.
+----------------------------------------------------------------------
+suite("goal-picker-repair-refilter", function(ck)
+    if type(Scan) ~= "table" then ck(false, "itemScan.lua did not load"); return end
+
+    -- ── 1. ATIESH, end to end, from tooltip text to picker row ──────────────
+    -- The fixture is the client's own tooltip for id 22589, in the order the
+    -- lines come off it. Nothing here is hand-waved: the same ParseRestrictions
+    -- the scan uses turns it into a mask, the same Scan.Put persists it, the same
+    -- Scan.Matches decides the row.
+    local loc = {
+        classPrefix = "Classes: ", racesPrefix = "Races: ",
+        classByName = { Warrior = "WARRIOR", Paladin = "PALADIN", Hunter = "HUNTER",
+                        Rogue = "ROGUE", Priest = "PRIEST", Shaman = "SHAMAN",
+                        Mage = "MAGE", Warlock = "WARLOCK", Druid = "DRUID" },
+        raceFaction = { Orc = Scan.FACTION_HORDE, Human = Scan.FACTION_ALLIANCE },
+        allianceLines = { Alliance = true }, hordeLines = { Horde = true },
+    }
+    local ATIESH_TIP = {
+        "Binds when picked up",
+        "Unique",
+        "Two-Hand", "Staff",
+        "146 - 271 Damage", "Speed 3.00",
+        "(69.5 damage per second)",
+        "+30 Stamina",
+        "+30 Intellect",
+        "Classes: Mage, Priest, Warlock, Druid",
+        "Requires Level 60",
+        "Equip: Increases damage and healing done by magical spells and effects by up to 95.",
+        "Equip: Restores 8 mana per 5 sec.",
+        "Increases the spell damage of all party members within 30 yards by up to 33.",
+    }
+    local mask, fac, read = Scan.ReadRestrictions(ATIESH_TIP, loc)
+    ck(read == true, "Atiesh's tooltip is a tooltip that BUILT (read = true)")
+    local expect = Scan.CLASS_BIT.MAGE + Scan.CLASS_BIT.PRIEST
+                 + Scan.CLASS_BIT.WARLOCK + Scan.CLASS_BIT.DRUID
+    ck(mask == expect,
+       "…and its 'Classes:' line is read as mage+priest+warlock+druid (got " .. mask .. ")")
+    ck(fac == Scan.FACTION_NONE, "…with no faction lock (both sides can hold it)")
+    ck(Scan.HasBit(mask, Scan.CLASS_BIT.WARRIOR) == false, "…and no warrior bit in it")
+    ck(Scan.HasBit(mask, Scan.CLASS_UNKNOWN) == false,
+       "…and no CLASS_UNKNOWN, so the filter does NOT fail open on it")
+
+    local warrior = { class = "WARRIOR", classBit = Scan.CLASS_BIT.WARRIOR,
+                      faction = Scan.FACTION_ALLIANCE, showUnusable = false }
+    local mage    = { class = "MAGE", classBit = Scan.CLASS_BIT.MAGE,
+                      faction = Scan.FACTION_ALLIANCE, showUnusable = false }
+    -- a staff is weapon subclass 10; a warrior IS proficient with staves, so the
+    -- class lock is the only thing that can hide it — exactly the owner's case
+    ck(Scan.PROF.WARRIOR.weapon[10] == true,
+       "a warrior can wield a staff, so proficiency alone would never hide Atiesh")
+    local atiesh = { id = 22589, name = "atiesh, greatstaff of the guardian",
+                     display = "Atiesh, Greatstaff of the Guardian",
+                     equipLoc = "INVTYPE_2HWEAPON",
+                     classID = Scan.ITEM_CLASS_WEAPON, subclassID = 10,
+                     classMask = mask, faction = fac }
+    local twoHand = { INVTYPE_2HWEAPON = true }
+    ck(Scan.Matches(atiesh, "", twoHand, warrior) == false,
+       "THE OWNER'S ROW: with the lock captured, a warrior's empty-query list drops Atiesh")
+    ck(Scan.Matches(atiesh, "atiesh", twoHand, warrior) == false,
+       "…and searching for it by name does not bring it back either")
+    ck(Scan.Matches(atiesh, "", twoHand, mage) == true, "…while a mage still sees it")
+    ck(Scan.Matches(atiesh, "", twoHand,
+       { class = "WARRIOR", classBit = Scan.CLASS_BIT.WARRIOR, showUnusable = true }) == true,
+       "…and 'Show unusable' still reveals it, because it IS a real item")
+    -- the pre-repair state is the bug, and it must still reproduce
+    local unrepaired = { id = 22589, name = "atiesh", display = "Atiesh",
+                         equipLoc = "INVTYPE_2HWEAPON",
+                         classID = Scan.ITEM_CLASS_WEAPON, subclassID = 10,
+                         classMask = 0, faction = Scan.FACTION_NONE }
+    ck(Scan.Matches(unrepaired, "", twoHand, warrior) == true,
+       "…and with classMask 0 the warrior DOES see it — the repair is the fix, not the filter")
+
+    -- the mask survives the cache round trip the repair writes it through
+    local c = Scan.NewCache()
+    Scan.Put(c, 22589, "Atiesh, Greatstaff of the Guardian", 5, 0, 0, true)   -- as 1.3.0 left it
+    ck(select(6, Scan.Get(c, 22589)) == true, "before the repair, Atiesh is flagged unread")
+    ck(Scan.UnreadIds(c)[1] == 22589, "…so the repair queue picks it up")
+    Scan.Put(c, 22589, "Atiesh, Greatstaff of the Guardian", 5, mask, fac, false)
+    local _, q2, m2, f2, i2, u2 = Scan.Get(c, 22589)
+    ck(m2 == expect and q2 == 5 and f2 == Scan.FACTION_NONE,
+       "after it, the cache holds the class lock the tooltip named")
+    ck(u2 == false and i2 == false, "…flagged read, and never internal")
+    ck(Scan.UnreadCount(c) == 0, "…and the repair queue is empty")
+    -- and all four copies repair independently
+    for _, id in ipairs({ 22589, 22630, 22631, 22632 }) do
+        Scan.Put(c, id, "Atiesh, Greatstaff of the Guardian", 5, mask, fac, false)
+    end
+    local locked = 0
+    for _, id in ipairs({ 22589, 22630, 22631, 22632 }) do
+        if select(3, Scan.Get(c, id)) == expect then locked = locked + 1 end
+    end
+    ck(locked == 4, "all FOUR Atiesh ids in the owner's cache carry the lock (got " .. locked .. ")")
+
+    -- ── 2. THE WIRING: a finished repair pushes the refresh ─────────────────
+    local sh = io.open(P("itemScan.lua"), "r")
+    ck(sh ~= nil, "itemScan.lua is readable")
+    if sh then
+        local s = sh:read("*a"); sh:close()
+        local finish = s:find("function Addon:FinishItemScan")
+        local push   = s:find("Addon%.RefreshGoalPicker")
+        local invalid= s:find("Addon%.GoalItemDB, Addon%._goalDBStamp = nil, nil")
+        ck(finish and invalid and invalid > finish,
+           "FinishItemScan invalidates the picker index")
+        ck(push and finish and push > finish,
+           "THE FIX: …and then PUSHES the refresh into an open picker")
+        ck(invalid and push and invalid < push,
+           "…in that order, so the refresh rebuilds rather than re-reading the stale index")
+        ck(s:find("cache%.restrictLocked%s*=%s*restricted") ~= nil,
+           "the repair result is PERSISTED, not only printed")
+        ck(s:find("cache%.restrictUnreadable%s*=%s*unread") ~= nil,
+           "…both halves of it")
+        -- the one-shot closes on a pass that started
+        local start = s:find("local started = Addon:StartItemScan%({ repair = true }%)")
+        local latch = s:find("Addon%._restrictRepairTried = true")
+        ck(start ~= nil, "MaybeRepairRestrictions asks whether the pass actually started")
+        ck(start and latch and latch > start,
+           "THE FIX: …before burning the session's one attempt on it")
+        local notice = s:find("re%-reading class restrictions for %%d cached items")
+        ck(start and notice and notice > start,
+           "…and before announcing a repair in chat")
+        -- the tooltip retry is deferred, not spun
+        ck(s:find("ST%.retry%[#ST%.retry %+ 1%] = id") ~= nil,
+           "an unreadable tooltip is deferred to a later tick, not re-queued into this one")
+        ck(s:find("ST%.queue%[#ST%.queue %+ 1%] = id\n%s*return true") == nil,
+           "THE SPIN IS GONE: three tries no longer burn inside one frame")
+        ck(s:find("and #ST%.retry == 0 then") ~= nil,
+           "…and a deferred row keeps the pass from declaring itself finished")
+    end
+    local gh = io.open(P("goalPicker.lua"), "r")
+    ck(gh ~= nil, "goalPicker.lua is readable")
+    if gh then
+        local g = gh:read("*a"); gh:close()
+        ck(g:find("function Addon:RefreshGoalPicker%(preserveScroll%)") ~= nil,
+           "the picker publishes the seam the scan pushes through")
+        ck(g:find("if not picker:IsShown%(%) then return false end") ~= nil,
+           "…which is a no-op when nothing is on screen")
+        ck(g:find("picker:Requery%(preserveScroll ~= false%)") ~= nil,
+           "…and re-filters, keeping the reader's scroll position by default")
+        ck(g:find("Addon:MaybeRepairRestrictions") ~= nil,
+           "the picker still triggers the repair when it opens")
+    end
+
+    -- ── 3. /darmory scanstatus: the state is QUERYABLE ──────────────────────
+    ck(type(Scan.StatusReport) == "function", "Scan.StatusReport is published")
+    local function joined(lines) return table.concat(lines or {}, "\n") end
+    local function findLine(lines, prefix)
+        for _, l in ipairs(lines or {}) do
+            if l:sub(1, #prefix) == prefix then return l end
+        end
+    end
+
+    local empty = Scan.StatusReport(nil, nil)
+    ck(#empty == 1 and empty[1]:find("never run") ~= nil,
+       "with no cache at all it says so in one line")
+    ck(#Scan.StatusReport({}, nil) == 1, "…as it does for a table that is not a cache")
+
+    -- a cache shaped like the owner's, mid-repair
+    local rc = Scan.NewCache()
+    Scan.Put(rc, 22589, "Atiesh, Greatstaff of the Guardian", 5, expect, 0, false)
+    Scan.Put(rc, 22476, "Bonescythe Breastplate", 4, 0, 0, true)          -- still unread
+    Scan.Put(rc, 22477, "Bonescythe Gauntlets",   4, 0, 0, true)          -- still unread
+    Scan.Put(rc, 16963, "Nightslayer Chestpiece", 4, Scan.CLASS_BIT.ROGUE, 0, false)
+    Scan.Put(rc, 13789, "[PH] Brilliant Dawn Cap", 1, 0, 0, false)        -- internal
+    Scan.Put(rc, 12592, "Blackblade of Shahram",  4, 0, Scan.FACTION_HORDE, false)
+    rc.scannedAt = 1785862751
+    rc.build, rc.ranges = "68940", "1-32000"
+
+    local idle = Scan.StatusReport(rc, nil)
+    -- cache / restrictions / scan state / last scan / last repair / stamps
+    ck(#idle == 6, "an idle report is six lines (got " .. #idle .. ")")
+    local cacheLine = findLine(idle, "cache:")
+    ck(cacheLine ~= nil, "…led by the cache line")
+    ck(cacheLine and cacheLine:find("6 ids") ~= nil, "…which counts every row")
+    ck(cacheLine and cacheLine:find("5 offerable") ~= nil, "…separating what the picker may offer")
+    ck(cacheLine and cacheLine:find("1 internal") ~= nil, "…from what it hides")
+    local restrictLine = findLine(idle, "restrictions:")
+    ck(restrictLine and restrictLine:find("2 class%-locked") ~= nil,
+       "the restriction line counts the class locks that ARE captured")
+    ck(restrictLine and restrictLine:find("1 faction%-locked") ~= nil, "…and the faction locks")
+    ck(restrictLine and restrictLine:find("2 still unread") ~= nil,
+       "…and, crucially, how many rows the repair still owes")
+    ck(findLine(idle, "scan: idle") ~= nil, "an idle scan says idle")
+    ck(findLine(idle, "scan: idle"):find("repair pass is still owed") ~= nil,
+       "…and says outright that a repair is outstanding, since 2 rows are unread")
+    ck(findLine(idle, "last full scan:") ~= nil, "the last completed scan is stamped")
+    ck(joined(idle):find("68940") ~= nil and joined(idle):find("1%-32000") ~= nil,
+       "…with the build and the id range it covered")
+    ck(findLine(idle, "last repair: never") ~= nil, "a cache never repaired says never")
+    ck(findLine(idle, "stamps:") ~= nil, "and the three stamps are readable")
+    ck(joined(idle):find("denylist " .. Scan.INTERNAL_STAMP) ~= nil, "…the denylist stamp")
+    ck(joined(idle):find("capture " .. Scan.RESTRICT_STAMP) ~= nil, "…and the capture stamp")
+
+    -- the same cache with a repair RUNNING over it
+    local live = Scan.StatusReport(rc, { phase = "repair", cursor = 4120, total = 9241,
+                                         percent = 44, found = 9241 })
+    ck(findLine(live, "repair: RUNNING") ~= nil, "a running repair says RUNNING")
+    ck(findLine(live, "repair: RUNNING"):find("4120 / 9241") ~= nil,
+       "…with x / y, which is the question the chat line could not answer later")
+    ck(findLine(live, "repair: RUNNING"):find("44%%") ~= nil, "…and a percentage")
+    ck(findLine(live, "scan: idle") == nil, "…and does not also claim to be idle")
+    local walking = Scan.StatusReport(rc, { phase = "instant", cursor = 8000, total = 32000,
+                                            percent = 25, found = 3100 })
+    ck(findLine(walking, "scan: RUNNING") ~= nil, "the id walk reports as a scan, not a repair")
+    ck(findLine(walking, "scan: RUNNING"):find("3100 equippable") ~= nil,
+       "…counting what it has found so far")
+    local loading = Scan.StatusReport(rc, { phase = "resolve", cursor = 900, total = 9241,
+                                            percent = 9 })
+    ck(findLine(loading, "scan: RUNNING") ~= nil, "so does the item-loading phase")
+    ck(findLine(loading, "scan: RUNNING"):find("900 / 9241") ~= nil, "…with its own x / y")
+
+    -- a repaired cache reports the result the chat line used to carry away
+    local done = Scan.NewCache()
+    Scan.Put(done, 22589, "Atiesh, Greatstaff of the Guardian", 5, expect, 0, false)
+    done.scannedAt = 1785862751
+    done.restrictRepairedAt = 1785949151
+    done.restrictLocked, done.restrictUnreadable = 1102, 37
+    local drep = Scan.StatusReport(done, nil)
+    local lastRepair = findLine(drep, "last repair:")
+    ck(lastRepair ~= nil and lastRepair:find("never") == nil, "a repaired cache reports its repair")
+    ck(lastRepair and lastRepair:find("1102 locked") ~= nil, "…how many rows it locked")
+    ck(lastRepair and lastRepair:find("37 unreadable") ~= nil, "…and how many it could not read")
+    ck(findLine(drep, "scan: idle") ~= nil and
+       findLine(drep, "scan: idle"):find("still owed") == nil,
+       "…and a fully-read cache does not claim a repair is outstanding")
+
+    -- purity: no line carries a colour code or a nil
+    for _, l in ipairs(idle) do
+        ck(type(l) == "string" and l:find("|c") == nil and l:find("nil") == nil,
+           "every status line is plain, complete text: " .. tostring(l))
+    end
+
+    -- the slash command really routes to it
+    local sl = io.open(P("slash.lua"), "r")
+    ck(sl ~= nil, "slash.lua is readable")
+    if sl then
+        local t = sl:read("*a"); sl:close()
+        ck(t:find('cmd == "scanstatus"') ~= nil, "/darmory scanstatus is a command")
+        ck(t:find("Scan%.StatusReport%(Addon:ItemScanCache%(%), Addon:ItemScanStatus%(%)%)") ~= nil,
+           "…and prints exactly the report, over the live cache and the live scan state")
+        ck(t:find("/darmory scanstatus") ~= nil, "…and is documented in the file's own header")
     end
 end)
 

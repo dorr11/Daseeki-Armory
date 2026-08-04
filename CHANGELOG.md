@@ -4,6 +4,51 @@
 
 ### Fixed
 
+- **The Goal picker no longer offers items from other expansions.** Armory ships a
+  bundled name list so the picker works before your first scan finishes. That list came
+  from a source that reaches well past this game — and once your own scan had completed,
+  Armory was still merging it in. So Wrath and Cataclysm gear that no Era character can
+  ever hold sat in the list: *Wrathful Gladiator's Tabard*, *Tabard of the Argent
+  Crusade*, *Gilneas Tabard*, the Exodar and Silvermoon City tabards, *Hallowed Helm*,
+  *Swift Brewfest Ram*, and a long tail of AtlasLoot's own section headings ("Warrior",
+  "Rogue", "Mage") parked on ids that mean nothing here. In a real cache that is
+  **1,889 entries the client has never heard of**, 95 of them beyond the range Armory
+  even scans.
+
+  Your completed scan is a full census of what your client actually contains, so it is
+  now the *only* source the picker uses. The bundled list still fills the gap before
+  your first scan finishes — that has not changed — and after it, an id your client does
+  not have is simply not offered. Nothing real is lost: *Kingsfall*, *Might of Menethil*,
+  Atiesh and the rest of Naxxramas are in your client, so they are in your scan, so they
+  stay.
+
+  One thing this deliberately does **not** do: items that exist in your client but can no
+  longer be obtained — the Warglaives of Azzinoth, *Andonisus*, *Gressil* — are still
+  listed. They are real entries in this client's data, and Armory does not keep a
+  hand-written list of what Blizzard has retired.
+
+- **A class lock that has just been repaired now reaches the picker you have open.**
+  Armory re-reads missing class restrictions in the background the first time you open
+  the picker (see below). When that pass finished, it updated the cache correctly — and
+  then nothing told the list on your screen. So four copies of Atiesh, and every Tier 3
+  set, stayed in a warrior's list until the picker was closed and reopened. The repair
+  now refreshes an open picker the moment it finishes, in place, without losing your
+  place in the list.
+
+  Two smaller faults in the same path went with it: the repair could burn its
+  once-per-session attempt (and announce itself in chat) on a pass that had not actually
+  started, and an item whose tooltip refused to build had all three of its retries used
+  up inside a single frame — so it was written off as unreadable without ever being given
+  time to load. Retries now wait for a later moment and ask the game for the item first.
+
+- **Scrolling the Goal picker no longer jumps back to the top.** Any background refresh —
+  item names arriving from the server, the restriction repair finishing — rebuilt the
+  list and sent you back to row one. During the repair pass those refreshes arrive
+  continuously, which made the list effectively unscrollable. Your position is now kept
+  across every refresh you did not ask for, and adjusts if the list gets shorter under
+  you. Typing in the search box, toggling **Show unusable**, or opening the picker still
+  starts at the top, as they should.
+
 - **The Goal picker shows the whole list again, in rarity colours.** 1.3.0 shipped the
   rarity tint with a one-line fault that stopped the row list dead: the picker asked the
   suite for a colour, got back only the red channel, and handing that to the game as a
@@ -66,6 +111,17 @@
   future update improves the rules, that too applies at the next login rather than
   asking for another scan. The chat line at the end of a scan now also tells you how
   many internal records it set aside.
+
+### New
+
+- **`/darmory scanstatus` tells you what the item scan knows, whenever you ask.** The
+  scan and the restriction repair each say their piece in chat once and then scroll away,
+  which is no help an hour later. This prints the state instead of asking you to have
+  witnessed it: how many items are cached and how many of those are hidden internal
+  records, how many carry a class or faction lock, how many still need re-reading,
+  whether a scan or repair is running right now and how far through it is, when the last
+  full scan and the last repair ran, and what the last repair achieved — how many items
+  it locked and how many it still could not read.
 
 ### Unchanged, and deliberately so
 

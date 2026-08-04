@@ -586,6 +586,93 @@ function Scan.IsComplete(cache)
 end
 
 ----------------------------------------------------------------------
+-- THE QUERYABLE STATE  (/darmory scanstatus, 1.3.1)
+--
+-- Everything the scan knows about itself has until now been announced in chat
+-- once and then scrolled away, which is no use to anyone trying to answer "is the
+-- repair still running?" or "did it actually read anything?" three minutes later.
+-- StatusReport turns the cache (plus the live scan status, when there is one)
+-- into the lines the slash command prints.
+--
+-- PURE. It walks the cache it is handed and touches no WoW API, so the harness
+-- pins the shape of the report rather than the fact that a print happened.
+--
+--   cache : the SavedVariables scan cache (Addon:ItemScanCache())
+--   live  : Addon:ItemScanStatus() when a scan/repair is running, else nil
+--   -> array of plain strings, one per line, no colour codes
+----------------------------------------------------------------------
+local function stampText(t)
+    t = tonumber(t)
+    if not t or t <= 0 then return "never" end
+    if type(date) == "function" then
+        local ok, s = pcall(date, "%Y-%m-%d %H:%M", t)
+        if ok and s then return s end
+    end
+    return tostring(t)
+end
+
+function Scan.StatusReport(cache, live)
+    local out = {}
+    local function line(s) out[#out + 1] = s end
+
+    if type(cache) ~= "table" or type(cache.names) ~= "table" then
+        line("no item cache yet — the scan has never run.")
+        return out
+    end
+
+    -- one walk answers every count, so the report can never disagree with itself
+    local total, internal, unread, locked, faction = 0, 0, 0, 0, 0
+    for id in pairs(cache.names) do
+        total = total + 1
+        local _, m, f, isInternal, isUnread = Scan.UnpackMeta(cache.meta and cache.meta[id])
+        if isInternal then
+            internal = internal + 1
+        else
+            if isUnread then unread = unread + 1 end
+            if m > 0 then locked = locked + 1 end
+            if f ~= Scan.FACTION_NONE then faction = faction + 1 end
+        end
+    end
+    local real = total - internal
+
+    line(("cache: %d ids — %d offerable, %d internal/unobtainable hidden")
+         :format(total, real, internal))
+    line(("restrictions: %d class-locked, %d faction-locked, %d still unread")
+         :format(locked, faction, unread))
+
+    if live then
+        if live.phase == "instant" then
+            line(("scan: RUNNING — walking item ids %d / %d (%d%%), %d equippable found")
+                 :format(live.cursor or 0, live.total or 0, live.percent or 0, live.found or 0))
+        elseif live.phase == "repair" then
+            line(("repair: RUNNING — re-reading restrictions %d / %d (%d%%)")
+                 :format(live.cursor or 0, live.total or 0, live.percent or 0))
+        else
+            line(("scan: RUNNING — loading items %d / %d (%d%%)")
+                 :format(live.cursor or 0, live.total or 0, live.percent or 0))
+        end
+    else
+        line(("scan: idle%s"):format(unread > 0 and " — a repair pass is still owed" or ""))
+    end
+
+    line(("last full scan: %s%s"):format(stampText(cache.scannedAt),
+         cache.build and (" (build " .. tostring(cache.build)
+                          .. ", ids " .. tostring(cache.ranges or "?") .. ")") or ""))
+    if cache.restrictRepairedAt then
+        line(("last repair: %s — %s locked, %s unreadable")
+             :format(stampText(cache.restrictRepairedAt),
+                     tostring(cache.restrictLocked or 0),
+                     tostring(cache.restrictUnreadable or 0)))
+    else
+        line("last repair: never")
+    end
+    line(("stamps: cache v%s, denylist %s, capture %s")
+         :format(tostring(cache.version), tostring(cache.internalStamp),
+                 tostring(cache.restrictStamp)))
+    return out
+end
+
+----------------------------------------------------------------------
 -- SCAN RANGES + BATCH MATH
 --
 -- CEILING RATIONALE. Vanilla's highest live item id is a little over 24 000
@@ -898,7 +985,7 @@ function Addon:StartItemScan(opts)
         cache = cache, ranges = ranges, total = Scan.RangeTotal(ranges),
         cursor = 0, phase = "instant",
         queue = {}, qHead = 1, queueTotal = 0,
-        ready = {}, rHead = 1,
+        ready = {}, rHead = 1, retry = {},
         inflight = {}, nInflight = 0, tries = {}, tipTries = {}, doneIds = {},
         found = 0, resolved = 0, failed = 0,
         acc = 0, started = GetTime(),
@@ -957,7 +1044,17 @@ local function recordItem(id)
         ST.tipTries[id] = t
         if t < Scan.TOOLTIP_TRIES then
             clearInflight()
-            ST.queue[#ST.queue + 1] = id
+            -- A LATER TICK, not this queue (1.3.1). Appending straight back onto
+            -- ST.queue re-tries the id under conditions that have not changed —
+            -- at the tail of a repair pass all three tries burn inside a single
+            -- frame, in microseconds, and the row is written off as unreadable
+            -- having never once been given time to load. ST.retry is drained at
+            -- the TOP of the next tick, and the client is asked for the item on
+            -- the way past so there is something new to read when it comes round.
+            ST.retry[#ST.retry + 1] = id
+            if _G.C_Item and _G.C_Item.RequestLoadItemDataByID then
+                _G.C_Item.RequestLoadItemDataByID(id)
+            end
             return true
         end
     end
@@ -1020,6 +1117,12 @@ function Addon:ScanTick(elapsed)
     -- ── phase 2: resolve, under a credit window ──────────────────────────────
     local now = GetTime()
 
+    -- rows whose tooltip refused LAST tick come back now, not sooner
+    if #ST.retry > 0 then
+        for _, id in ipairs(ST.retry) do ST.queue[#ST.queue + 1] = id end
+        ST.retry = {}
+    end
+
     -- expire silent requests, retrying once before writing them off
     for id, deadline in pairs(ST.inflight) do
         if now > deadline then
@@ -1070,7 +1173,11 @@ function Addon:ScanTick(elapsed)
 
     report()
 
-    if ST.qHead > #ST.queue and ST.rHead > #ST.ready and ST.nInflight <= 0 then
+    -- #ST.retry is part of the finish test: a row deferred to the next tick is
+    -- outstanding work, and finishing on top of it would write the pass off as
+    -- complete while a tooltip it never re-read is still owed.
+    if ST.qHead > #ST.queue and ST.rHead > #ST.ready and ST.nInflight <= 0
+       and #ST.retry == 0 then
         Addon:FinishItemScan()
     end
 end
@@ -1106,9 +1213,21 @@ function Addon:FinishItemScan()
     cache.internalStamp = Scan.INTERNAL_STAMP
     cache.unreadCount   = unread
     cache.restrictStamp = Scan.RESTRICT_STAMP
+    if st.repair then
+        -- PERSIST the result, do not just print it. "N locked, M unreadable" is
+        -- the only evidence the owner has that the repair did anything, and a chat
+        -- line scrolls away inside a minute; /darmory scanstatus reads these back.
+        cache.restrictLocked     = restricted
+        cache.restrictUnreadable = unread
+    end
 
     -- the picker's index is derived from the cache; force a rebuild
     Addon.GoalItemDB, Addon._goalDBStamp = nil, nil
+    -- …and PUSH that rebuild into an open picker rather than waiting for its own
+    -- poll to notice. Without this, a repair that lands every class lock it read
+    -- still leaves the list the owner is looking at showing the rows it had at
+    -- open time (Atiesh on a warrior) until the frame is closed and reopened.
+    if Addon.RefreshGoalPicker then pcall(Addon.RefreshGoalPicker, Addon, true) end
 
     local secs = Scan.FormatDuration(GetTime() - st.started) or "?"
     if st.repair then
@@ -1146,11 +1265,19 @@ function Addon:MaybeRepairRestrictions()
     if not Scan.IsComplete(cache) then return false end
     local n = Scan.UnreadCount(cache)
     if n <= 0 then return false end
+    -- THE ONE-SHOT CLOSES ON A PASS THAT ACTUALLY STARTED (1.3.1), and the notice
+    -- is printed only then. cache.unreadCount is a maintained tally, so it can be
+    -- ahead of the real flags (a session that repaired rows and then reloaded);
+    -- StartItemScan rebuilds the queue from the flags themselves and returns false
+    -- when there is nothing in it. Stamping the latch before that answer burned the
+    -- session's only attempt on a pass that never ran, and announced it in chat.
+    local started = Addon:StartItemScan({ repair = true })
+    if not started then return false end
     Addon._restrictRepairTried = true
     print(string.format("%s re-reading class restrictions for %d cached items — "
         .. "this runs once and does not need a rescan. %s",
         Addon:Tag(), n, Addon:Wrap("muted", "(Keep playing; the picker updates when it finishes.)")))
-    return Addon:StartItemScan({ repair = true })
+    return true
 end
 
 ----------------------------------------------------------------------
