@@ -292,6 +292,56 @@ function Scan.ReadRestrictions(lines, loc)
 end
 
 ----------------------------------------------------------------------
+-- A TOOLTIP THAT BUILT IS NOT THE SAME THING AS AN ITEM THAT LOADED  (1.3.1,
+-- third and final generation of this fix)
+--
+-- ReadRestrictions above answers "was there anything to parse". That question is
+-- necessary and it is not sufficient, and the difference is what round two still
+-- got wrong. SetItemByID on an item whose FULL data the client does not hold
+-- builds a PARTIAL tooltip: the name line renders (the client keeps the name from
+-- the last time anything asked for the item — our own earlier scan, in this case)
+-- while the block that carries "Classes: …" / "Requires: <faction>" does not,
+-- because those lines come from item data that is not there. The "did the tooltip
+-- build" test — a non-empty line 1 — accepts that partial happily, so "I saw no
+-- class line" was recorded as "this item has no class lock" for essentially every
+-- COLD item in the cache.
+--
+-- THE OWNER'S EVIDENCE, which is what pins this rather than a theory: the stamp-2
+-- repair ran to completion over all 9 240 real rows and reported "834 locked, 0
+-- unreadable" — ONE more lock than the 833 it started with, and not one row it
+-- could not read. A pass that genuinely re-read 9 240 tooltips and found nothing
+-- new is not a pass that was blind; a pass that read 9 240 partials and believed
+-- every one of them is exactly that number. Corroboration from the same cache:
+-- the Bonescythe ring DID capture mask 8, on the one occasion its data happened
+-- to be warm, and the contiguous Tier-3 band that lost every lock in the original
+-- scan is the same mechanism with the retry spin on top of it.
+--
+-- THE RULE. An UNRESTRICTED verdict is a claim about what the tooltip did not
+-- say, so it may only be believed when the item's data is verifiably loaded at
+-- read time. A RESTRICTION THAT WAS FOUND is believed unconditionally: evidence is
+-- evidence whatever the client's cache state, which is the same precedence
+-- Scan.Put applies to a write. So, exactly:
+--
+--   read == false                     -> never trusted (the tooltip built nothing)
+--   classMask ~= 0                    -> trusted: a class line rendered
+--   faction ~= FACTION_NONE           -> trusted: a faction line rendered, so the
+--                                        restriction block DID render and the
+--                                        absence of a class line means something
+--   both empty, data cached           -> trusted: a loaded item that names no class
+--                                        really has no class lock
+--   both empty, data NOT cached       -> NOT trusted. Ask the server, come back.
+--
+-- PURE, so the harness pins the decision itself rather than the caller that makes
+-- it; the caller supplies `dataCached` from C_Item.IsItemDataCachedByID.
+----------------------------------------------------------------------
+function Scan.TrustRead(read, classMask, faction, dataCached)
+    if not read then return false end
+    if (tonumber(classMask) or 0) ~= 0 then return true end
+    if (tonumber(faction) or 0) ~= Scan.FACTION_NONE then return true end
+    return dataCached and true or false
+end
+
+----------------------------------------------------------------------
 -- INTERNAL / UNOBTAINABLE ITEM NAMES
 --
 -- The 1..32000 id walk is a walk of the CLIENT's item space, and the client
@@ -472,7 +522,28 @@ Scan.CACHE_VERSION = 1
 --        rescanned a scan that COMPLETES under this build is stamped 2 by
 --                  FinishItemScan, so it is never re-flagged and no repair
 --                  follows it.
-Scan.RESTRICT_STAMP = 2
+--
+--   3  THE SECOND FORCING BUMP, and the same trigger class as the first: a
+--      shipped build consumed the unread flags while recording facts that were
+--      not true. Round two's machinery worked — it re-read all 9 240 rows and
+--      cleared every flag — but the READ it was running was blind to a partial
+--      tooltip (see Scan.TrustRead), so it wrote "no class lock" over every cold
+--      item and then reported "834 locked, 0 unreadable" as if the debt were
+--      settled. The flags are again the only record of that debt and they are
+--      again spent, so the stamp is again the only thing that can re-arm them.
+--      Every cache that ran the partial-blind pass therefore re-arms once more,
+--      and this time the read behind it is gated on the item's data actually
+--      being loaded.
+--
+--      What it costs each cache state, on the next login:
+--        stamp 1 or 2  every real row is re-flagged and one repair pass is owed,
+--                      now under the gated read. Locks already captured SURVIVE
+--                      the migration untouched (Normalize rewrites the flag bit
+--                      only) and the mask-preserve rule means an exhausted retry
+--                      cannot take one away, so the picker is correct throughout.
+--        stamp 3       nothing happens: a cache scanned or repaired under this
+--                      build is already stamped by FinishItemScan.
+Scan.RESTRICT_STAMP = 3
 
 local Q_BITS, M_BITS = 16, 4096      -- quality < 16, classMask < 4096
 local F_SHIFT = Q_BITS * M_BITS      -- 65536
@@ -831,6 +902,17 @@ end
 -- TOOLTIP_BUDGET caps the per-tick tooltip builds (the one genuinely expensive
 -- step) so a warm client cache — where every item resolves locally and instantly
 -- — cannot drain thousands of items in a single frame and hitch the client.
+--
+-- ONE CREDIT COVERS FIRST-ASKS AND RE-ASKS ALIKE (1.3.1, the data gate). Once an
+-- unrestricted verdict has to wait for the item's data to load, the RE-ask on the
+-- retry path is the traffic that dominates a repair pass, not the first dispatch:
+-- in a repair over a completed cache GetItemInfo already answers for nearly every
+-- row, so the dispatch loop hardly spends its credit at all while the retry path
+-- wants one load per cold row. Letting the retry path request outside the credit
+-- would have quietly doubled the peak the throttle was designed around, so both
+-- spend ST.loadSent and the peak stays exactly 300 requests/second. A retry that
+-- finds no credit left is requeued WITHOUT burning a try — the try is spent on
+-- an ask, not on a lap of the queue.
 ----------------------------------------------------------------------
 Scan.TICK             = 0.05
 Scan.INSTANT_PER_TICK = 1200   -- phase 1: local lookups only, no server traffic
@@ -843,6 +925,16 @@ Scan.MAX_TRIES        = 2
 -- before the row is written down as "restrictions unread" for the repair pass.
 -- The retry is what makes a momentary miss self-heal inside the same scan.
 Scan.TOOLTIP_TRIES    = 3
+-- …and how many times an item whose tooltip DID build but whose data is not
+-- loaded is put back. This is the far commoner case and it has a far better
+-- prospect of self-healing — the ask has been made, the server simply has not
+-- answered yet — so the ceiling is generous. It is not free patience: each try
+-- costs one lap of the remaining queue (ST.retry drains to the queue TAIL), so
+-- ten tries are spread across the whole pass rather than burned in a second, and
+-- a busy realm gets minutes rather than milliseconds to answer. When the ceiling
+-- IS exhausted the row is persisted unread and, under Scan.Put's mask-preserve
+-- rule, loses nothing it already knew.
+Scan.DATA_TRIES       = 10
 
 function Scan.PeakRequestsPerSecond() return Scan.REQUEST_PER_TICK / Scan.TICK end
 function Scan.PeakRecordsPerSecond()  return Scan.TOOLTIP_BUDGET   / Scan.TICK end
@@ -975,6 +1067,36 @@ end
 Addon.ItemScanTooltipLines = tooltipLines
 
 ----------------------------------------------------------------------
+-- IS THIS ITEM'S DATA ACTUALLY LOADED?  (1.3.1, the data gate)
+--
+-- The probe behind Scan.TrustRead. C_Item.IsItemDataCachedByID(itemID) is the
+-- client's own answer to exactly this question and it is present on this
+-- client — verified against the 1.15.9.68808 API catalogue, alongside
+-- C_Item.RequestLoadItemDataByID, which is the matching ask.
+--
+-- ABOUT THE FALLBACK, honestly: `GetItemInfo(id) ~= nil` is NOT a second line of
+-- defence against the partial tooltip. By the time recordItem reads a tooltip it
+-- has already established that GetItemInfo answers for this id, so on the very
+-- path that matters the fallback is always true and the gate degrades to the
+-- behaviour we are fixing. That is deliberate and it is the right trade: on a
+-- build with no C_Item namespace there is no way to ask the question, and
+-- degrading to "believe the tooltip" is what 1.3.0 through round two did, so no
+-- build is made worse. Every client the TOC targets HAS the API.
+--
+-- pcall, because a probe that raises must not take the whole scan down with it;
+-- a raise reads as "cannot answer", which routes to the fallback.
+----------------------------------------------------------------------
+local function itemDataCached(id)
+    local CI = _G.C_Item
+    if CI and CI.IsItemDataCachedByID then
+        local ok, cached = pcall(CI.IsItemDataCachedByID, id)
+        if ok and type(cached) == "boolean" then return cached end
+    end
+    return GetItemInfo(id) ~= nil
+end
+Addon.ItemScanDataCached = itemDataCached
+
+----------------------------------------------------------------------
 -- The scan runner
 ----------------------------------------------------------------------
 local ST      -- active scan state; nil when idle
@@ -1040,7 +1162,8 @@ function Addon:StartItemScan(opts)
         cursor = 0, phase = "instant",
         queue = {}, qHead = 1, queueTotal = 0,
         ready = {}, rHead = 1, retry = {},
-        inflight = {}, nInflight = 0, tries = {}, tipTries = {}, doneIds = {},
+        inflight = {}, nInflight = 0, tries = {}, tipTries = {}, dataTries = {},
+        doneIds = {}, loadSent = 0,
         found = 0, resolved = 0, failed = 0,
         acc = 0, started = GetTime(),
         valid = slotUnion(), loc = localeContext(),
@@ -1076,6 +1199,23 @@ function Addon:StopItemScan()
     return true
 end
 
+-- The one and only place the scan asks the server for an item, so the ONE credit
+-- is spent in one place too (see the THROTTLE note). -> true when the ask was
+-- actually made, false when this tick's credit is already gone.
+local function requestLoad(id)
+    if not ST then return false end
+    if (ST.loadSent or 0) >= Scan.REQUEST_PER_TICK then return false end
+    ST.loadSent = (ST.loadSent or 0) + 1
+    if _G.C_Item and _G.C_Item.RequestLoadItemDataByID then
+        -- recordItem's own GetItemInfo(id) miss has ALREADY queued a server load
+        -- for this id; the explicit request is the modern, documented form of the
+        -- same ask (1.15 C_Item), so a build without it still resolves through the
+        -- GetItemInfo path and fires the same event.
+        pcall(_G.C_Item.RequestLoadItemDataByID, id)
+    end
+    return true
+end
+
 -- Try to read + record an item from what the client already holds. Returns true
 -- when the item was recorded (or is known-bad); false means "still needs loading".
 local function recordItem(id)
@@ -1088,27 +1228,53 @@ local function recordItem(id)
     if not name then return false end
 
     local classMask, faction, read = Scan.ReadRestrictions(tooltipLines(id), ST.loc)
+
+    -- THE DATA GATE (1.3.1, third generation). `read` above says only that the
+    -- tooltip produced lines. An UNRESTRICTED verdict — no class line, no faction
+    -- line — is a claim about what was NOT there, and a partial tooltip built over
+    -- an item the client has not loaded says exactly that while knowing nothing.
+    -- Scan.TrustRead therefore demands the item's data be verifiably present
+    -- before an empty verdict is believed, and believes a found restriction
+    -- unconditionally. See the rule beside TrustRead for why "834 locked, 0
+    -- unreadable" over 9 240 rows is the signature of the blind read.
+    local cold = false
+    if read then
+        local cached = itemDataCached(id)
+        if not Scan.TrustRead(read, classMask, faction, cached) then
+            read, cold = false, true
+        end
+    end
+
     if not read then
-        -- THE TOOLTIP DID NOT BUILD. That is evidence of nothing, so it must not
-        -- be written down as "no class restriction" (1.3.0 did, and lost the
+        -- NOTHING TRUSTWORTHY WAS READ — either the tooltip did not build at all,
+        -- or it built without the item behind it. Neither is evidence, so neither
+        -- may be written down as "no class restriction" (1.3.0 did, and lost the
         -- class lock on every Tier-3 piece in the owner's cache). Put the id back
-        -- on the queue; only after TOOLTIP_TRIES does the row get persisted with
-        -- the unread flag, for the repair pass to pick up on a later session.
-        local t = (ST.tipTries[id] or 0) + 1
-        ST.tipTries[id] = t
-        if t < Scan.TOOLTIP_TRIES then
+        -- on the queue; only when its tries are spent does the row get persisted
+        -- with the unread flag, for the repair pass to pick up on a later session.
+        --
+        -- The two causes keep SEPARATE counters and separate ceilings. A tooltip
+        -- that will not build at all is a local fault with poor prospects, so it
+        -- gets TOOLTIP_TRIES; an item merely waiting on the server has been asked
+        -- for and will very probably arrive, so it gets the far more patient
+        -- DATA_TRIES. Sharing one counter would let a row that flips cause lose
+        -- the patience it had earned.
+        local tries   = cold and ST.dataTries or ST.tipTries
+        local ceiling = cold and Scan.DATA_TRIES or Scan.TOOLTIP_TRIES
+        local t = (tries[id] or 0) + 1
+        if t < ceiling then
             clearInflight()
             -- A LATER TICK, not this queue (1.3.1). Appending straight back onto
             -- ST.queue re-tries the id under conditions that have not changed —
-            -- at the tail of a repair pass all three tries burn inside a single
+            -- at the tail of a repair pass all the tries burn inside a single
             -- frame, in microseconds, and the row is written off as unreadable
             -- having never once been given time to load. ST.retry is drained at
             -- the TOP of the next tick, and the client is asked for the item on
             -- the way past so there is something new to read when it comes round.
             ST.retry[#ST.retry + 1] = id
-            if _G.C_Item and _G.C_Item.RequestLoadItemDataByID then
-                _G.C_Item.RequestLoadItemDataByID(id)
-            end
+            -- A try is spent on an ASK, never on a lap of the queue: when this
+            -- tick's request credit is gone the row comes round again unpunished.
+            if requestLoad(id) then tries[id] = t end
             return true
         end
     end
@@ -1177,6 +1343,11 @@ function Addon:ScanTick(elapsed)
     -- ── phase 2: resolve, under a credit window ──────────────────────────────
     local now = GetTime()
 
+    -- ONE request credit per tick, shared by the dispatch loop's first-asks and
+    -- the retry path's re-asks, so the data gate cannot raise the peak the
+    -- throttle was designed around.
+    ST.loadSent = 0
+
     -- rows whose tooltip refused LAST tick come back now, not sooner
     if #ST.retry > 0 then
         for _, id in ipairs(ST.retry) do ST.queue[#ST.queue + 1] = id end
@@ -1208,8 +1379,7 @@ function Addon:ScanTick(elapsed)
     end
 
     -- dispatch new work
-    local sent = 0
-    while budget > 0 and sent < Scan.REQUEST_PER_TICK
+    while budget > 0 and ST.loadSent < Scan.REQUEST_PER_TICK
           and ST.nInflight < Scan.MAX_INFLIGHT and ST.qHead <= #ST.queue do
         local id = ST.queue[ST.qHead]; ST.qHead = ST.qHead + 1
         if not ST.inflight[id] and not ST.doneIds[id] then
@@ -1219,14 +1389,7 @@ function Addon:ScanTick(elapsed)
                 ST.inflight[id] = now + Scan.REQUEST_TIMEOUT
                 ST.nInflight = ST.nInflight + 1
                 ST.tries[id] = ST.tries[id] or 1
-                -- recordItem's own GetItemInfo(id) miss has ALREADY queued a server
-                -- load for this id; the explicit request is the modern, documented
-                -- form of the same ask (1.15 C_Item), so a build without it still
-                -- resolves through the GetItemInfo path and fires the same event.
-                if _G.C_Item and _G.C_Item.RequestLoadItemDataByID then
-                    _G.C_Item.RequestLoadItemDataByID(id)
-                end
-                sent = sent + 1
+                requestLoad(id)
             end
         end
     end

@@ -84,6 +84,34 @@
   restriction it had read correctly the first time. A read that came back with nothing
   now keeps whatever the item already had and simply asks to look again later.
 
+- **…and, finally, the repair now waits for the item before deciding it is unrestricted.**
+  This is the root of the whole family of faults above, and it took the repair's own
+  report to expose it. That pass re-read all 9,240 items in a real cache and came back
+  with *one* more class lock than it started with, and not a single item it could not
+  read — which is not what re-reading nine thousand tooltips looks like. What was
+  happening: when Armory asks the game for an item it does not currently hold, the game
+  hands back a **partial** tooltip. The item's name is there, because Armory itself
+  asked for it earlier — but the "Classes: Rogue" line is not, because the data behind it
+  has not arrived. Armory checked that a tooltip had appeared, saw no class line on it,
+  and wrote down "this item has no class restriction". For nearly every item that was
+  not already loaded.
+
+  That is why the fix has taken three goes: each round repaired the machinery around a
+  read that was itself unreliable. Armory now asks the game a second question — *is this
+  item actually loaded?* — and only believes "no restrictions" when the answer is yes. A
+  restriction it *does* find is believed either way, because that line could not have
+  been drawn out of nothing. Anything not yet loaded is requested and revisited later in
+  the same pass, up to ten times spread across it, so a busy realm has minutes rather
+  than milliseconds to answer; anything still unanswered keeps whatever it already knew
+  and is left for a later session.
+
+  **Your cache re-arms once more and repairs itself, without a rescan.** The next time
+  you open the Goal picker after updating, the pass runs again under the new rule. Expect
+  it to take **about a minute or two** — it asks the server no faster than it did before —
+  and expect the class-locked count in `/darmory scanstatus` to rise by roughly a
+  hundred: the Tier 3 sets, the four Atieshes, the class relics and the rest of what was
+  read while cold. Nothing you can already see is lost while it runs.
+
 - **The picker no longer shows an item under the wrong name.** Armory merges your
   client's own scan with a bundled name list, the client always winning. Dropping an
   entry as a Blizzard placeholder used to release its id back to the bundled list, which

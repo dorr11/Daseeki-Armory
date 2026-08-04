@@ -3447,7 +3447,7 @@ end)
 suite("item-scan-capture-restamp", function(ck)
     if type(Scan) ~= "table" then ck(false, "itemScan.lua did not load"); return end
 
-    ck(Scan.RESTRICT_STAMP == 2,
+    ck(Scan.RESTRICT_STAMP == 3,
        "the capture stamp has MOVED (got " .. tostring(Scan.RESTRICT_STAMP)
        .. ") — nothing below can re-arm a consumed cache without it")
 
@@ -3695,8 +3695,10 @@ suite("item-scan-capture-restamp", function(ck)
     ck(fh ~= nil, "itemScan.lua is readable")
     if fh then
         local s = fh:read("*a"); fh:close()
-        ck(s:find("Scan%.RESTRICT_STAMP%s*=%s*2") ~= nil,
-           "the capture constant is at 2 in the source")
+        ck(s:find("Scan%.RESTRICT_STAMP%s*=%s*3") ~= nil,
+           "the capture constant is at 3 in the source")
+        ck(s:find("  3  THE SECOND FORCING BUMP") ~= nil,
+           "…and the bump carries its rationale, so the next reader knows WHY it moved")
         ck(s:find("cache%.restrictStamp%s*~=%s*Scan%.RESTRICT_STAMP") ~= nil,
            "Normalize compares against the CONSTANT, so the next bump needs one edit and no other")
         ck(s:find("restrictStamp%s*~=%s*1") == nil and s:find("restrictStamp%s*==%s*1") == nil,
@@ -3946,6 +3948,422 @@ suite("item-scan-mask-preserve", function(ck)
         local rec = s:find("Scan%.Put%(ST%.cache")
         ck(put ~= nil and rec ~= nil and rec > put,
            "…and the scan's one and only writer goes through it")
+    end
+end)
+
+----------------------------------------------------------------------
+-- AN UNRESTRICTED VERDICT IS ONLY BELIEVABLE FROM A LOADED ITEM  (1.3.1,
+-- third and final generation of the restriction fix)
+--
+-- THE DEFECT, proven by the owner's own pass rather than reasoned about: the
+-- stamp-2 repair ran to completion over all 9 240 real rows in his cache and
+-- reported "834 locked, 0 unreadable" — one more lock than the 833 it started
+-- with, and not a single row it could not read. That is not what a healthy
+-- re-read of 9 240 tooltips looks like. It is what a re-read looks like when
+-- SetItemByID builds a PARTIAL tooltip over an item whose data the client does
+-- not hold: line 1 carries the name (kept from the previous scan's own load) so
+-- the "did the tooltip build" test passes, while the block that carries
+-- "Classes: …" never renders — and "I saw no class line" was then written down
+-- as "this item has no class lock", for essentially every cold row.
+--
+-- Corroboration in the same cache: the one Bonescythe piece that DID capture
+-- mask 8 is the one whose data happened to be warm at read time, and the
+-- contiguous Tier-3 band that lost every lock in the original scan is the same
+-- mechanism with round one's retry spin on top of it.
+--
+-- THE FIX under test here: Scan.TrustRead. An empty verdict is believed only
+-- when the item's data is verifiably loaded; a restriction that WAS found is
+-- believed unconditionally (evidence is evidence — the same precedence
+-- Scan.Put applies to a write). A cold row is asked for and requeued instead,
+-- with a patient ceiling, and an exhausted ceiling persists it unread — which,
+-- under mask-preserve, costs it nothing it already knew.
+----------------------------------------------------------------------
+suite("item-scan-data-gate", function(ck)
+    if type(Scan) ~= "table" then ck(false, "itemScan.lua did not load"); return end
+
+    local ROGUE   = Scan.CLASS_BIT.ROGUE
+    local WARRIOR = Scan.CLASS_BIT.WARRIOR
+    local NONE    = Scan.FACTION_NONE
+    local HORDE   = Scan.FACTION_HORDE
+
+    -- ── 1. THE PRIMITIVE: the truth table, every cell ───────────────────────
+    ck(type(Scan.TrustRead) == "function", "Scan.TrustRead is published as a pure primitive")
+    if type(Scan.TrustRead) ~= "function" then return end
+
+    ck(Scan.TrustRead(false, 0, NONE, true) == false,
+       "a tooltip that did not build is never trusted, however warm the item is")
+    ck(Scan.TrustRead(false, ROGUE, NONE, true) == false,
+       "…not even when the parser somehow produced a mask from nothing")
+    ck(Scan.TrustRead(true, ROGUE, NONE, false) == true,
+       "THE GATE'S OTHER HALF: a class line that DID render is trusted on a cold item")
+    ck(Scan.TrustRead(true, 0, HORDE, false) == true,
+       "…and so is a faction line: the restriction block rendered, so the missing "
+       .. "class line is a finding")
+    ck(Scan.TrustRead(true, Scan.CLASS_UNKNOWN, NONE, false) == true,
+       "…and an unresolved class token is still a class line, so it is trusted too")
+    ck(Scan.TrustRead(true, 0, NONE, true) == true,
+       "a LOADED item that names no class really has no class lock")
+    ck(Scan.TrustRead(true, 0, NONE, false) == false,
+       "THE FIX: an EMPTY verdict off a COLD item is not evidence and is not trusted")
+    ck(Scan.TrustRead(true, 0, NONE, nil) == false,
+       "…and an unanswerable cache probe reads as cold, not as permission")
+
+    -- the ceiling exists, and is patient enough to be worth having
+    ck(type(Scan.DATA_TRIES) == "number" and Scan.DATA_TRIES >= 5,
+       "a cold row gets a patient retry ceiling (got " .. tostring(Scan.DATA_TRIES) .. ")")
+    ck(Scan.DATA_TRIES > Scan.TOOLTIP_TRIES,
+       "…more patient than a tooltip that will not build at all, whose prospects are worse")
+
+    ----------------------------------------------------------------------
+    -- 2. BEHAVIOURAL: drive the REAL recorder against a REAL partial tooltip.
+    -- The stubs model the defect exactly — GetItemInfo answers with the name
+    -- (which is why recordItem gets as far as the tooltip at all), the tooltip
+    -- builds with a name line and no restriction block, and
+    -- C_Item.IsItemDataCachedByID tells the truth about the item's data.
+    ----------------------------------------------------------------------
+    local function scanEnv()
+        local A = {}
+        local fnc = loadfile(P("itemScan.lua"))
+        if not fnc then return nil end
+        if not pcall(fnc, "Daseeki-Armory", A) then return nil end
+        A.Tag  = function() return "[Armory]" end
+        A.Wrap = function(_, _, s) return s end
+        A.SLOT_INVTYPES = { chest = { INVTYPE_ROBE = true } }
+        return A
+    end
+
+    local NIL  = {}
+    local KEYS = { "CreateFrame", "GetTime", "GetBuildInfo", "time", "UnitClass",
+                   "print", "UIParent", "C_Item", "C_CreatureInfo", "GetItemInfo",
+                   "GetItemInfoInstant", "LOCALIZED_CLASS_NAMES_MALE",
+                   "LOCALIZED_CLASS_NAMES_FEMALE", "ITEM_CLASSES_ALLOWED",
+                   "DaseekiArmoryScanDB" }
+    for i = 1, 8 do KEYS[#KEYS + 1] = "DaseekiArmoryItemScanTipTextLeft" .. i end
+
+    -- world state the cases drive
+    local W = {}
+    local function resetWorld()
+        W.cached  = {}   -- [id] = true once the item's data is "loaded"
+        W.tip     = {}   -- [id] = the tooltip lines this id builds RIGHT NOW
+        W.names   = {}
+        W.asked   = {}   -- [id] = how many times the server was asked
+        W.asks    = 0    -- total asks
+        W.peakAsk = 0    -- most asks inside any one tick
+        W.noAPI   = false
+        W.warmTip = nil    -- the lines an id builds ONCE its data has arrived
+        W.loadAfter = nil  -- ask count at which an id's data arrives
+    end
+    resetWorld()
+
+    local function withStubs(fn)
+        local saved = {}
+        for _, k in ipairs(KEYS) do
+            local v = _G[k]; saved[k] = (v == nil) and NIL or v
+        end
+        local frame = {}
+        function frame:Hide() end
+        function frame:Show() end
+        function frame:SetScript() end
+        function frame:RegisterEvent() end
+        function frame:UnregisterAllEvents() end
+        function frame:SetOwner() end
+        function frame:ClearLines() end
+        local shown
+        function frame:SetItemByID(id)
+            shown = W.tip[id]
+            for i = 1, 8 do _G["DaseekiArmoryItemScanTipTextLeft" .. i] = nil end
+            for i, txt in ipairs(shown or {}) do
+                local t = txt
+                _G["DaseekiArmoryItemScanTipTextLeft" .. i] = { GetText = function() return t end }
+            end
+        end
+        function frame:NumLines() return shown and #shown or 0 end
+        _G.CreateFrame  = function() return frame end
+        _G.GetTime      = function() return 1000 end
+        _G.GetBuildInfo = function() return "1.15.9", "68808" end
+        _G.time         = function() return 1786000000 end
+        _G.UnitClass    = function() return "Warrior", "WARRIOR" end
+        _G.UIParent     = frame
+        _G.print        = function() end
+        _G.C_CreatureInfo = nil
+        _G.LOCALIZED_CLASS_NAMES_MALE   = { ROGUE = "Rogue", WARRIOR = "Warrior" }
+        _G.LOCALIZED_CLASS_NAMES_FEMALE = nil
+        _G.ITEM_CLASSES_ALLOWED = "Classes: %s"
+        _G.GetItemInfo        = function(id) return W.names[id], nil, 4 end
+        _G.GetItemInfoInstant = function(id) return id, nil, nil, "INVTYPE_ROBE", 12345 end
+        -- NOT `W.noAPI and nil or {…}` — in Lua that always yields the table.
+        _G.C_Item = nil
+        if not W.noAPI then _G.C_Item = {
+            IsItemDataCachedByID = function(id) return W.cached[id] and true or false end,
+            RequestLoadItemDataByID = function(id)
+                W.asked[id] = (W.asked[id] or 0) + 1
+                W.asks = W.asks + 1
+                W.tickAsks = (W.tickAsks or 0) + 1
+                if W.peakAsk < W.tickAsks then W.peakAsk = W.tickAsks end
+                if W.loadAfter and W.asked[id] >= W.loadAfter then
+                    W.cached[id] = true
+                    if W.warmTip and W.warmTip[id] then W.tip[id] = W.warmTip[id] end
+                end
+            end,
+        } end
+        local packed = { pcall(fn) }
+        for _, k in ipairs(KEYS) do
+            local v = saved[k]; _G[k] = (v ~= NIL) and v or nil
+        end
+        return unpack(packed)
+    end
+
+    local function runToIdle(A, cap)
+        local t = 0
+        while A:IsScanning() and t < (cap or 200) do
+            W.tickAsks = 0
+            A:ScanTick(1); t = t + 1
+        end
+        A:StopItemScan()
+        return t
+    end
+
+    -- ── (a) THE DEFECT'S OWN CASE: cold item, partial tooltip ───────────────
+    -- Round two would have read "no Classes: line" here and written mask 0 over
+    -- a real rogue lock. The gate must refuse it, ask the server, and come back.
+    local A1 = scanEnv()
+    ck(A1 ~= nil, "a headless itemScan environment loads with C_Item present")
+    if A1 then
+        resetWorld()
+        W.names[22476] = "Bonescythe Breastplate"
+        W.tip[22476]   = { "Bonescythe Breastplate", "Binds when picked up" }  -- PARTIAL
+        W.warmTip      = { [22476] = { "Bonescythe Breastplate", "Binds when picked up",
+                                       "Chest", "Leather", "Classes: Rogue" } }
+        W.loadAfter    = 2   -- the realm answers on the second ask
+        local sv = Scan.NewCache()
+        Scan.Put(sv, 22476, "Bonescythe Breastplate", 4, 0, 0, true)
+        sv.scannedAt = 1785862751
+        local ok, ticks = withStubs(function()
+            _G.DaseekiArmoryScanDB = sv
+            A1:ItemScanCache()
+            A1:StartItemScan({ repair = true })
+            return runToIdle(A1)
+        end)
+        ck(ok == true, "(a) the gated repair pass runs over a partial tooltip")
+        ck(ticks < Scan.DATA_TRIES,
+           "(a) it finishes once the data arrives, well inside the ceiling (got "
+           .. tostring(ticks) .. ")")
+        ck(W.asks >= 2, "(a) the cold row was ASKED for, not written off (asks="
+           .. tostring(W.asks) .. ")")
+        local _, _, m, f, _, u = Scan.Get(sv, 22476)
+        ck(m == ROGUE,
+           "(a) THE FIX, END TO END: the class lock is captured once the item loads (got "
+           .. tostring(m) .. ")")
+        ck(f == NONE and u == false, "…the row is read, and owes nothing further")
+        ck(sv.unreadCount == 0, "…so the cache is clean")
+        ck(sv.restrictLocked == 1,
+           "…and the pass reports the lock it found (got " .. tostring(sv.restrictLocked) .. ")")
+    end
+
+    -- ── (b) THE ROUND-TWO REGRESSION, pinned: never recorded unrestricted ───
+    -- Same partial tooltip, but the realm NEVER answers. The row must not come
+    -- out of the pass claiming to be unrestricted-and-read.
+    local A2 = scanEnv()
+    if A2 then
+        resetWorld()
+        W.names[22476] = "Bonescythe Breastplate"
+        W.tip[22476]   = { "Bonescythe Breastplate", "Binds when picked up" }
+        W.cached[22476] = false           -- and it stays cold for ever
+        local sv2 = Scan.NewCache()
+        Scan.Put(sv2, 22476, "Bonescythe Breastplate", 4, ROGUE, 0, false)  -- a KNOWN lock
+        sv2.scannedAt     = 1785862751
+        sv2.restrictStamp = 2             -- off disk on the partial-blind stamp
+        local ok2, owed, ticks2 = withStubs(function()
+            _G.DaseekiArmoryScanDB = sv2
+            A2:ItemScanCache()                      -- LOGIN under stamp 3: re-armed
+            local n = Scan.UnreadCount(sv2)
+            A2:StartItemScan({ repair = true })
+            return n, runToIdle(A2)
+        end)
+        ck(ok2 == true, "(b) the pass runs against a tooltip that never fills in")
+        ck(owed == 1, "(b) the stamp-3 bump re-arms the row round two consumed")
+        ck(ticks2 == Scan.DATA_TRIES,
+           "(b) the ceiling is spent one try per TICK, never inside one frame (got "
+           .. tostring(ticks2) .. ")")
+        local _, _, m2, _, _, u2 = Scan.Get(sv2, 22476)
+        ck(m2 == ROGUE,
+           "(b) THE REGRESSION CANNOT RECUR: an exhausted ceiling keeps the stored lock")
+        ck(u2 == true, "…and leaves the row flagged unread for a later session")
+        ck(sv2.restrictUnreadable == 1,
+           "…so the pass reports it as UNREADABLE rather than as read-and-clean")
+        ck(sv2.unreadCount == 1, "…and the debt survives on disk")
+    end
+
+    -- ── (c) a COLD item whose tooltip DOES name a class: trusted at once ────
+    local A3 = scanEnv()
+    if A3 then
+        resetWorld()
+        W.names[16905] = "Bloodfang Chestpiece"
+        W.tip[16905]   = { "Bloodfang Chestpiece", "Chest", "Leather", "Classes: Warrior" }
+        W.cached[16905] = false           -- cold, and it does not matter
+        local sv3 = Scan.NewCache()
+        Scan.Put(sv3, 16905, "Bloodfang Chestpiece", 4, ROGUE, 0, true)
+        sv3.scannedAt = 1785862751
+        local ok3, ticks3 = withStubs(function()
+            _G.DaseekiArmoryScanDB = sv3
+            A3:ItemScanCache()
+            A3:StartItemScan({ repair = true })
+            return runToIdle(A3)
+        end)
+        ck(ok3 == true, "(c) the pass runs over a cold item with a real class line")
+        ck(ticks3 == 1, "(c) it is believed on the FIRST look — no wait, no retry (got "
+           .. tostring(ticks3) .. ")")
+        ck(W.asks == 0, "…and the server is never troubled for it")
+        local _, _, m3, _, _, u3 = Scan.Get(sv3, 16905)
+        ck(m3 == WARRIOR, "(c) evidence is evidence: the found lock is recorded as read")
+        ck(u3 == false, "…and the row owes nothing")
+    end
+
+    -- ── (d) a WARM item with no class line: trusted unrestricted ────────────
+    local A4 = scanEnv()
+    if A4 then
+        resetWorld()
+        W.names[9425] = "Pendulum of Doom"
+        W.tip[9425]   = { "Pendulum of Doom", "Binds when equipped", "Two-Hand", "Mace" }
+        W.cached[9425] = true             -- LOADED, so the silence means something
+        local sv4 = Scan.NewCache()
+        Scan.Put(sv4, 9425, "Pendulum of Doom", 4, ROGUE, 0, true)  -- a stale mask
+        sv4.scannedAt = 1785862751
+        local ok4, ticks4 = withStubs(function()
+            _G.DaseekiArmoryScanDB = sv4
+            A4:ItemScanCache()
+            A4:StartItemScan({ repair = true })
+            return runToIdle(A4)
+        end)
+        ck(ok4 == true, "(d) the pass runs over a warm item with no restriction block")
+        ck(ticks4 == 1, "(d) a loaded item is answered on the first look (got "
+           .. tostring(ticks4) .. ")")
+        ck(W.asks == 0, "…with no server round trip at all")
+        local _, _, m4, _, _, u4 = Scan.Get(sv4, 9425)
+        ck(m4 == 0,
+           "(d) THE GATE IS NOT A BLANKET REFUSAL: a read off a LOADED item still clears "
+           .. "a stale lock (got " .. tostring(m4) .. ")")
+        ck(u4 == false, "…and the row is recorded as read")
+        ck(sv4.unreadCount == 0, "…so no repair is owed afterwards")
+    end
+
+    -- ── (e) THROTTLE: re-asks spend the same credit as first-asks ───────────
+    -- The gate turns nearly every cold row into a server ask, so the retry path
+    -- is where a repair pass's traffic now lives. If it requested outside the
+    -- credit the peak would quietly double.
+    local A5 = scanEnv()
+    if A5 then
+        resetWorld()
+        local sv5 = Scan.NewCache()
+        for id = 30001, 30120 do
+            W.names[id] = "Cold Item " .. id
+            W.tip[id]   = { "Cold Item " .. id, "Binds when picked up" }   -- all partial
+            Scan.Put(sv5, id, "Cold Item " .. id, 4, 0, 0, true)
+        end
+        sv5.scannedAt = 1785862751
+        local ok5 = withStubs(function()
+            _G.DaseekiArmoryScanDB = sv5
+            A5:ItemScanCache()
+            A5:StartItemScan({ repair = true })
+            return runToIdle(A5, 400)
+        end)
+        ck(ok5 == true, "(e) a 120-row all-cold repair pass runs to completion")
+        ck(W.peakAsk <= Scan.REQUEST_PER_TICK,
+           "(e) THE THROTTLE HOLDS: no tick ever asks more than REQUEST_PER_TICK times (peak "
+           .. tostring(W.peakAsk) .. " vs " .. tostring(Scan.REQUEST_PER_TICK) .. ")")
+        ck(sv5.unreadCount == 120,
+           "…every row that never loaded is still owed (got " .. tostring(sv5.unreadCount) .. ")")
+        local capped = true
+        for id = 30001, 30120 do
+            if (W.asked[id] or 0) > Scan.DATA_TRIES then capped = false end
+        end
+        ck(capped, "…and no row was asked more times than its ceiling allows")
+    end
+
+    -- ── (e2) …including on the ARRIVALS path, which is where the dispatch ───
+    -- loop's own guard cannot reach. Items whose data arrived are drained under
+    -- TOOLTIP_BUDGET (25), not under REQUEST_PER_TICK (15); if such a row is
+    -- STILL cold when its tooltip is read — the realm answered the event and the
+    -- data went away again, or answered for a different id — it takes the retry
+    -- path and asks. Only requestLoad's own credit test bounds that.
+    local A5b = scanEnv()
+    if A5b then
+        resetWorld()
+        local sv5b = Scan.NewCache()
+        local IDS = {}
+        for id = 31001, 31040 do
+            IDS[#IDS + 1] = id
+            W.tip[id] = { "Arrived Item " .. id, "Binds when picked up" }   -- partial
+            Scan.Put(sv5b, id, "Arrived Item " .. id, 4, 0, 0, true)
+        end
+        sv5b.scannedAt = 1785862751
+        local ok5b, peak = withStubs(function()
+            _G.DaseekiArmoryScanDB = sv5b
+            A5b:ItemScanCache()
+            A5b:StartItemScan({ repair = true })
+            -- GetItemInfo answers for nothing yet, so every row goes IN FLIGHT
+            for _ = 1, 6 do W.tickAsks = 0; A5b:ScanTick(1) end
+            -- …then the whole batch "arrives" at once
+            for _, id in ipairs(IDS) do W.names[id] = "Arrived Item " .. id end
+            for _, id in ipairs(IDS) do A5b:ScanItemLoaded(id, true) end
+            W.peakAsk, W.tickAsks = 0, 0
+            A5b:ScanTick(1)               -- the drain tick: up to 25 tooltip reads
+            local p = W.peakAsk
+            A5b:StopItemScan()
+            return p
+        end)
+        ck(ok5b == true, "(e2) a batch of 40 arrivals drains under the tooltip budget")
+        ck(peak > 0, "(e2) …and the still-cold rows do ask the server (asks=" .. tostring(peak) .. ")")
+        ck(peak <= Scan.REQUEST_PER_TICK,
+           "(e2) THE CREDIT IS THE ONLY THING BOUNDING THE ARRIVALS PATH: "
+           .. tostring(peak) .. " asks in one tick, ceiling " .. tostring(Scan.REQUEST_PER_TICK))
+    end
+
+    -- ── (f) NO C_Item NAMESPACE: degrades, never raises ─────────────────────
+    local A6 = scanEnv()
+    if A6 then
+        resetWorld()
+        W.noAPI = true
+        W.names[9425] = "Pendulum of Doom"
+        W.tip[9425]   = { "Pendulum of Doom", "Two-Hand", "Mace" }
+        local sv6 = Scan.NewCache()
+        Scan.Put(sv6, 9425, "Pendulum of Doom", 4, 0, 0, true)
+        sv6.scannedAt = 1785862751
+        local ok6 = withStubs(function()
+            _G.DaseekiArmoryScanDB = sv6
+            A6:ItemScanCache()
+            A6:StartItemScan({ repair = true })
+            return runToIdle(A6)
+        end)
+        ck(ok6 == true, "(f) a build with no C_Item namespace still completes the pass")
+        ck(select(6, Scan.Get(sv6, 9425)) == false,
+           "…falling back to GetItemInfo, which is 1.3.1's behaviour unchanged — no build is "
+           .. "made worse by the gate")
+    end
+
+    -- ── source contract ─────────────────────────────────────────────────────
+    local fh = io.open(P("itemScan.lua"), "r")
+    ck(fh ~= nil, "itemScan.lua is readable")
+    if fh then
+        local s = fh:read("*a"); fh:close()
+        ck(s:find("A TOOLTIP THAT BUILT IS NOT THE SAME THING AS AN ITEM THAT LOADED") ~= nil,
+           "the rule is stated where the code enforces it")
+        ck(s:find("C_Item%.IsItemDataCachedByID") ~= nil,
+           "the probe is the client's own documented answer (1.15.9 API catalogue)")
+        ck(s:find("Scan%.TrustRead%(read, classMask, faction, cached%)") ~= nil,
+           "…and recordItem routes its verdict through the pure primitive")
+        local trust  = s:find("function Scan%.TrustRead")
+        local caller = s:find("Scan%.TrustRead%(read, classMask")
+        ck(trust ~= nil and caller ~= nil and caller > trust,
+           "…which is defined in the pure layer, above its one in-game caller")
+        ck(s:find("Scan%.DATA_TRIES") ~= nil and s:find("Scan%.TOOLTIP_TRIES") ~= nil,
+           "the two causes keep separate ceilings")
+        ck(s:find("if requestLoad%(id%) then tries%[id%] = t end") ~= nil,
+           "a try is spent on an ASK, so a throttled lap of the queue costs the row nothing")
+        ck(s:find("ST%.loadSent") ~= nil,
+           "…and both ask paths spend one shared per-tick credit")
+        ck(s:find("_G%.C_Item%.RequestLoadItemDataByID%(id%)\n") == nil,
+           "…with no ungoverned request left anywhere in the file")
     end
 end)
 
