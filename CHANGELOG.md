@@ -4,6 +4,45 @@
 
 ### Fixed
 
+- **The Goal picker shows the whole list again, in rarity colours.** 1.3.0 shipped the
+  rarity tint with a one-line fault that stopped the row list dead: the picker asked the
+  suite for a colour, got back only the red channel, and handing that to the game as a
+  colour raised an error partway through drawing the very first row. Everything after it
+  — the other eleven rows, every tint, and the "N items" line under the list — never ran.
+  What you saw was a single uncoloured line that changed as you scrolled, with the items
+  really there but never drawn. The list now fills all twelve rows, every row is tinted
+  by rarity (grey through orange), and the count line updates again.
+
+- **Rogue-only Tier 3 no longer offers itself to your warrior.** The picker hides gear
+  your class can never wear, and it reads that restriction off each item's tooltip while
+  it scans. When a tooltip did not build in time, 1.3.0 recorded "this item has no class
+  restriction" — the same thing it records for an item that genuinely has none. In a real
+  cache that silently erased the class lock from all eight Tier 3 armour sets, so
+  Bonescythe (rogue leather) sat in a warrior's list. Armory now knows the difference
+  between *read nothing* and *nothing to read*: it retries the item during the scan, and
+  marks anything still unreadable so it can come back to it.
+
+  **This repairs itself without a rescan.** The first time you open the Goal picker after
+  updating, Armory re-reads the class and faction locks for the affected items in the
+  background — names, rarities and everything else in your cache are left alone, and you
+  can keep using the picker while it runs. It happens once.
+
+- **The picker no longer shows an item under the wrong name.** Armory merges your
+  client's own scan with a bundled name list, the client always winning. Dropping an
+  entry as a Blizzard placeholder used to release its id back to the bundled list, which
+  does not agree with your client about what every id is — so a placeholder that had just
+  been filtered out reappeared under a stale name. That is why `Enchant Cloak -
+  Resistance` (the name of an *enchantment*, not of anything wearable) turned up in the
+  picker. Thirty-seven ids were doing this. The client's verdict on an id is now final.
+
+- **Enchantment names are filtered out of the picker.** The bundled name list carries 123
+  entries like `Enchant Cloak - Resistance` and `Enchant 2H Weapon - Agility`; those name
+  an effect, not an item, and none of them can be worn. The *recipes* are real and are
+  untouched — `Formula: Enchant Cloak - Greater Resistance` still appears — and so is
+  every genuine item whose name merely starts similarly, such as *Enchanted Thorium Helm*
+  and *Enchanter's Cowl*. One more Blizzard placeholder that had slipped through
+  (`Nax PH Crit Plate Shoulders`) is filtered too.
+
 - **The Goal picker no longer offers you items that do not exist.** 1.3.0 taught Armory
   to read your client's own item list, which was a real improvement — but your client
   also stores Blizzard's working records alongside the game's actual items: art

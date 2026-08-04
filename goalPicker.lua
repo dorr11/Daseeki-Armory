@@ -23,9 +23,19 @@
     turns the filter off for edge cases.
 
     Rows that are not ITEMS at all — Blizzard's placeholders, creature-equipment art,
-    designer test gear, retired duplicates — never enter the index (Scan.IsInternalName /
-    the cached internal flag). "Show unusable" does NOT bring them back: they are not
-    unusable, they are not real, and no character anywhere can obtain one.
+    designer test gear, retired duplicates, enchantment-effect names — never enter the
+    index (Scan.IsInternalName / the cached internal flag). "Show unusable" does NOT
+    bring them back: they are not unusable, they are not real, and no character
+    anywhere can obtain one.
+
+    SOURCE PRECEDENCE IS ABSOLUTE (1.3.1). Any id the SCAN covered is settled by the
+    scan, whatever it decided — kept, dropped as internal, or rejected for its equip
+    location. The bundled seed is an AtlasLoot snapshot whose ids do not all agree
+    with this client, so it may only speak for ids the scan never saw.
+
+    The class/faction locks the scan could not read are re-read lazily the first time
+    the picker opens in a session (Addon:MaybeRepairRestrictions) — a throttled pass
+    over only the flagged rows, no rescan, no id walk.
 
     An EMPTY search box lists the whole slot (browse mode), exactly as it has since
     1.0.0. There is no minimum query length and no row is ever the current goal echoed
@@ -43,6 +53,78 @@ local MAX_RESULTS = 500
 local picker
 
 local Scan = Addon.ItemScan
+
+-- ── The row pool: geometry and tint, as a PURE module ─────────────────────────
+-- Everything here is arithmetic over numbers, touches no WoW API, and is
+-- harness-gated. It exists because 1.3.0 shipped a picker that rendered ONE row:
+--
+--     local cr, cg, cb = Addon.Borders and Addon.Borders.QualityTextRGB(q)
+--
+-- In Lua an `and` expression is adjusted to a SINGLE value, so cg and cb were
+-- always nil, the very next line called SetTextColor(r, nil, nil), and that
+-- raises. Row 1 had already been given its text, rows 2..12 had not been touched
+-- yet, and the error left the loop — so the list showed exactly one line, no row
+-- was ever tinted, and scrolling appeared to reveal items one at a time. Tint()
+-- now returns the triple from a plain assignment; Rows.Tint's contract (all three
+-- or none) is what the harness pins.
+local Rows = {}
+Addon.GoalPickerRows = Rows
+Rows.ROW_HEIGHT  = ROWH
+Rows.VISIBLE     = ROWS
+Rows.LIST_TOP    = LIST_TOP
+Rows.WIDTH       = W
+Rows.FOOTER_Y    = FOOTER_Y
+Rows.MAX_RESULTS = MAX_RESULTS
+
+-- Downward offset of visible row i from the frame's TOPLEFT (1-based).
+function Rows.RowY(i)
+    i = math.floor(tonumber(i) or 0)
+    if i < 1 or i > ROWS then return nil end
+    return LIST_TOP + (i - 1) * ROWH
+end
+
+function Rows.FrameHeight() return FOOTER_Y + 32 end
+
+-- The furthest the list can scroll: the last screenful, never negative.
+function Rows.MaxOffset(n)
+    n = math.floor(tonumber(n) or 0)
+    return math.max(0, n - ROWS)
+end
+
+function Rows.ClampOffset(offset, n)
+    offset = math.floor(tonumber(offset) or 0)
+    if offset < 0 then return 0 end
+    local mx = Rows.MaxOffset(n)
+    if offset > mx then return mx end
+    return offset
+end
+
+-- Which result index each of the VISIBLE rows shows at this offset; false for a
+-- row that must be hidden. Always exactly ROWS entries — the list is a fixed
+-- pool, so every refresh has to say something about every row in it.
+function Rows.Slice(n, offset)
+    n = math.floor(tonumber(n) or 0)
+    offset = Rows.ClampOffset(offset, n)
+    local out = {}
+    for i = 1, ROWS do
+        local idx = offset + i
+        out[i] = (idx >= 1 and idx <= n) and idx or false
+    end
+    return out
+end
+
+-- -> r, g, b, needsLoad
+-- All three components or none: a caller can never be handed a partial color.
+-- needsLoad is true exactly when the quality is not known yet, which is the
+-- signal to ask the client for the item and re-tint on the reply.
+function Rows.Tint(quality, borders)
+    local B = borders or Addon.Borders
+    if B and B.QualityTextRGB then
+        local r, g, b = B.QualityTextRGB(quality)
+        if r ~= nil and g ~= nil and b ~= nil then return r, g, b, false end
+    end
+    return nil, nil, nil, true
+end
 
 -- ── Class / faction usability ─────────────────────────────────────────────────
 -- The predicate itself lives in itemScan.lua (pure, harness-gated); this is the
@@ -64,31 +146,43 @@ end
 function Addon:BuildGoalItemDB()
     local cache = Addon:ItemScanCache()
     -- the denylist stamp is part of the key: growing INTERNAL_PATTERNS must rebuild
-    -- the index, not wait for the next scan.
+    -- the index, not wait for the next scan. So is the restriction repair, which
+    -- changes class locks without changing a single name.
     local stamp = tostring(cache.scannedAt or 0) .. "/" .. tostring(cache.count or 0)
                   .. "/" .. tostring(cache.internalStamp or 0)
+                  .. "/" .. tostring(cache.restrictRepairedAt or 0)
     if Addon.GoalItemDB and Addon._goalDBStamp == stamp then return Addon.GoalItemDB end
 
-    local list, byId = {}, {}
-    -- `internal` is the cached flag when the caller has one (the scan already
-    -- derived it) and nil for the seed tables, where it is derived here. Internal
-    -- rows never enter the index at ALL, which is why "Show unusable" cannot
-    -- reveal them: that tick box is about items some OTHER character could equip,
-    -- and these are not items — they are Blizzard's placeholders and test records.
+    local list, settled = {}, {}
+    -- `settled` is every id a HIGHER-confidence source has already spoken for,
+    -- whatever it decided — kept, dropped as internal, or rejected for its equip
+    -- location. A lower source may never speak for a settled id again.
+    --
+    -- That is stricter than the "already in the list" test it replaces, and the
+    -- difference is a real defect (owner screenshot, 1.3.1): the internal drop
+    -- returns BEFORE the id is recorded, so dropping the client's placeholder at
+    -- id 13794 handed that id straight back to the bundled seed — which names
+    -- 13794 "Enchant Cloak - Resistance", an enchantment EFFECT, while the client
+    -- calls it "[PH] Shining Dawn Coif". The picker then showed the seed's wrong
+    -- name for a row the denylist had just removed. 37 ids in the owner's cache
+    -- were resurrecting like that, 7 of them as "Enchant …" rows.
+    --
+    -- itemDB.lua is an AtlasLoot-derived SNAPSHOT; where it and the client
+    -- disagree about what an id is, the client wins, always.
     local function add(id, name, quality, classMask, faction, scanned, internal)
-        if not id or byId[id] or type(name) ~= "string" or name == "" then return end
+        if not id or settled[id] then return end
+        settled[id] = true
+        if type(name) ~= "string" or name == "" then return end
         if internal == nil then internal = Scan.IsInternalName(name) end
         if internal then return end
         local _, _, _, equipLoc, icon, classID, subclassID = GetItemInfoInstant(id)
         if not (icon and equipLoc and equipLoc ~= "" and equipLoc ~= "INVTYPE_NON_EQUIP") then return end
-        local e = {
+        list[#list + 1] = {
             id = id, name = name:lower(), display = name, icon = icon,
             equipLoc = equipLoc, classID = classID, subclassID = subclassID,
             quality = quality, classMask = classMask or 0,
             faction = faction or Scan.FACTION_NONE, scanned = scanned or false,
         }
-        byId[id] = e
-        list[#list + 1] = e
     end
 
     -- 1 — the scan (authoritative)
@@ -107,7 +201,7 @@ function Addon:BuildGoalItemDB()
     -- 3 — PvP rank pieces: no bundled name, so ask the client for one
     local missing = 0
     for _, id in ipairs(Addon.PvPItemIDs or {}) do
-        if not byId[id] then
+        if not settled[id] then
             local nm, _, q = GetItemInfo(id)
             if nm then add(id, nm, q, seedClassMask(id), Scan.FACTION_NONE, false)
             else missing = missing + 1 end
@@ -269,10 +363,10 @@ local function ensure()
     f.hint:SetText("Search by item name, or shift-click an item link here")
 
     f.rows = {}
-    for i = 1, ROWS do
+    for i = 1, Rows.VISIBLE do
         local r = CreateFrame("Button", nil, f)
         r:SetSize(W - 28, ROWH)
-        r:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -(LIST_TOP + (i - 1) * ROWH))
+        r:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -Rows.RowY(i))
         r.bg = r:CreateTexture(nil, "BACKGROUND"); r.bg:SetAllPoints()
         r.bg:SetColorTexture(Addon:Col(i % 2 == 0 and "raised" or "panel", 0.5))
         r.icon = r:CreateTexture(nil, "ARTWORK"); r.icon:SetSize(22, 22); r.icon:SetPoint("LEFT", 2, 0)
@@ -318,8 +412,7 @@ local function ensure()
 
     f:EnableMouseWheel(true)
     f:SetScript("OnMouseWheel", function(_, delta)
-        local maxOff = math.max(0, #(picker._list or {}) - ROWS)
-        picker._offset = math.min(maxOff, math.max(0, (picker._offset or 0) - delta))
+        picker._offset = Rows.ClampOffset((picker._offset or 0) - delta, #(picker._list or {}))
         picker:RefreshList()
     end)
 
@@ -351,8 +444,11 @@ local function ensure()
     -- progress if the owner opens the picker while it is running.
     function f:SyncScanUI()
         local scanning = Addon:IsScanning()
-        if self.rescan.SetText then self.rescan:SetText(scanning and "Scanning…" or "Rescan Items") end
-        if self.rescan._label then self.rescan._label:SetText(scanning and "Scanning…" or "Rescan Items") end
+        local label = (not scanning and "Rescan Items")
+                   or (Addon.IsRepairing and Addon:IsRepairing() and "Repairing…")
+                   or "Scanning…"
+        if self.rescan.SetText then self.rescan:SetText(label) end
+        if self.rescan._label then self.rescan._label:SetText(label) end
         if scanning then self.rescan:Disable() else self.rescan:Enable() end
         if scanning and not self._scanPoll then
             self._scanPoll = true
@@ -376,6 +472,9 @@ local function ensure()
         if st.phase == "instant" then
             self.countText:SetText(string.format("Scanning item ids… %d%%  (%d equippable found)",
                 st.percent or 0, st.found or 0))
+        elseif st.phase == "repair" then
+            self.countText:SetText(string.format("Re-reading class restrictions… %d / %d  (%d%%)",
+                st.cursor or 0, st.total or 0, st.percent or 0))
         else
             self.countText:SetText(string.format("Loading items… %d / %d  (%d%%)",
                 st.cursor or 0, st.total or 0, st.percent or 0))
@@ -389,26 +488,31 @@ local function ensure()
 
     function f:RefreshList()
         local list  = self._list or {}
-        local start = (self._offset or 0)
-        for i, r in ipairs(self.rows) do
-            local e = list[start + i]
-            if e then
+        -- Slice says something about EVERY row in the pool, and the loop walks the
+        -- pool by index rather than with ipairs: a hole in the pool must not be
+        -- able to cut the list short, which is half of how 1.3.0 rendered one row.
+        local slice = Rows.Slice(#list, self._offset or 0)
+        for i = 1, Rows.VISIBLE do
+            local r = self.rows[i]
+            local e = slice[i] and list[slice[i]] or nil
+            if r and e then
                 r.icon:SetTexture(e.icon)
-                r.label:SetText(e.display)
-                -- RARITY TINT: the suite's quality chain, text variant.
-                local q = qualityOf(e)
-                local cr, cg, cb = Addon.Borders and Addon.Borders.QualityTextRGB(q)
+                -- RARITY TINT: the suite's quality chain, text variant. Decide the
+                -- color BEFORE touching the widget, and take all three components
+                -- from one assignment (see Rows.Tint).
+                local cr, cg, cb, needsLoad = Rows.Tint(qualityOf(e))
                 if cr then r.label:SetTextColor(cr, cg, cb)
                 else
                     r.label:SetTextColor(Addon:Col("text"))
                     -- uncached: ask the client, then re-tint on GET_ITEM_INFO_RECEIVED
-                    if _G.C_Item and _G.C_Item.RequestLoadItemDataByID then
+                    if needsLoad and _G.C_Item and _G.C_Item.RequestLoadItemDataByID then
                         _G.C_Item.RequestLoadItemDataByID(e.id)
                     end
                 end
+                r.label:SetText(e.display)
                 r._id = e.id
                 r:Show()
-            else
+            elseif r then
                 r._id = nil; r:Hide()
             end
         end
@@ -437,6 +541,12 @@ end
 function Addon:ShowGoalPicker(slotId, onPick)
     local f = ensure()
     Addon:WarmGoalItems()
+    -- LAZY RESTRICTION REPAIR: a cache written by the pre-1.3.1 capture cannot
+    -- say which of its rows had a readable tooltip, so the class locks it is
+    -- missing (every Tier-3 piece in the owner's cache) are re-read here, once,
+    -- for exactly the flagged rows. No wipe, no id walk, and the picker stays
+    -- usable while it runs.
+    if Addon.MaybeRepairRestrictions then Addon:MaybeRepairRestrictions() end
     f._onPick   = onPick
     f._slotId   = slotId
     f._validLoc = Addon.SLOT_INVTYPES[slotId] or {}

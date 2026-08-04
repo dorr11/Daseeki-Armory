@@ -26,9 +26,19 @@
                               credit-limited window, then read name + quality and
                               scan a hidden tooltip once for the restriction lines.
 
-    Only name / quality / classMask / faction / the internal flag are persisted;
-    everything else is re-derived instantly from GetItemInfoInstant at load,
-    which keeps the cache small and immune to client data changes.
+    Only name / quality / classMask / faction / the internal flag / the
+    restrictions-unread flag are persisted; everything else is re-derived instantly
+    from GetItemInfoInstant at load, which keeps the cache small and immune to
+    client data changes.
+
+    A TOOLTIP THAT DID NOT BUILD IS NOT AN ITEM WITHOUT RESTRICTIONS (1.3.1).
+    Phase 2's tooltip read can come back empty, and 1.3.0 wrote that down as
+    classMask = 0 — indistinguishable from an item it read and found unrestricted.
+    Every Tier-3 armour piece in the owner's cache lost its class lock that way, so
+    rogue-only Bonescythe offered itself to a warrior. Each record now carries a
+    restrictions-UNREAD bit, the scan retries an unreadable tooltip before writing
+    it off, and Addon:MaybeRepairRestrictions re-reads the flagged rows the next
+    time the goal picker opens.
 
     THE ID WALK SWEEPS UP BLIZZARD'S OWN SCAFFOLDING (1.3.1). The client's item
     space is not the game's item list: it also holds placeholders ("[PH] …"),
@@ -46,6 +56,8 @@
         Addon:StartItemScan(opts) -- opts = { force=, onProgress=, onDone= }
         Addon:StopItemScan()
         Addon:IsScanning()
+        Addon:IsRepairing()       -- true while the restriction re-read is running
+        Addon:MaybeRepairRestrictions()  -- lazy, once-per-session repair (picker open)
         Addon:ItemScanStatus()    -- progress record, or nil when idle
         Addon:ScanContext(showUnusable)  -- the viewing character's filter context
         Addon:InitItemScan()      -- login hook (binds the SV, auto-runs once)
@@ -253,6 +265,33 @@ function Scan.ParseRestrictions(lines, loc)
 end
 
 ----------------------------------------------------------------------
+-- READ vs "READ NOTHING" — the distinction 1.3.0 did not make (1.3.1).
+--
+-- The scan reads restrictions off a hidden tooltip. When that tooltip does not
+-- build, `lines` is nil — and 1.3.0 then fell through to classMask = 0, which is
+-- the SAME value it writes for an item it read successfully and found
+-- unrestricted. So a tooltip that never built was persisted as positive evidence
+-- of "anyone may wear this".
+--
+-- That is not theoretical: in the owner's real 10 504-item cache every one of the
+-- eight Tier-3 armour sets (ids 22416-22511, nine classes) carries classMask = 0,
+-- inside one contiguous 224-row band (ids 22314-22821) that holds no restricted
+-- row at all, while Tier 1 and Tier 2 either side of it are captured 8-for-8.
+-- Bonescythe (rogue leather) therefore offered itself to a warrior.
+--
+-- ReadRestrictions returns the third value the parser was always missing:
+-- whether there was anything to parse. An unread row is flagged in the cache and
+-- retried instead of being written down as a fact.
+----------------------------------------------------------------------
+function Scan.ReadRestrictions(lines, loc)
+    if type(lines) ~= "table" or #lines == 0 then
+        return 0, Scan.FACTION_NONE, false
+    end
+    local m, f = Scan.ParseRestrictions(lines, loc)
+    return m, f, true
+end
+
+----------------------------------------------------------------------
 -- INTERNAL / UNOBTAINABLE ITEM NAMES
 --
 -- The 1..32000 id walk is a walk of the CLIENT's item space, and the client
@@ -288,7 +327,7 @@ end
 
 -- Bump when the pattern list changes; Normalize re-derives every cached flag on
 -- a mismatch, so a pattern fix reaches an existing cache WITHOUT a rescan.
-Scan.INTERNAL_STAMP = 1
+Scan.INTERNAL_STAMP = 2
 
 Scan.INTERNAL_PATTERNS = {
     "%[ph%]",              --  79  "[PH] Brilliant Dawn Cap" — Blizzard's placeholder tag
@@ -323,6 +362,18 @@ Scan.INTERNAL_PATTERNS = {
     -- "TEST GUN Horde50" and "BKP 42 \"Ultra\"" are not what trips it.
     "%f[%a]%a%d%d ",       --  74  (10 of them caught by nothing else)
     "%f[%a]%a%d%d$",       --  16
+    -- SPELL-EFFECT CARRIERS (added 1.3.1 from the owner's screenshot: the picker
+    -- offered "Enchant Cloak - Resistance"). "Enchant <slot> - <effect>" is the
+    -- name of the enchantment EFFECT, not of anything a player can wear; the
+    -- bundled AtlasLoot seed carries 123 of them under ids that mean something
+    -- else entirely on this client. Swept across the owner's cache survivors PLUS
+    -- every seed row the cache does not cover (11 129 names): 90 hits, all of that
+    -- family, zero collisions. The anchor is what keeps the REAL neighbours:
+    --   "Formula: Enchant Cloak - Greater Resistance"  (34 recipes) — not at ^
+    --   "Enchanted Thorium Helm" / "Enchanter's Cowl"  (24 real)    — no space after "enchant"
+    "^enchant %w.* %- %a",  --  90  "Enchant Cloak - Resistance", "Enchant 2H Weapon - Agility"
+    "%f[%a]nax ph%f[%A]",   --   1  "Nax PH Crit Plate Shoulders" — a bare-PH placeholder
+                            --      that "%[ph%]" cannot see (no brackets)
 }
 
 -- -> the pattern that condemned this name, or nil when the name is a real item.
@@ -378,38 +429,46 @@ end
 --
 -- Layout (SavedVariables):
 --   { version, build, ranges, scannedAt, count, internalCount, internalStamp,
---     autoScanTried,
+--     unreadCount, restrictStamp, restrictRepairedAt, autoScanTried,
 --     names = { [id] = "Corehound Belt" },
 --     meta  = { [id] = packedNumber } }
 --
 -- meta packs quality (4 bits) + classMask (12 bits) + faction (2 bits) + the
--- internal/unobtainable flag (1 bit) into a single integer well inside Lua's
--- exact-double range. equipLoc / icon / classID / subclassID are deliberately
--- NOT stored: GetItemInfoInstant answers them offline and instantly for any id,
--- so persisting them would only let the cache go stale against a client data
--- change.
+-- internal/unobtainable flag (1 bit) + the restrictions-UNREAD flag (1 bit) into
+-- a single integer well inside Lua's exact-double range. equipLoc / icon /
+-- classID / subclassID are deliberately NOT stored: GetItemInfoInstant answers
+-- them offline and instantly for any id, so persisting them would only let the
+-- cache go stale against a client data change.
 --
--- The internal bit is the TOP bit, so every meta value written by 1.3.0 (which
--- had no such bit) reads back as internal=false — an old cache is stale, not
--- corrupt, and Normalize re-derives it in place rather than forcing a rescan.
+-- The two flag bits are the TOP bits, so every meta value written by 1.3.0 (which
+-- had neither) reads back with both clear — an old cache is stale, not corrupt,
+-- and Normalize re-derives them in place rather than forcing a rescan.
 ----------------------------------------------------------------------
 Scan.CACHE_VERSION = 1
+
+-- Bump when the RESTRICTION CAPTURE changes (as opposed to the denylist).
+-- Normalize flags every real row unread on a mismatch, which is how a cache
+-- written by a scan whose tooltip pass could silently read nothing gets repaired
+-- without a full id walk. 1 = the first capture we are prepared to believe.
+Scan.RESTRICT_STAMP = 1
 
 local Q_BITS, M_BITS = 16, 4096      -- quality < 16, classMask < 4096
 local F_SHIFT = Q_BITS * M_BITS      -- 65536
 local I_SHIFT = F_SHIFT * 4          -- 262144
+local U_SHIFT = I_SHIFT * 2          -- 524288
 
-function Scan.PackMeta(quality, classMask, faction, internal)
+function Scan.PackMeta(quality, classMask, faction, internal, unread)
     local q = math.floor(tonumber(quality)   or 0)
     local m = math.floor(tonumber(classMask) or 0)
     local f = math.floor(tonumber(faction)   or 0)
     if q < 0 then q = 0 elseif q > Q_BITS - 1 then q = Q_BITS - 1 end
     if m < 0 then m = 0 elseif m > M_BITS - 1 then m = M_BITS - 1 end
     if f < 0 then f = 0 elseif f > 3 then f = 3 end
-    return q + m * Q_BITS + f * F_SHIFT + (internal and I_SHIFT or 0)
+    return q + m * Q_BITS + f * F_SHIFT
+           + (internal and I_SHIFT or 0) + (unread and U_SHIFT or 0)
 end
 
--- -> quality, classMask, faction, internal(boolean)
+-- -> quality, classMask, faction, internal(boolean), unread(boolean)
 function Scan.UnpackMeta(n)
     n = math.floor(tonumber(n) or 0)
     if n < 0 then n = 0 end
@@ -417,12 +476,14 @@ function Scan.UnpackMeta(n)
     local m = math.floor(n / Q_BITS) % M_BITS
     local f = math.floor(n / F_SHIFT) % 4
     local i = math.floor(n / I_SHIFT) % 2 == 1
-    return q, m, f, i
+    local u = math.floor(n / U_SHIFT) % 2 == 1
+    return q, m, f, i, u
 end
 
 function Scan.NewCache()
     return { version = Scan.CACHE_VERSION, names = {}, meta = {}, count = 0,
-             internalCount = 0, internalStamp = Scan.INTERNAL_STAMP }
+             internalCount = 0, internalStamp = Scan.INTERNAL_STAMP,
+             unreadCount = 0, restrictStamp = Scan.RESTRICT_STAMP }
 end
 
 -- Bind / repair a table that came back off disk. A version bump discards the old
@@ -435,6 +496,13 @@ end
 -- learns about tomorrow is filtered on the NEXT LOGIN of an existing cache,
 -- with no minute-long walk of the id space, and a rescan re-derives it anyway
 -- (Scan.Put reads the name), so the two paths can never disagree.
+--
+-- The restrictions-unread flag is re-derived on the same principle, from
+-- cache.restrictStamp. A cache written before 1.3.1 cannot say which of its rows
+-- had a tooltip and which did not — the two were recorded identically — so on a
+-- stamp mismatch EVERY real row is flagged unread and the repair pass re-reads
+-- them. Internal rows are never flagged: they never reach the picker, so their
+-- restrictions are not a question anyone asks.
 function Scan.Normalize(cache)
     if type(cache) ~= "table" or cache.version ~= Scan.CACHE_VERSION then
         return Scan.NewCache()
@@ -442,27 +510,29 @@ function Scan.Normalize(cache)
     if type(cache.names) ~= "table" then cache.names = {} end
     if type(cache.meta)  ~= "table" then cache.meta  = {} end
 
-    local restamp = cache.internalStamp ~= Scan.INTERNAL_STAMP
-    local n, internal = 0, 0
+    local restamp   = cache.internalStamp ~= Scan.INTERNAL_STAMP
+    local reread    = cache.restrictStamp ~= Scan.RESTRICT_STAMP
+    local n, internal, unread = 0, 0, 0
     for id, nm in pairs(cache.names) do
         n = n + 1
-        local flag
-        if restamp then
-            local q, m, f = Scan.UnpackMeta(cache.meta[id])
-            flag = Scan.IsInternalName(nm)
-            cache.meta[id] = Scan.PackMeta(q, m, f, flag)
-        else
-            flag = select(4, Scan.UnpackMeta(cache.meta[id]))
+        local q, m, f, flag, unflag = Scan.UnpackMeta(cache.meta[id])
+        if restamp then flag = Scan.IsInternalName(nm) end
+        if reread  then unflag = not flag end
+        if restamp or reread then
+            cache.meta[id] = Scan.PackMeta(q, m, f, flag, unflag)
         end
-        if flag then internal = internal + 1 end
+        if flag then internal = internal + 1
+        elseif unflag then unread = unread + 1 end
     end
     cache.count         = n
     cache.internalCount = internal
     cache.internalStamp = Scan.INTERNAL_STAMP
+    cache.unreadCount   = unread
+    cache.restrictStamp = Scan.RESTRICT_STAMP
     return cache
 end
 
-function Scan.Put(cache, id, name, quality, classMask, faction)
+function Scan.Put(cache, id, name, quality, classMask, faction, unread)
     if type(cache) ~= "table" then return false end
     id = tonumber(id)
     if not id or type(name) ~= "string" or name == "" then return false end
@@ -472,19 +542,42 @@ function Scan.Put(cache, id, name, quality, classMask, faction)
     cache.names[id] = name
     -- The internal flag is DERIVED, never passed in: the name is the only
     -- evidence there is, so a rescan cannot lose the flag and a caller cannot
-    -- disagree with the denylist.
-    cache.meta[id]  = Scan.PackMeta(quality, classMask, faction, Scan.IsInternalName(name))
+    -- disagree with the denylist. An internal row is never "unread" — nothing
+    -- ever asks it for a class lock.
+    local internal = Scan.IsInternalName(name)
+    cache.meta[id] = Scan.PackMeta(quality, classMask, faction, internal,
+                                   (not internal) and unread and true or false)
     return true
 end
 
--- -> name, quality, classMask, faction, internal   (nil when the id was never scanned)
+-- -> name, quality, classMask, faction, internal, unread
+--    (nil when the id was never scanned)
 function Scan.Get(cache, id)
     if type(cache) ~= "table" or type(cache.names) ~= "table" then return nil end
     id = tonumber(id)
     local nm = id and cache.names[id]
     if not nm then return nil end
-    local q, m, f, i = Scan.UnpackMeta(cache.meta and cache.meta[id])
-    return nm, q, m, f, i
+    local q, m, f, i, u = Scan.UnpackMeta(cache.meta and cache.meta[id])
+    return nm, q, m, f, i, u
+end
+
+-- Ids whose class/faction locks were never actually read off a tooltip, in id
+-- order (so a repair pass walks the cache the same way the scan did).
+function Scan.UnreadIds(cache)
+    local out = {}
+    if type(cache) ~= "table" or type(cache.names) ~= "table" then return out end
+    for id in pairs(cache.names) do
+        local _, _, _, internal, unread = Scan.UnpackMeta(cache.meta and cache.meta[id])
+        if unread and not internal then out[#out + 1] = id end
+    end
+    table.sort(out)
+    return out
+end
+
+function Scan.UnreadCount(cache)
+    if type(cache) ~= "table" then return 0 end
+    if type(cache.unreadCount) == "number" then return cache.unreadCount end
+    return #Scan.UnreadIds(cache)
 end
 
 -- True once a scan has run to completion at least once on this account.
@@ -605,6 +698,10 @@ Scan.MAX_INFLIGHT     = 200
 Scan.TOOLTIP_BUDGET   = 25
 Scan.REQUEST_TIMEOUT  = 6      -- seconds before a silent request is retried
 Scan.MAX_TRIES        = 2
+-- How many times an item whose TOOLTIP would not build is put back on the queue
+-- before the row is written down as "restrictions unread" for the repair pass.
+-- The retry is what makes a momentary miss self-heal inside the same scan.
+Scan.TOOLTIP_TRIES    = 3
 
 function Scan.PeakRequestsPerSecond() return Scan.REQUEST_PER_TICK / Scan.TICK end
 function Scan.PeakRecordsPerSecond()  return Scan.TOOLTIP_BUDGET   / Scan.TICK end
@@ -712,12 +809,21 @@ local scanTip
 local function tooltipLines(id)
     if not scanTip then
         scanTip = CreateFrame("GameTooltip", "DaseekiArmoryItemScanTip", nil, "GameTooltipTemplate")
-        scanTip:SetOwner(UIParent, "ANCHOR_NONE")
     end
+    -- SetOwner on EVERY call, not once at creation. A GameTooltip that has lost
+    -- its owner builds nothing at all, silently, and 1.3.0 read that silence as
+    -- "this item has no class restriction" — see ReadRestrictions above.
+    scanTip:SetOwner(UIParent, "ANCHOR_NONE")
     scanTip:ClearLines()
     scanTip:SetItemByID(id)
     local n = scanTip:NumLines() or 0
     if n < 2 then return nil end
+    -- Line 1 is the item name. An empty line 1 means the tooltip did not really
+    -- build for this id, whatever NumLines claims, so treat it as unread rather
+    -- than as an item with nothing to say.
+    local head = _G["DaseekiArmoryItemScanTipTextLeft1"]
+    local title = head and head:GetText()
+    if not title or title == "" then return nil end
     local out = {}
     for i = 2, n do
         local fs = _G["DaseekiArmoryItemScanTipTextLeft" .. i]
@@ -754,6 +860,7 @@ local function runnerFrame()
 end
 
 function Addon:IsScanning() return ST ~= nil end
+function Addon:IsRepairing() return (ST and ST.repair) and true or false end
 
 function Addon:ItemScanStatus()
     if not ST then return nil end
@@ -764,7 +871,7 @@ function Addon:ItemScanStatus()
     end
     local total = ST.queueTotal or 0
     local done  = ST.resolved + ST.failed
-    return { phase = "resolve", cursor = done, total = total,
+    return { phase = ST.repair and "repair" or "resolve", cursor = done, total = total,
              percent = Scan.Percent(done, total),
              found = ST.found, resolved = ST.resolved, failed = ST.failed,
              pending = math.max(0, total - done) }
@@ -774,11 +881,17 @@ local function report()
     if ST and ST.onProgress then ST.onProgress(Addon:ItemScanStatus()) end
 end
 
+-- opts.force   wipe the cache and re-walk the whole id space
+-- opts.repair  skip the id walk entirely and re-read ONLY the rows whose
+--              restrictions were never actually read off a tooltip. Same
+--              throttle, same recorder, a fraction of the work — this is the
+--              path that repairs a cache written by the pre-1.3.1 capture.
 function Addon:StartItemScan(opts)
     if ST then return false end
     opts = opts or {}
     local cache = Addon:ItemScanCache()
     if opts.force then cache.names, cache.meta, cache.count = {}, {}, 0 end
+    local repair = (opts.repair and not opts.force) and true or false
 
     local ranges = Scan.ActiveRanges()
     ST = {
@@ -786,13 +899,22 @@ function Addon:StartItemScan(opts)
         cursor = 0, phase = "instant",
         queue = {}, qHead = 1, queueTotal = 0,
         ready = {}, rHead = 1,
-        inflight = {}, nInflight = 0, tries = {}, doneIds = {},
+        inflight = {}, nInflight = 0, tries = {}, tipTries = {}, doneIds = {},
         found = 0, resolved = 0, failed = 0,
         acc = 0, started = GetTime(),
         valid = slotUnion(), loc = localeContext(),
         force = opts.force and true or false,
+        repair = repair,
         onProgress = opts.onProgress, onDone = opts.onDone,
     }
+    if repair then
+        ST.phase      = "resolve"
+        ST.cursor     = ST.total
+        ST.queue      = Scan.UnreadIds(cache)
+        ST.queueTotal = #ST.queue
+        ST.found      = ST.queueTotal
+        if ST.queueTotal == 0 then ST = nil; return false end
+    end
     -- Both events carry (itemID, success) and the handler is idempotent, so watching
     -- both is belt and braces. RegisterEvent RAISES on an event a build does not know,
     -- and the TOC spans three interface versions, so each one is guarded.
@@ -817,19 +939,34 @@ end
 -- when the item was recorded (or is known-bad); false means "still needs loading".
 local function recordItem(id)
     if not ST then return false end
-    if ST.doneIds[id] then
+    local function clearInflight()
         if ST.inflight[id] then ST.inflight[id] = nil; ST.nInflight = ST.nInflight - 1 end
-        return true
     end
+    if ST.doneIds[id] then clearInflight(); return true end
     local name, _, quality = GetItemInfo(id)
     if not name then return false end
-    local classMask, faction = 0, Scan.FACTION_NONE
-    local lines = tooltipLines(id)
-    if lines then classMask, faction = Scan.ParseRestrictions(lines, ST.loc) end
-    Scan.Put(ST.cache, id, name, quality or 1, classMask, faction)
+
+    local classMask, faction, read = Scan.ReadRestrictions(tooltipLines(id), ST.loc)
+    if not read then
+        -- THE TOOLTIP DID NOT BUILD. That is evidence of nothing, so it must not
+        -- be written down as "no class restriction" (1.3.0 did, and lost the
+        -- class lock on every Tier-3 piece in the owner's cache). Put the id back
+        -- on the queue; only after TOOLTIP_TRIES does the row get persisted with
+        -- the unread flag, for the repair pass to pick up on a later session.
+        local t = (ST.tipTries[id] or 0) + 1
+        ST.tipTries[id] = t
+        if t < Scan.TOOLTIP_TRIES then
+            clearInflight()
+            ST.queue[#ST.queue + 1] = id
+            return true
+        end
+    end
+
+    Scan.Put(ST.cache, id, name, quality or 1, classMask, faction, not read)
     ST.doneIds[id] = true
     ST.resolved = ST.resolved + 1
-    if ST.inflight[id] then ST.inflight[id] = nil; ST.nInflight = ST.nInflight - 1 end
+    if not read then ST.unread = (ST.unread or 0) + 1 end
+    clearInflight()
     return true
 end
 
@@ -946,34 +1083,74 @@ function Addon:FinishItemScan()
 
     local cache = st.cache
     cache.version   = Scan.CACHE_VERSION
-    cache.scannedAt = (type(time) == "function" and time()) or 0
-    cache.ranges    = Scan.RangesLabel(st.ranges)
-    cache.build     = select(2, GetBuildInfo())
-    cache.autoScanTried = nil        -- a completed scan re-arms the auto path for a future reset
-    local n, restricted, internal = 0, 0, 0
+    if st.repair then
+        cache.restrictRepairedAt = (type(time) == "function" and time()) or 0
+    else
+        cache.scannedAt = (type(time) == "function" and time()) or 0
+        cache.ranges    = Scan.RangesLabel(st.ranges)
+        cache.build     = select(2, GetBuildInfo())
+        cache.autoScanTried = nil    -- a completed scan re-arms the auto path for a future reset
+    end
+    local n, restricted, internal, unread = 0, 0, 0, 0
     for id in pairs(cache.names) do
         n = n + 1
-        local _, m, f, i = Scan.UnpackMeta(cache.meta[id])
+        local _, m, f, i, u = Scan.UnpackMeta(cache.meta[id])
         if i then internal = internal + 1
-        elseif m > 0 or f ~= Scan.FACTION_NONE then restricted = restricted + 1 end
+        else
+            if u then unread = unread + 1 end
+            if m > 0 or f ~= Scan.FACTION_NONE then restricted = restricted + 1 end
+        end
     end
     cache.count         = n
     cache.internalCount = internal
     cache.internalStamp = Scan.INTERNAL_STAMP
+    cache.unreadCount   = unread
+    cache.restrictStamp = Scan.RESTRICT_STAMP
 
     -- the picker's index is derived from the cache; force a rebuild
     Addon.GoalItemDB, Addon._goalDBStamp = nil, nil
 
     local secs = Scan.FormatDuration(GetTime() - st.started) or "?"
-    -- The internal count is reported, not hidden: the owner should be able to see
-    -- that ~12% of what the client holds is Blizzard's own scaffolding, and that
-    -- Armory kept it out of the picker on purpose.
-    print(string.format("%s item scan complete — %d equippable items cached (%d restricted, "
-        .. "%d internal/unobtainable hidden) in %s.%s",
-        Addon:Tag(), n - internal, restricted, internal, secs,
-        st.failed > 0 and (" " .. st.failed .. " could not be loaded.") or ""))
+    if st.repair then
+        -- The repair pass is reported in the terms that make it checkable: how
+        -- many rows now carry a class/faction lock, and how many are still unread.
+        print(string.format("%s item restrictions re-read — %d items now carry a class or "
+            .. "faction lock, %d still unreadable, in %s.",
+            Addon:Tag(), restricted, unread, secs))
+    else
+        -- The internal count is reported, not hidden: the owner should be able to see
+        -- that ~12% of what the client holds is Blizzard's own scaffolding, and that
+        -- Armory kept it out of the picker on purpose.
+        print(string.format("%s item scan complete — %d equippable items cached (%d restricted, "
+            .. "%d internal/unobtainable hidden) in %s.%s",
+            Addon:Tag(), n - internal, restricted, internal, secs,
+            st.failed > 0 and (" " .. st.failed .. " could not be loaded.") or ""))
+    end
 
     if st.onDone then st.onDone(cache, st, false) end
+end
+
+----------------------------------------------------------------------
+-- THE LAZY RESTRICTION REPAIR (1.3.1)
+--
+-- Called when the goal picker opens. If the cache holds rows whose class /
+-- faction locks were never actually read, re-read exactly those rows — no id
+-- walk, no wipe, names and qualities untouched. Once per session at most, and
+-- only on a cache that has already completed a scan (before that, the scan
+-- itself is the thing to run).
+----------------------------------------------------------------------
+function Addon:MaybeRepairRestrictions()
+    if ST then return false end
+    if Addon._restrictRepairTried then return false end
+    local cache = Addon:ItemScanCache()
+    if not Scan.IsComplete(cache) then return false end
+    local n = Scan.UnreadCount(cache)
+    if n <= 0 then return false end
+    Addon._restrictRepairTried = true
+    print(string.format("%s re-reading class restrictions for %d cached items — "
+        .. "this runs once and does not need a rescan. %s",
+        Addon:Tag(), n, Addon:Wrap("muted", "(Keep playing; the picker updates when it finishes.)")))
+    return Addon:StartItemScan({ repair = true })
 end
 
 ----------------------------------------------------------------------

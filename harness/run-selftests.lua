@@ -1955,6 +1955,9 @@ suite("item-scan-internal-filter", function(ck)
         ["^%d+ gray %a"]        = "40 Gray Mage Robe",
         ["%f[%a]%a%d%d "]       = "Black Leather D02 Boots",
         ["%f[%a]%a%d%d$"]       = "Monster Shield Engineer A01",
+        -- 1.3.1, from the owner's second screenshot
+        ["^enchant %w.* %- %a"] = "Enchant Cloak - Resistance",
+        ["%f[%a]nax ph%f[%A]"]  = "Nax PH Crit Plate Shoulders",
     }
     local uncovered = {}
     for _, p in ipairs(Scan.INTERNAL_PATTERNS) do
@@ -1991,6 +1994,18 @@ suite("item-scan-internal-filter", function(ck)
         "Nat Pagle's Extreme Angler FC-5000", "Warglaive of Azzinoth (Left)",
         "Seal of the Dawn", "Tabard of the Argent Dawn",
         "BKP 42 \"Ultra\"", "Warlock Orb 35",
+        -- the enchant family's real neighbours (1.3.1). The recipes are genuine
+        -- tradeable items and the "Enchanted …" gear is genuine worn gear; only
+        -- the bare "Enchant <slot> - <effect>" spell-effect name is not real.
+        "Formula: Enchant Cloak - Resistance",
+        "Formula: Enchant Cloak - Greater Resistance",
+        "Formula: Enchant 2H Weapon - Major Intellect",
+        "Formula: Enchant Gloves - Superior Agility",
+        "Enchanted Thorium Helm", "Enchanted Thorium Breastplate",
+        "Enchanted Battlehammer", "Enchanted Kodo Bracers",
+        "Enchanted Moonstalker Cloak", "Enchanted South Seas Kelp",
+        "Enchanter's Cowl", "Boots of the Enchanter",
+        "Pristine Enchanted South Seas Kelp",
     }
     for _, nm in ipairs(SURVIVORS) do
         ck(Scan.IsInternalName(nm) == false,
@@ -2011,6 +2026,35 @@ suite("item-scan-internal-filter", function(ck)
         ck(Scan.IsInternalName(t[1]) == false and Scan.IsInternalName(t[2]) == true,
            "the live item outlives its dead twin: " .. t[1])
     end
+
+    -- ── THE ENCHANT FAMILY (1.3.1) ──────────────────────────────────────────
+    -- "Enchant <slot> - <effect>" is the name of an enchantment EFFECT. The
+    -- bundled AtlasLoot seed carries 123 of them; the owner's picker offered
+    -- "Enchant Cloak - Resistance". Fixtures are verbatim seed names, one per
+    -- slot the family covers, so a future narrowing of the pattern goes red.
+    local ENCHANTS = {
+        "Enchant Cloak - Resistance", "Enchant Cloak - Greater Resistance",
+        "Enchant Cloak - Superior Defense", "Enchant Cloak - Stealth",
+        "Enchant Chest - Greater Stats", "Enchant Chest - Minor Absorption",
+        "Enchant Bracer - Superior Strength", "Enchant Bracer - Mana Regeneration",
+        "Enchant Gloves - Advanced Herbalism", "Enchant Gloves - Riding Skill",
+        "Enchant Boots - Minor Speed", "Enchant Shield - Lesser Block",
+        "Enchant Weapon - Crusader", "Enchant Weapon - Mighty Intellect",
+        "Enchant 2H Weapon - Agility",        -- the slot token starts with a DIGIT
+        "Enchant 2H Weapon - Superior Impact",
+    }
+    for _, nm in ipairs(ENCHANTS) do
+        ck(Scan.InternalPattern(nm) == "^enchant %w.* %- %a",
+           "the enchant-effect pattern removes: " .. nm)
+    end
+    -- …and the pattern's anchor is load-bearing in BOTH directions.
+    ck(Scan.IsInternalName("Formula: Enchant Cloak - Resistance") == false,
+       "the RECIPE for the very same enchant survives (it is a real, tradeable item)")
+    ck(Scan.IsInternalName("Enchanted Thorium Helm") == false,
+       "'Enchanted …' survives: the pattern needs a SPACE after the word enchant")
+    ck(Scan.IsInternalName("Enchanter's Cowl") == false, "…and so does 'Enchanter's …'")
+    ck(Scan.IsInternalName("Enchant Cloak") == false,
+       "a bare 'Enchant <word>' with no ' - <effect>' is not the family and is left alone")
 
     -- degenerate inputs
     ck(Scan.IsInternalName(nil) == false, "nil is not an internal name")
@@ -2074,6 +2118,7 @@ suite("item-scan-internal-filter", function(ck)
     local FIX = {}
     for _, nm in pairs(KILLS) do FIX[#FIX + 1] = nm end
     for _, nm in ipairs(SURVIVORS) do FIX[#FIX + 1] = nm end
+    for _, nm in ipairs(ENCHANTS) do FIX[#FIX + 1] = nm end
     FIX[#FIX + 1] = "test Eric Shirt"
     FIX[#FIX + 1] = "Mandokir's Sting DEPRECATED"
     FIX[#FIX + 1] = "Monster - Axe, 2H Pendulum of Doom"
@@ -2100,6 +2145,11 @@ suite("item-scan-internal-filter", function(ck)
         ["N8 only the first pattern is consulted"] = function(name)
             return tostring(name or ""):lower():find(Scan.INTERNAL_PATTERNS[1]) ~= nil
         end,
+        -- 1.3.1: the enchant pattern is exactly as loose as it must be, no looser.
+        ["N12 'enchant' as a loose substring"] = anyOf({ "enchant" }),
+        ["N13 '^enchant' without the trailing space"] = anyOf({ "^enchant" }),
+        ["N14 the enchant pattern without its ' - <effect>' tail"] = anyOf({ "^enchant %w" }),
+        ["N15 'ph' anywhere, not just the Nax placeholder"] = anyOf({ "ph" }),
         ["N9 the verdict is inverted"] = function(name) return not Scan.IsInternalName(name) end,
         ["N10 nothing is ever internal"] = function() return false end,
         ["N11 everything is internal"] = function() return true end,
@@ -2278,6 +2328,485 @@ suite("goal-picker-row-model", function(ck)
     ck(toc:find("\nitemScan%.lua") ~= nil, "itemScan.lua is in the load order")
     ck(toc:find("itemScan%.lua") < toc:find("goalPicker%.lua"),
        "…before goalPicker.lua, which binds Addon.ItemScan at file scope")
+end)
+
+----------------------------------------------------------------------
+-- THE ROW POOL: geometry and tint  (1.3.1)
+--
+-- THE DEFECT (owner screenshot, shipped in 1.3.0 with the rarity-colour work):
+-- the picker rendered exactly ONE row. Items were there — scrolling moved that
+-- one row through them — and nothing was tinted by rarity.
+--
+-- THE CAUSE was a single line of Lua:
+--     local cr, cg, cb = Addon.Borders and Addon.Borders.QualityTextRGB(q)
+-- An `and` expression is adjusted to ONE value, so cg and cb were always nil and
+-- the next line ran SetTextColor(r, nil, nil), which raises. Row 1 had already
+-- been given its text; rows 2..12 had not been reached; the error left
+-- RefreshList, so the count line never updated either. Every symptom follows.
+--
+-- goalPicker.lua now publishes the pure half of the pool (Addon.GoalPickerRows)
+-- so the geometry and the tint contract are arithmetic a harness can hold.
+----------------------------------------------------------------------
+local PickerRows
+do
+    local A = { ItemScan = Scan }
+    local fn = loadfile(P("goalPicker.lua"))
+    if fn then
+        local ok = pcall(fn, "Daseeki-Armory", A)
+        if ok then PickerRows = A.GoalPickerRows end
+    end
+end
+
+suite("goal-picker-row-pool", function(ck)
+    ck(type(PickerRows) == "table",
+       "goalPicker.lua loads with no WoW API and publishes Addon.GoalPickerRows")
+    if type(PickerRows) ~= "table" then return end
+    local R = PickerRows
+
+    -- ── geometry ────────────────────────────────────────────────────────────
+    ck(R.VISIBLE == 12, "the pool holds 12 visible rows")
+    ck(R.ROW_HEIGHT == 28, "each row is 28px tall")
+    ck(R.LIST_TOP == 82, "the list starts 82px below the frame top")
+    ck(R.RowY(1) == R.LIST_TOP, "row 1 sits at the top of the list")
+    for i = 2, R.VISIBLE do
+        ck(R.RowY(i) - R.RowY(i - 1) == R.ROW_HEIGHT,
+           "row " .. i .. " is exactly one row-height below row " .. (i - 1))
+    end
+    ck(R.RowY(R.VISIBLE) == R.LIST_TOP + (R.VISIBLE - 1) * R.ROW_HEIGHT,
+       "the last row's offset is LIST_TOP + 11 row heights (no drift)")
+    ck(R.RowY(0) == nil and R.RowY(R.VISIBLE + 1) == nil,
+       "a row outside the pool has no position")
+    ck(R.FrameHeight() > R.RowY(R.VISIBLE) + R.ROW_HEIGHT,
+       "the frame is tall enough to show every row in the pool")
+    ck(R.FOOTER_Y >= R.RowY(R.VISIBLE) + R.ROW_HEIGHT,
+       "…and the footer sits below the last row, not on top of it")
+
+    -- ── N VISIBLE ROWS FOR M ITEMS: the property the defect broke ────────────
+    local function shown(n, off)
+        local s, c = R.Slice(n, off), 0
+        for i = 1, R.VISIBLE do if s[i] then c = c + 1 end end
+        return c, s
+    end
+    ck(#R.Slice(0, 0) == R.VISIBLE, "Slice always speaks for every row in the pool")
+    for _, case in ipairs({ { 0, 0 }, { 1, 1 }, { 5, 5 }, { 11, 11 }, { 12, 12 },
+                            { 13, 12 }, { 500, 12 }, { 9241, 12 } }) do
+        local n, expect = case[1], case[2]
+        local got = shown(n, 0)
+        ck(got == expect,
+           n .. " results fill " .. expect .. " rows at offset 0 (got " .. got .. ")")
+    end
+    local _, s0 = shown(40, 0)
+    ck(s0[1] == 1 and s0[12] == 12, "at offset 0 the pool shows results 1..12")
+    local _, s7 = shown(40, 7)
+    ck(s7[1] == 8 and s7[12] == 19, "at offset 7 it shows results 8..19")
+    local _, sEnd = shown(40, 28)
+    ck(sEnd[1] == 29 and sEnd[12] == 40, "at the last screenful it shows 29..40, all full")
+    local _, sShort = shown(3, 0)
+    ck(sShort[3] == 3 and sShort[4] == false,
+       "with 3 results, rows 4..12 are told to hide (they are not left stale)")
+
+    -- ── scrolling cannot run off either end ─────────────────────────────────
+    ck(R.MaxOffset(0) == 0 and R.MaxOffset(12) == 0, "a list that fits does not scroll")
+    ck(R.MaxOffset(13) == 1, "one row over the pool scrolls by exactly one")
+    ck(R.MaxOffset(500) == 488, "a full result set stops with the last row at the bottom")
+    ck(R.ClampOffset(-5, 500) == 0, "scrolling up past the top clamps to the top")
+    ck(R.ClampOffset(9999, 500) == 488, "…and down past the end clamps to the last screenful")
+    ck(R.ClampOffset(4, 3) == 0, "an offset larger than a short list collapses to 0")
+    local _, sOver = shown(500, 9999)
+    ck(sOver[12] == 500, "the clamped bottom really shows the last result")
+
+    -- ── THE TINT CONTRACT: all three components, or none ────────────────────
+    local Bd = {}
+    local bfn = loadfile(P("borders.lua"))
+    ck(bfn ~= nil, "borders.lua compiles")
+    if not bfn then return end
+    Bd.SLOTS = {}
+    pcall(bfn, "Daseeki-Armory", Bd)
+    local B = Bd.Borders
+    ck(type(B) == "table", "borders.lua published Addon.Borders")
+    if type(B) ~= "table" then return end
+
+    for q = 0, 7 do
+        local r, g, b, needs = R.Tint(q, B)
+        ck(r ~= nil and g ~= nil and b ~= nil,
+           "quality " .. q .. " tints with a COMPLETE r,g,b triple (this is the 1.3.0 defect)")
+        ck(needs == false, "…and needs no further item load")
+        local br, bg, bb = B.QualityTextRGB(q)
+        ck(r == br and g == bg and b == bb,
+           "…and it is the suite's own colour for quality " .. q .. ", not a private one")
+    end
+    local nr, ng, nb, needs = R.Tint(nil, B)
+    ck(nr == nil and ng == nil and nb == nil,
+       "an unresolved quality yields NO colour rather than a partial one")
+    ck(needs == true, "…and asks for the item to be loaded")
+    local mr, mg, mb, mneeds = R.Tint(4, nil)
+    ck(mr == nil and mg == nil and mb == nil and mneeds == true,
+       "with no Borders module at all the row falls back cleanly instead of raising")
+
+    -- the epic row is purple in all three channels — a truncated return would
+    -- have passed the r check alone
+    local er, eg, eb = R.Tint(4, B)
+    ck(near(er, 0.64) and near(eg, 0.21) and near(eb, 0.93),
+       "an epic row is the Blizzard purple in every channel")
+
+    -- ── MUTATION ADEQUACY over the layout and the tint ──────────────────────
+    local LAYOUT_MUTANTS = {
+        ["L1 RowY forgets the 1-based offset (i, not i-1)"] = function()
+            return R.LIST_TOP + 1 * R.ROW_HEIGHT == R.RowY(1)
+        end,
+        ["L2 every row is anchored at the same y"] = function()
+            return R.RowY(1) == R.RowY(2)
+        end,
+        ["L3 Slice fills only the first row (the 1.3.0 symptom)"] = function()
+            return shown(40, 0) == 1
+        end,
+        ["L4 Slice ignores the offset"] = function()
+            local _, s = shown(40, 7); return s[1] == 1
+        end,
+        ["L5 MaxOffset forgets to subtract the pool"] = function()
+            return R.MaxOffset(500) == 500
+        end,
+        ["L6 the offset is never clamped"] = function()
+            return R.ClampOffset(9999, 500) == 9999 or R.ClampOffset(-5, 500) == -5
+        end,
+        ["L7 Slice leaves the tail rows stale instead of hiding them"] = function()
+            local _, s = shown(3, 0); return s[4] ~= false
+        end,
+    }
+    local lnames = {}
+    for k in pairs(LAYOUT_MUTANTS) do lnames[#lnames + 1] = k end
+    table.sort(lnames)
+    for _, name in ipairs(lnames) do
+        local okm, holds = pcall(LAYOUT_MUTANTS[name])
+        ck(okm and holds == false, "mutation killed: " .. name)
+    end
+
+    -- The tint mutants are written as REPLACEMENT implementations and must all
+    -- disagree with the real one on the fixture qualities. M1 is the shipped bug.
+    local TINT_MUTANTS = {
+        ["M1 the `and` truncation (THE 1.3.0 DEFECT)"] = function(q)
+            local r, g, b = B and B.QualityTextRGB(q)
+            return r, g, b
+        end,
+        ["M2 nothing ever gets a colour"] = function() return nil, nil, nil end,
+        ["M3 every row gets the same colour"] = function() return 1, 1, 1 end,
+        ["M4 an unknown quality is tinted anyway"] = function(q)
+            if q == nil then return 1, 1, 1 end
+            local r, g, b = B.QualityTextRGB(q); return r, g, b
+        end,
+        ["M5 Poor uses the near-black GLOW value as text"] = function(q)
+            local r, g, b = B.QualityRGB(q); return r, g, b
+        end,
+    }
+    local QFIX = { 0, 1, 2, 3, 4, 5, 6, 7, nil }
+    local tnames = {}
+    for k in pairs(TINT_MUTANTS) do tnames[#tnames + 1] = k end
+    table.sort(tnames)
+    for _, name in ipairs(tnames) do
+        local mut, killed = TINT_MUTANTS[name], false
+        for i = 1, 9 do
+            local q = QFIX[i]
+            local a1, a2, a3 = R.Tint(q, B)
+            local okm, b1, b2, b3 = pcall(mut, q)
+            if not okm or a1 ~= b1 or a2 ~= b2 or a3 ~= b3 then killed = true; break end
+        end
+        ck(killed, "mutation killed: " .. name)
+    end
+
+    -- ── source contract: the picker really uses the pool ────────────────────
+    local h = io.open(P("goalPicker.lua"), "r")
+    ck(h ~= nil, "goalPicker.lua is readable")
+    if not h then return end
+    local src = h:read("*a"); h:close()
+    ck(src:find("Rows%.Tint%(qualityOf") ~= nil,
+       "RefreshList tints through Rows.Tint, not through an `and` expression")
+    -- The defect line is QUOTED in the file's own comment (that is the record of
+    -- why the pool exists), so the check has to look at code, not at prose.
+    local offending
+    for line in (src .. "\n"):gmatch("([^\n]*)\n") do
+        local body = line:gsub("^%s+", "")
+        if body:sub(1, 2) ~= "--"
+           and line:find("=[^=]*and%s+[%w_.]*QualityTextRGB%s*%(") then
+            offending = line
+        end
+    end
+    ck(offending == nil,
+       "THE DEFECT LINE IS GONE: no multi-return is taken out of an `and` ("
+       .. tostring(offending) .. ")")
+    ck(src:find("for i = 1, Rows%.VISIBLE do") ~= nil,
+       "the refresh walks the pool BY INDEX, so a hole cannot cut the list short")
+    ck(src:find("Rows%.Slice") ~= nil, "…over the slice, which speaks for every row")
+    ck(src:find("Rows%.ClampOffset") ~= nil, "the mouse wheel clamps through the same module")
+    ck(src:find("%-Rows%.RowY%(i%)") ~= nil, "…and the rows are anchored by Rows.RowY")
+end)
+
+----------------------------------------------------------------------
+-- RESTRICTION CAPTURE: "read nothing" is not "nothing to read"  (1.3.1)
+--
+-- THE DEFECT (owner screenshot): Bonescythe — rogue-only Tier-3 leather — was
+-- offered to a WARRIOR. Not a fail-open on an unknown class token: the owner's
+-- cache carries classMask = 0 for it, i.e. "no restriction at all", which the
+-- filter is right to honour.
+--
+-- THE CAUSE: the scan read locks off a hidden tooltip and, when that tooltip did
+-- not build, fell through to classMask = 0 — the same value it writes for an item
+-- it read successfully and found unrestricted. Evidence from the owner's real
+-- 10 504-item cache: all eight Tier-3 armour sets (ids 22416-22511, nine classes)
+-- have classMask 0, inside one contiguous 224-row band of ids 22314-22821 that
+-- contains no restricted row at all, while Tier 1 and Tier 2 either side of it
+-- are captured 8-for-8 (Bloodfang, Nightslayer, Judgement, Lawbringer …). The
+-- CLASS_UNKNOWN bit is set on 0 of 10 504 rows, so the fail-open path was never
+-- the one in play — the reads simply never happened and were written down as
+-- facts.
+----------------------------------------------------------------------
+suite("item-scan-restriction-capture", function(ck)
+    if type(Scan) ~= "table" then ck(false, "itemScan.lua did not load"); return end
+    ck(type(Scan.ReadRestrictions) == "function", "Scan.ReadRestrictions is published")
+
+    local loc = {
+        classPrefix = "Classes: ", racesPrefix = "Races: ",
+        classByName = { Rogue = "ROGUE", Warrior = "WARRIOR", Mage = "MAGE" },
+        raceFaction = { Orc = Scan.FACTION_HORDE, Human = Scan.FACTION_ALLIANCE },
+        allianceLines = { Alliance = true }, hordeLines = { Horde = true },
+    }
+
+    -- ── the three outcomes are now THREE, not two ───────────────────────────
+    local m, f, read = Scan.ReadRestrictions(
+        { "Binds when picked up", "Chest", "Leather", "Classes: Rogue" }, loc)
+    ck(read == true and m == Scan.CLASS_BIT.ROGUE and f == Scan.FACTION_NONE,
+       "a tooltip that built and named a class yields that class, read=true")
+    m, f, read = Scan.ReadRestrictions({ "Binds when equipped", "Chest", "Plate" }, loc)
+    ck(read == true and m == 0,
+       "a tooltip that built and named NO class is evidence of an unrestricted item")
+    m, f, read = Scan.ReadRestrictions(nil, loc)
+    ck(read == false and m == 0,
+       "THE FIX: a tooltip that did not build is evidence of NOTHING (read=false)")
+    m, f, read = Scan.ReadRestrictions({}, loc)
+    ck(read == false, "…and so is an empty line list")
+    ck(select(3, Scan.ReadRestrictions("not a table", loc)) == false,
+       "…and a non-table")
+
+    -- the Bonescythe line itself, as the client writes it
+    ck(select(1, Scan.ReadRestrictions({ "Classes: Rogue" }, loc)) == Scan.CLASS_BIT.ROGUE,
+       "'Classes: Rogue' is the lock that hides Bonescythe from a warrior")
+    local warrior = { class = "WARRIOR", classBit = Scan.CLASS_BIT.WARRIOR,
+                      faction = Scan.FACTION_NONE, showUnusable = false }
+    local bone = { classID = Scan.ITEM_CLASS_ARMOR, subclassID = 2,
+                   classMask = Scan.CLASS_BIT.ROGUE, faction = Scan.FACTION_NONE }
+    ck(Scan.Usable(bone, warrior) == false, "with the lock captured, a warrior does not see it")
+    local boneBare = { classID = Scan.ITEM_CLASS_ARMOR, subclassID = 2,
+                       classMask = 0, faction = Scan.FACTION_NONE }
+    ck(Scan.Usable(boneBare, warrior) == true,
+       "…and with classMask 0 he does — the filter is right, the capture was wrong")
+    -- fail-open on a genuinely unknown token is UNCHANGED policy
+    local unk = { classID = Scan.ITEM_CLASS_ARMOR, subclassID = 2,
+                  classMask = Scan.CLASS_UNKNOWN + Scan.CLASS_BIT.ROGUE,
+                  faction = Scan.FACTION_NONE }
+    ck(Scan.Usable(unk, warrior) == true,
+       "a TRUE unknown still fails open: hiding an item he can use is the worse defect")
+
+    -- ── the unread flag round-trips and is persisted ────────────────────────
+    local q, cm, fa, i, u = Scan.UnpackMeta(Scan.PackMeta(4, Scan.CLASS_BIT.ROGUE, 0, false, true))
+    ck(q == 4 and cm == Scan.CLASS_BIT.ROGUE and i == false and u == true,
+       "the unread bit round-trips alongside quality / mask / faction / internal")
+    ck(select(5, Scan.UnpackMeta(Scan.PackMeta(4, 0, 0, false, false))) == false,
+       "…and reads back clear when it was not set")
+    ck(select(5, Scan.UnpackMeta(Scan.PackMeta(4, 0, 0, true))) == false,
+       "1.3.0's argument list still means 'read' (an old meta value is stale, not corrupt)")
+    ck(Scan.PackMeta(15, 4095, 3, true, true) < 2 ^ 24,
+       "a fully-flagged record is still a small integer")
+
+    local c = Scan.NewCache()
+    ck(c.restrictStamp == Scan.RESTRICT_STAMP, "a fresh cache carries the capture stamp")
+    ck(Scan.UnreadCount(c) == 0, "…and nothing to re-read")
+    Scan.Put(c, 22476, "Bonescythe Breastplate", 4, 0, 0, true)   -- tooltip refused
+    Scan.Put(c, 16905, "Bloodfang Chestpiece",   4, Scan.CLASS_BIT.ROGUE, 0, false)
+    ck(select(6, Scan.Get(c, 22476)) == true, "a row whose tooltip refused is flagged unread")
+    ck(select(6, Scan.Get(c, 16905)) == false, "…and a row that was read is not")
+    ck(select(3, Scan.Get(c, 16905)) == Scan.CLASS_BIT.ROGUE, "…keeping the lock it read")
+    Scan.Put(c, 13789, "[PH] Brilliant Dawn Cap", 1, 0, 0, true)
+    ck(select(6, Scan.Get(c, 13789)) == false,
+       "an INTERNAL row is never 'unread': nothing ever asks it for a class lock")
+
+    local ids = Scan.UnreadIds(c)
+    ck(#ids == 1 and ids[1] == 22476, "UnreadIds lists exactly the rows to re-read")
+
+    -- ── a pre-1.3.1 cache is migrated, not discarded ────────────────────────
+    -- It cannot say which rows had a tooltip, so every real row is re-queued.
+    local old = {
+        version = Scan.CACHE_VERSION, scannedAt = 1785862751, count = 4,
+        internalStamp = Scan.INTERNAL_STAMP,
+        names = { [22476] = "Bonescythe Breastplate", [16905] = "Bloodfang Chestpiece",
+                  [9425]  = "Pendulum of Doom",       [13789] = "[PH] Brilliant Dawn Cap" },
+        meta  = { [22476] = Scan.PackMeta(4, 0, 0),
+                  [16905] = Scan.PackMeta(4, Scan.CLASS_BIT.ROGUE, 0),
+                  [9425]  = Scan.PackMeta(4, 0, 0),
+                  [13789] = Scan.PackMeta(1, 0, 0, true) },
+    }
+    ck(old.restrictStamp == nil, "the pre-1.3.1 cache has no capture stamp")
+    local up = Scan.Normalize(old)
+    ck(up.count == 4, "the migration keeps every row (no rescan is demanded)")
+    ck(up.restrictStamp == Scan.RESTRICT_STAMP, "…and stamps the capture it now trusts")
+    ck(up.unreadCount == 3, "…having queued every REAL row for a re-read")
+    ck(select(6, Scan.Get(up, 13789)) == false, "…and left the internal row out of it")
+    ck(select(2, Scan.Get(up, 16905)) == 4, "the migration preserves quality")
+    ck(select(3, Scan.Get(up, 16905)) == Scan.CLASS_BIT.ROGUE,
+       "…and the locks it DID capture (a re-read can only improve on them)")
+    local queue = Scan.UnreadIds(up)
+    ck(#queue == 3 and queue[1] == 9425 and queue[3] == 22476,
+       "the repair queue is in id order, exactly as the scan walked them")
+
+    -- idempotent: a stamped cache is not re-flagged on the next login
+    up.meta[9425] = Scan.PackMeta(4, 0, 0, false, false)   -- pretend it was repaired
+    local again = Scan.Normalize(up)
+    ck(select(6, Scan.Get(again, 9425)) == false,
+       "a cache already on the current capture stamp is NOT re-flagged (the pass runs once)")
+    ck(again.unreadCount == 2, "…and the remaining count falls as rows are repaired")
+    again.restrictStamp = 0
+    again = Scan.Normalize(again)
+    ck(again.unreadCount == 3,
+       "…while a capture-stamp bump re-queues everything, so a future capture fix lands too")
+
+    -- a cache with NOTHING left to re-read asks for no repair at all
+    for id in pairs(again.names) do
+        local nm, qq, mm, ff = Scan.Get(again, id)
+        Scan.Put(again, id, nm, qq, mm, ff, false)
+    end
+    again.unreadCount = nil                     -- force the recount path
+    ck(Scan.UnreadCount(again) == 0, "a fully-read cache has no repair queue")
+
+    -- ── source contract ─────────────────────────────────────────────────────
+    local fh = io.open(P("itemScan.lua"), "r")
+    ck(fh ~= nil, "itemScan.lua is readable")
+    if fh then
+        local s = fh:read("*a"); fh:close()
+        ck(s:find("Scan%.ReadRestrictions%(tooltipLines%(id%), ST%.loc%)") ~= nil,
+           "the recorder asks whether the tooltip was READ, not just what it said")
+        ck(s:find("if lines then classMask, faction") == nil,
+           "THE DEFECT IS GONE: an unbuilt tooltip is no longer silently 'unrestricted'")
+        ck(s:find("Scan%.TOOLTIP_TRIES") ~= nil,
+           "an unreadable tooltip is retried inside the scan before it is written off")
+        ck(s:find("scanTip:SetOwner%(UIParent, \"ANCHOR_NONE\"%)") ~= nil,
+           "the scanning tooltip re-owns itself on every use (an unowned tooltip builds nothing)")
+        local created = s:find("CreateFrame%(\"GameTooltip\", \"DaseekiArmoryItemScanTip\"")
+        local owned   = s:find("scanTip:SetOwner")
+        ck(created ~= nil and owned ~= nil and owned > created,
+           "…and does so AFTER creation, on the call path, not once at construction")
+        ck(s:find("function Addon:MaybeRepairRestrictions") ~= nil,
+           "the lazy repair pass is published")
+        ck(s:find("opts%.repair") ~= nil, "…and rides the existing throttled scan runner")
+        ck(s:find("Scan%.TOOLTIP_TRIES") < s:find("function Addon:MaybeRepairRestrictions"),
+           "…with the in-scan retry as the first line of defence")
+    end
+    local gp = io.open(P("goalPicker.lua"), "r")
+    if gp then
+        local g = gp:read("*a"); gp:close()
+        ck(g:find("Addon:MaybeRepairRestrictions") ~= nil,
+           "the picker triggers the repair when it opens (lazily, once per session)")
+        ck(g:find("Re%-reading class restrictions") ~= nil,
+           "…and says so in the count line while it runs")
+    end
+end)
+
+----------------------------------------------------------------------
+-- THE SEED MAY NOT OVERRIDE THE CLIENT  (1.3.1)
+--
+-- THE DEFECT (owner screenshot): the picker offered "Enchant Cloak -
+-- Resistance", the name of an enchantment EFFECT. It reached the list through a
+-- fall-through introduced with the denylist: goalPicker's `add` returned on an
+-- internal row BEFORE recording that the id had been dealt with, so the bundled
+-- AtlasLoot seed — whose ids do not all agree with this client — got to name it
+-- on the next pass. Id 13794 is "[PH] Shining Dawn Coif" in the owner's client
+-- and "Enchant Cloak - Resistance" in the seed; the denylist removed the former
+-- and the seed put the latter back. 37 ids in the owner's cache were resurrecting
+-- like that, 7 of them as "Enchant …" rows, the rest under equally wrong names
+-- ("Instant Poison V" for "Monster - Axe, 2H Pendulum of Doom").
+----------------------------------------------------------------------
+suite("goal-picker-source-precedence", function(ck)
+    -- ── BEHAVIOURAL: drive the real BuildGoalItemDB over the real defect ─────
+    -- goalPicker.lua touches the WoW API only from inside functions, so the index
+    -- builder can be run headlessly against stubs. The fixture is the owner's own
+    -- id 13794: "[PH] Shining Dawn Coif" in the client, "Enchant Cloak -
+    -- Resistance" in the bundled seed.
+    if type(Scan) == "table" then
+        local A = { ItemScan = Scan }
+        local fn = loadfile(P("goalPicker.lua"))
+        ck(fn ~= nil, "goalPicker.lua compiles for the index-builder fixture")
+        if fn and pcall(fn, "Daseeki-Armory", A) then
+            local cache = Scan.NewCache()
+            Scan.Put(cache, 13794, "[PH] Shining Dawn Coif", 3, 0, 0)      -- internal
+            Scan.Put(cache, 18419, "Monster - Axe, 2H Horde Red War Axe", 2, 0, 0)
+            Scan.Put(cache, 19019, "Thunderfury, Blessed Blade of the Windseeker", 5, 0, 0)
+            cache.scannedAt = 1785862751
+            A.ItemScanCache = function() return cache end
+            -- the seed's disagreeing names for the SAME ids, verbatim from itemDB.lua
+            A.ItemNameDB = {
+                [13794] = "Enchant Cloak - Resistance",
+                [18419] = "Felcloth Pants",
+                [21134] = "Zandalar Freethinker's Breastplate",   -- seed-only, genuine
+            }
+            A.ItemClassMask = {}
+            A.PvPItemIDs = {}
+
+            local savedI, savedG = _G.GetItemInfoInstant, _G.GetItemInfo
+            _G.GetItemInfoInstant = function(id)
+                return id, nil, nil, "INVTYPE_HEAD", "icon" .. tostring(id), 4, 1
+            end
+            _G.GetItemInfo = function() return nil end
+            local okb, list = pcall(A.BuildGoalItemDB, A)
+            _G.GetItemInfoInstant, _G.GetItemInfo = savedI, savedG
+
+            ck(okb and type(list) == "table", "the index builds (" .. tostring(list) .. ")")
+            if okb and type(list) == "table" then
+                local byId, byName = {}, {}
+                for _, e in ipairs(list) do byId[e.id] = e; byName[e.display] = true end
+                ck(byName["Enchant Cloak - Resistance"] == nil,
+                   "THE DEFECT: the seed cannot re-name an id the scan dropped as internal")
+                ck(byId[13794] == nil, "…id 13794 is out of the index entirely")
+                ck(byName["Felcloth Pants"] == nil,
+                   "…and neither can it re-name a dropped creature-art record")
+                ck(byId[19019] ~= nil and byId[19019].display
+                   == "Thunderfury, Blessed Blade of the Windseeker",
+                   "a real scanned item is still in the index, under the CLIENT's name")
+                ck(byId[21134] ~= nil,
+                   "…and the seed still fills ids the scan never covered")
+                ck(#list == 2, "exactly the two survivors, no resurrections (got " .. #list .. ")")
+            end
+        end
+    end
+
+    local h = io.open(P("goalPicker.lua"), "r")
+    ck(h ~= nil, "goalPicker.lua is readable")
+    if not h then return end
+    local src = h:read("*a"); h:close()
+
+    ck(src:find("local list, settled = {}, {}") ~= nil,
+       "the index builder tracks every id a source has SETTLED, not just the ones it kept")
+    local mark = src:find("settled%[id%] = true")
+    local drop = src:find("if internal then return end")
+    ck(mark ~= nil and drop ~= nil and mark < drop,
+       "an id is settled BEFORE the internal drop, so the drop cannot hand it to the seed")
+    local guard = src:find("if not id or settled%[id%] then return end")
+    ck(guard ~= nil and guard < mark, "…and a settled id is refused at the door")
+    ck(src:find("if not byId%[id%] then") == nil and src:find("byId%[id%] = e") == nil,
+       "the old keep-only bookkeeping is gone")
+    ck(src:find("if not settled%[id%] then") ~= nil,
+       "the PvP source honours the same ledger")
+
+    -- source order: the scan speaks first, then the seed, then the PvP ids
+    local scanLoop = src:find("for id in pairs%(cache%.names%) do")
+    local seedLoop = src:find("for id, nm in pairs%(Addon%.ItemNameDB%) do")
+    local pvpLoop  = src:find("for _, id in ipairs%(Addon%.PvPItemIDs")
+    ck(scanLoop and seedLoop and pvpLoop and scanLoop < seedLoop and seedLoop < pvpLoop,
+       "the CLIENT scan is consulted before the bundled snapshot, always")
+
+    -- and the family that exposed it can no longer be named at all
+    if type(Scan) == "table" then
+        ck(Scan.IsInternalName("Enchant Cloak - Resistance") == true,
+           "belt and braces: the seed's own name for 13794 is on the denylist too")
+        ck(Scan.IsInternalName("[PH] Shining Dawn Coif") == true,
+           "…as is what the client actually calls that id")
+    end
 end)
 
 ----------------------------------------------------------------------
