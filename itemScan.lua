@@ -622,6 +622,12 @@ function Scan.Normalize(cache)
     cache.internalStamp = Scan.INTERNAL_STAMP
     cache.unreadCount   = unread
     cache.restrictStamp = Scan.RESTRICT_STAMP
+    -- The block reason is SESSION state that happens to live on the cache so
+    -- /darmory scanstatus can read it back. Normalize runs once per session, on
+    -- the bound cache, before anything has been refused — so clearing it here is
+    -- what keeps "repair blocked: this session's pass already ran" from being a
+    -- lie the moment the owner relogs.
+    cache.repairBlocked = nil
     return cache
 end
 
@@ -711,6 +717,72 @@ function Scan.IsComplete(cache)
 end
 
 ----------------------------------------------------------------------
+-- MAY A REPAIR PASS RUN RIGHT NOW?  (1.3.1, THE SESSION LATCH)
+--
+-- THE OWNER'S BUG, and it is this gate, not the capture stamp. His live report:
+--
+--     restrictions: … 9 240 still unread
+--     scan: idle — a repair pass is still owed
+--     stamps: … capture 3
+--
+-- …and opening the goal picker did NOTHING. No pass, no chat line, no state
+-- change. Every earlier suspect is innocent: the stamp-3 migration re-flagged his
+-- rows correctly, UnreadIds finds all 9 240 of them, and the picker-open path
+-- reaches this code. What stopped him is that a pass had ALREADY RUN in that
+-- session — the degenerate one the data gate describes, where the realm never
+-- answers inside DATA_TRIES, so it re-read 9 240 rows, captured nothing, and
+-- reported "0 locked, 9 240 unreadable". Addon._restrictRepairTried was set the
+-- moment that pass STARTED, so every picker open for the rest of the session was
+-- refused, in silence, while the status line kept saying a pass was owed.
+--
+-- THE LATCH WAS MEASURING THE WRONG THING. It exists so a pass that hangs the
+-- client cannot restart itself over and over (the same property autoScanTried
+-- gives the login scan), and that is a real requirement — but "a pass ran" is not
+-- "the debt is settled". A pass that paid NOTHING off leaves exactly the work it
+-- found, and bolting the door behind it strands the owner until a /reload.
+--
+-- THE RULE, therefore, is about the DEBT and not about the attempt:
+--   * nothing owed          -> no pass, and no complaint: this is the healthy state
+--   * no completed scan     -> no pass; the SCAN is the thing to run first
+--   * a scan already running -> no pass; one at a time
+--   * nothing tried yet     -> run
+--   * the last pass in this session REDUCED the debt -> run another. It is paying
+--     the cache down, so the next one very probably pays more, and each pass is
+--     strictly smaller than the last, so this cannot cycle.
+--   * the last pass left the debt where it found it -> refuse, and SAY SO. Another
+--     pass under identical conditions would spend another minute of throttled
+--     traffic to achieve the same nothing; what the owner needs is the reason and
+--     the remedy, not a silent no-op.
+--
+-- Pure, so the harness pins the decision rather than the caller that makes it.
+-- -> allowed(boolean), reason(string or nil).  A nil reason means "nothing to
+--    report": there is no debt, so there is nothing to be blocked about.
+----------------------------------------------------------------------
+function Scan.RepairGate(st)
+    if type(st) ~= "table" then return false, nil end
+    local owed = tonumber(st.owed) or 0
+    if st.scanning then
+        if owed <= 0 then return false, nil end
+        return false, "a scan is already running"
+    end
+    if not st.complete then
+        if owed <= 0 then return false, nil end
+        return false, "no completed item scan on this account yet — press Rescan Items"
+    end
+    if owed <= 0 then return false, nil end
+    if st.tried then
+        local from = tonumber(st.lastFrom) or 0
+        if owed >= from then
+            return false, string.format(
+                "this session's repair pass already ran and left all %d rows unread "
+                .. "(the client never returned their item data) — /reload or relog to run another",
+                owed)
+        end
+    end
+    return true, nil
+end
+
+----------------------------------------------------------------------
 -- THE QUERYABLE STATE  (/darmory scanstatus, 1.3.1)
 --
 -- Everything the scan knows about itself has until now been announced in chat
@@ -778,6 +850,15 @@ function Scan.StatusReport(cache, live)
         end
     else
         line(("scan: idle%s"):format(unread > 0 and " — a repair pass is still owed" or ""))
+    end
+
+    -- SILENCE IS A META-BUG (1.3.1). "A repair pass is still owed" and "opening
+    -- the picker does nothing" were, for the owner, two true statements with no
+    -- third line joining them. A repair that is owed, asked for and refused now
+    -- names its reason here, so the question is answerable three minutes later
+    -- rather than only by whoever happened to be watching chat.
+    if type(cache.repairBlocked) == "string" and cache.repairBlocked ~= "" then
+        line("repair blocked: " .. cache.repairBlocked)
     end
 
     line(("last full scan: %s%s"):format(stampText(cache.scannedAt),
@@ -1149,8 +1230,10 @@ end
 --              restrictions were never actually read off a tooltip. Same
 --              throttle, same recorder, a fraction of the work — this is the
 --              path that repairs a cache written by the pre-1.3.1 capture.
+-- -> started(boolean), reason(string or nil). A false with a reason is a refusal
+--    the caller is expected to make audible; see Addon:BlockRepair.
 function Addon:StartItemScan(opts)
-    if ST then return false end
+    if ST then return false, "a scan is already running" end
     opts = opts or {}
     local cache = Addon:ItemScanCache()
     if opts.force then cache.names, cache.meta, cache.count = {}, {}, 0 end
@@ -1177,7 +1260,29 @@ function Addon:StartItemScan(opts)
         ST.queue      = Scan.UnreadIds(cache)
         ST.queueTotal = #ST.queue
         ST.found      = ST.queueTotal
-        if ST.queueTotal == 0 then ST = nil; return false end
+        -- What this pass is attacking, taken from the queue itself rather than
+        -- from the caller, so "did it pay anything off?" is answerable at the end
+        -- however the pass was started.
+        ST.owedAtStart = ST.queueTotal
+        -- AN EMPTY QUEUE WHILE WORK IS OWED IS AN IMPOSSIBLE STATE, not a quiet
+        -- no-op (1.3.1). cache.unreadCount is a maintained tally and the flags are
+        -- the truth; when the two disagree the tally is wrong, and leaving it
+        -- wrong is what makes "9 240 owed" and "nothing to do" coexist for ever —
+        -- MaybeRepairRestrictions keeps being invited by the tally and keeps
+        -- finding an empty queue, silently, on every picker open of every session.
+        -- So the disagreement is RECONCILED to the queue's truth here and reported,
+        -- which ends the state rather than re-entering it.
+        if ST.queueTotal == 0 then
+            ST = nil
+            local claimed = tonumber(cache.unreadCount) or 0
+            cache.unreadCount = 0
+            if claimed > 0 then
+                return false, string.format(
+                    "the cache claimed %d rows still unread but not one of them carries the "
+                    .. "flag — the tally was wrong and has been reconciled to 0", claimed)
+            end
+            return false, "no row is flagged unread — there is nothing to re-read"
+        end
     end
     -- Both events carry (itemID, success) and the handler is idempotent, so watching
     -- both is belt and braces. RegisterEvent RAISES on an event a build does not know,
@@ -1452,6 +1557,10 @@ function Addon:FinishItemScan()
     -- open time (Atiesh on a warrior) until the frame is closed and reopened.
     if Addon.RefreshGoalPicker then pcall(Addon.RefreshGoalPicker, Addon, true) end
 
+    -- Nothing is owed any more, so nothing can be blocked: clear the reason a
+    -- refusal earlier in this session may have parked on the cache.
+    if unread <= 0 and Addon.BlockRepair then Addon:BlockRepair(cache, nil) end
+
     local secs = Scan.FormatDuration(GetTime() - st.started) or "?"
     if st.repair then
         -- The repair pass is reported in the terms that make it checkable: how
@@ -1459,6 +1568,16 @@ function Addon:FinishItemScan()
         print(string.format("%s item restrictions re-read — %d items now carry a class or "
             .. "faction lock, %d still unreadable, in %s.",
             Addon:Tag(), restricted, unread, secs))
+        -- A PASS THAT PAID NOTHING OFF SAYS SO, HERE, while the owner is still
+        -- looking. This is the exact shape of his bug — the degenerate pass where
+        -- the client returns no item data at all — and the line that used to be
+        -- missing is the one that tells him the next picker open will decline and
+        -- what to do about it.
+        if unread > 0 and unread >= (tonumber(st.owedAtStart) or 0) then
+            print(string.format("%s …which is every row it started with: the client returned "
+                .. "no item data for them. %s", Addon:Tag(),
+                Addon:Wrap("muted", "(/reload or relog and reopen the picker to try again.)")))
+        end
     else
         -- The internal count is reported, not hidden: the owner should be able to see
         -- that ~12% of what the client holds is Blizzard's own scaffolding, and that
@@ -1473,34 +1592,81 @@ function Addon:FinishItemScan()
 end
 
 ----------------------------------------------------------------------
+-- SILENCE IS A META-BUG (1.3.1)
+--
+-- A refusal that says nothing is worse than the refusal itself. The owner spent a
+-- session clicking a picker that answered him with a completely empty chat frame
+-- while /darmory scanstatus insisted a repair was owed, and there was no way in
+-- from either end. So every refusal now has a REASON, the reason is said once in
+-- chat, and it is parked on the cache where StatusReport reads it back.
+--
+-- ONCE per reason, deliberately. The goal picker is opened over and over while
+-- editing a set, and a line per open would be spam that teaches the owner to
+-- ignore the line. A NEW reason speaks again, because it is new information.
+-- -> the reason (so callers can return it), or nil when there was nothing to say.
+----------------------------------------------------------------------
+function Addon:BlockRepair(cache, reason)
+    if type(reason) ~= "string" or reason == "" then
+        if type(cache) == "table" then cache.repairBlocked = nil end
+        Addon._repairBlockSaid = nil
+        return nil
+    end
+    if type(cache) == "table" then cache.repairBlocked = reason end
+    if Addon._repairBlockSaid ~= reason then
+        Addon._repairBlockSaid = reason
+        print(string.format("%s restriction repair blocked: %s", Addon:Tag(), reason))
+    end
+    return reason
+end
+
+----------------------------------------------------------------------
 -- THE LAZY RESTRICTION REPAIR (1.3.1)
 --
 -- Called when the goal picker opens. If the cache holds rows whose class /
 -- faction locks were never actually read, re-read exactly those rows — no id
--- walk, no wipe, names and qualities untouched. Once per session at most, and
--- only on a cache that has already completed a scan (before that, the scan
--- itself is the thing to run).
+-- walk, no wipe, names and qualities untouched. Only on a cache that has already
+-- completed a scan (before that, the scan itself is the thing to run), and under
+-- Scan.RepairGate, which is where the once-per-session rule now lives.
+--
+-- WHAT CHANGED, and why (the owner's picker-does-nothing bug). The latch used to
+-- be stamped by a pass that STARTED and was never released, so the degenerate
+-- pass — 9 240 rows re-read, not one item's data returned, "0 locked, 9 240
+-- unreadable" — bought silence for the rest of the session while leaving every
+-- row exactly as it found it. The latch now records what the pass started FROM,
+-- and RepairGate lets another pass run whenever the debt has come down since;
+-- when it has not, the refusal is spoken instead of swallowed.
+--
+-- -> started(boolean), reason(string or nil)
 ----------------------------------------------------------------------
 function Addon:MaybeRepairRestrictions()
-    if ST then return false end
-    if Addon._restrictRepairTried then return false end
     local cache = Addon:ItemScanCache()
-    if not Scan.IsComplete(cache) then return false end
-    local n = Scan.UnreadCount(cache)
-    if n <= 0 then return false end
-    -- THE ONE-SHOT CLOSES ON A PASS THAT ACTUALLY STARTED (1.3.1), and the notice
-    -- is printed only then. cache.unreadCount is a maintained tally, so it can be
+    local owed  = Scan.UnreadCount(cache)
+    local allowed, reason = Scan.RepairGate({
+        scanning = ST ~= nil,
+        complete = Scan.IsComplete(cache),
+        owed     = owed,
+        tried    = Addon._restrictRepairTried,
+        lastFrom = Addon._restrictRepairFrom,
+    })
+    if not allowed then return false, Addon:BlockRepair(cache, reason) end
+
+    -- THE LATCH CLOSES ON A PASS THAT ACTUALLY STARTED (1.3.1), and the notice is
+    -- printed only then. cache.unreadCount is a maintained tally, so it can be
     -- ahead of the real flags (a session that repaired rows and then reloaded);
-    -- StartItemScan rebuilds the queue from the flags themselves and returns false
-    -- when there is nothing in it. Stamping the latch before that answer burned the
-    -- session's only attempt on a pass that never ran, and announced it in chat.
-    local started = Addon:StartItemScan({ repair = true })
-    if not started then return false end
+    -- StartItemScan rebuilds the queue from the flags themselves, reconciles the
+    -- tally when the two disagree, and hands back the reason. Stamping the latch
+    -- before that answer burned the session's attempt on a pass that never ran,
+    -- and announced it in chat.
+    local started, sreason = Addon:StartItemScan({ repair = true })
+    if not started then return false, Addon:BlockRepair(cache, sreason) end
+
     Addon._restrictRepairTried = true
+    Addon._restrictRepairFrom  = owed          -- the debt this pass is attacking
+    Addon:BlockRepair(cache, nil)              -- a pass is running: nothing is blocked
     print(string.format("%s re-reading class restrictions for %d cached items — "
-        .. "this runs once and does not need a rescan. %s",
-        Addon:Tag(), n, Addon:Wrap("muted", "(Keep playing; the picker updates when it finishes.)")))
-    return true
+        .. "%s", Addon:Tag(), owed,
+        Addon:Wrap("muted", "(Keep playing; the picker updates when it finishes.)")))
+    return true, nil
 end
 
 ----------------------------------------------------------------------

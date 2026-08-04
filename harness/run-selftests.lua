@@ -3118,12 +3118,12 @@ suite("goal-picker-repair-refilter", function(ck)
            "the repair result is PERSISTED, not only printed")
         ck(s:find("cache%.restrictUnreadable%s*=%s*unread") ~= nil,
            "…both halves of it")
-        -- the one-shot closes on a pass that started
-        local start = s:find("local started = Addon:StartItemScan%({ repair = true }%)")
+        -- the latch closes on a pass that started
+        local start = s:find("local started, sreason = Addon:StartItemScan%({ repair = true }%)")
         local latch = s:find("Addon%._restrictRepairTried = true")
         ck(start ~= nil, "MaybeRepairRestrictions asks whether the pass actually started")
         ck(start and latch and latch > start,
-           "THE FIX: …before burning the session's one attempt on it")
+           "THE FIX: …before burning the session's attempt on it")
         local notice = s:find("re%-reading class restrictions for %%d cached items")
         ck(start and notice and notice > start,
            "…and before announcing a repair in chat")
@@ -4364,6 +4364,510 @@ suite("item-scan-data-gate", function(ck)
            "…and both ask paths spend one shared per-tick credit")
         ck(s:find("_G%.C_Item%.RequestLoadItemDataByID%(id%)\n") == nil,
            "…with no ungoverned request left anywhere in the file")
+    end
+end)
+
+----------------------------------------------------------------------
+-- THE SESSION LATCH  (1.3.1) — "opening the picker does nothing"
+--
+-- THE OWNER'S BUG, in his words: /darmory scanstatus reads
+--
+--     restrictions: … 9 240 still unread
+--     scan: idle — a repair pass is still owed
+--     stamps: … capture 3
+--
+-- and opening the Choose Goal Item picker triggers NOTHING — no pass, no chat
+-- line, no state change.
+--
+-- Every suspect ahead of it was innocent and this suite says so as it goes: the
+-- meta bit layout is one shared constant, so the writer and the reader cannot
+-- disagree; the stamp-3 migration flags his rows and UnreadIds finds every one of
+-- them; and goalPicker.lua does reach MaybeRepairRestrictions on open. What
+-- stopped him is that a pass had ALREADY RUN that session — the degenerate one
+-- the data gate describes, where the client returns no item data at all, so it
+-- re-read 9 240 rows, captured nothing and reported "0 locked, 9 240 unreadable".
+-- Addon._restrictRepairTried was stamped the moment that pass STARTED and was
+-- never released, so every later picker open was refused, in silence, for the
+-- rest of the session while the status line kept saying a pass was owed.
+--
+-- THE SHAPE 1 315 CHECKS NEVER BUILT: a SECOND picker open in the SAME session,
+-- after a first pass that finished without paying the debt down. Every existing
+-- behavioural case opens the picker exactly once per environment (suite
+-- item-scan-capture-restamp) or starts the pass directly through StartItemScan
+-- (suite item-scan-data-gate), so the latch was only ever observed in its
+-- unstamped state and the second open was never taken.
+----------------------------------------------------------------------
+suite("item-scan-repair-gate", function(ck)
+    if type(Scan) ~= "table" then ck(false, "itemScan.lua did not load"); return end
+    local ROGUE = Scan.CLASS_BIT.ROGUE
+    local NONE  = Scan.FACTION_NONE
+
+    -- ── SINGLE-SOURCE BIT LAYOUT (suspect 1, refuted and pinned) ────────────
+    -- The unread-flag WRITER (Normalize's re-flag) and the repair-queue READER
+    -- (UnreadIds) can only disagree if somebody keeps a second copy of the
+    -- layout. There is exactly one, it is private to itemScan.lua, and every
+    -- reader in the addon goes through Scan.PackMeta / Scan.UnpackMeta.
+    do
+        local h = io.open(P("itemScan.lua"), "r")
+        ck(h ~= nil, "itemScan.lua is readable")
+        if h then
+            local s = h:read("*a"); h:close()
+            local _, defs = s:gsub("local%s+U_SHIFT%s*=", "")
+            ck(defs == 1, "the unread bit's position is declared exactly ONCE (got "
+               .. tostring(defs) .. ")")
+            local _, packs = s:gsub("cache%.meta%[id%]%s*=%s*Scan%.PackMeta", "")
+            ck(packs == 2, "…and only Normalize and Scan.Put ever write a packed record (got "
+               .. tostring(packs) .. ")")
+            -- no other shipped file may open the record by hand
+            local toc, others = io.open(P("Daseeki-Armory.toc"), "r"), 0
+            if toc then
+                for line in toc:lines() do
+                    local f = line:match("^%s*([%w_%-]+%.lua)%s*$")
+                    if f and f ~= "itemScan.lua" then
+                        local fh = io.open(P(f), "r")
+                        if fh then
+                            local body = fh:read("*a"); fh:close()
+                            if body:find("U_SHIFT") or body:find("I_SHIFT")
+                               or body:find("524288") or body:find("262144") then
+                                others = others + 1
+                            end
+                        end
+                    end
+                end
+                toc:close()
+            end
+            ck(others == 0, "…and no other shipped file knows a bit position (got "
+               .. tostring(others) .. " that do)")
+        end
+    end
+
+    -- …and the layout is PINNED, because it is not private to this build: every
+    -- packed record is sitting in somebody's SavedVariables right now. Moving a
+    -- bit position re-reads every stored record as something else — an owner's
+    -- 9 240 unread flags would come back as internal flags, or as nothing — so a
+    -- move is only safe together with a Scan.CACHE_VERSION bump, which discards
+    -- the old payload instead of misreading it. These literals make that pairing
+    -- a deliberate, visible edit rather than a silent one.
+    do
+        ck(Scan.PackMeta(1, 0, 0, false, false) == 1,      "layout: quality occupies the low bits")
+        ck(Scan.PackMeta(0, 1, 0, false, false) == 16,     "layout: classMask starts at 16")
+        ck(Scan.PackMeta(0, 0, 1, false, false) == 65536,  "layout: faction starts at 65536")
+        ck(Scan.PackMeta(0, 0, 0, true,  false) == 262144, "layout: the INTERNAL flag is 262144")
+        ck(Scan.PackMeta(0, 0, 0, false, true)  == 524288,
+           "layout: the UNREAD flag is 524288 — move it and every cache on disk is misread")
+        ck(Scan.CACHE_VERSION == 1,
+           "…so CACHE_VERSION is pinned beside it: a layout change must bump this in the same edit")
+        ck(select(5, Scan.UnpackMeta(524288)) == true,
+           "…and the reader opens that exact bit as `unread`")
+        ck(select(4, Scan.UnpackMeta(262144)) == true, "…and that exact bit as `internal`")
+    end
+
+    -- every reader of the flag agrees on the same fixture, by construction
+    do
+        local c = Scan.NewCache()
+        Scan.Put(c, 101, "Read Row",   4, ROGUE, 0, false)
+        Scan.Put(c, 102, "Unread Row", 4, 0, 0, true)
+        Scan.Put(c, 103, "[PH] Thing", 1, 0, 0, true)   -- internal: never owed
+        local n = Scan.Normalize(c)
+        local report = table.concat(Scan.StatusReport(n, nil), "\n")
+        ck(n.unreadCount == 1, "the WRITER's tally counts one owed row")
+        ck(#Scan.UnreadIds(n) == 1, "…the repair-queue READER finds the same one")
+        ck(Scan.UnreadIds(n)[1] == 102, "…and it is the row that is actually flagged")
+        ck(report:find("1 still unread") ~= nil, "…and the status walk agrees with both")
+    end
+
+    -- ── THE BLOCK REASON IS SESSION STATE ───────────────────────────────────
+    -- It lives on the cache only so /darmory scanstatus can read it back, and
+    -- every reason it can carry is phrased about THIS session. A reason that
+    -- survived a relog would be a lie in the one place the owner goes for the
+    -- truth, so the login normalise clears it.
+    do
+        local c = Scan.NewCache()
+        Scan.Put(c, 102, "Unread Row", 4, 0, 0, true)
+        c.scannedAt      = 1785862751
+        c.repairBlocked  = "this session's repair pass already ran and left all 9240 rows unread"
+        local n = Scan.Normalize(c)
+        ck(n.repairBlocked == nil,
+           "a block reason does not survive the login that ends the session it described")
+        ck(table.concat(Scan.StatusReport(n, nil), "\n"):find("repair blocked") == nil,
+           "…so a fresh session's scanstatus does not report a stale block")
+        ck(n.unreadCount == 1, "…while the debt itself, which IS on disk, survives untouched")
+    end
+
+    -- ── THE GATE ITSELF, pure ────────────────────────────────────────────────
+    local function gate(t) return Scan.RepairGate(t) end
+    do
+        local ok, why = gate({ scanning = false, complete = true, owed = 9240 })
+        ck(ok == true and why == nil, "an owed debt on a complete cache runs a pass")
+
+        ok, why = gate({ scanning = false, complete = true, owed = 0 })
+        ck(ok == false and why == nil,
+           "nothing owed is NOT a refusal — there must be no complaint about a healthy cache")
+
+        ok, why = gate({ scanning = true, complete = true, owed = 9240 })
+        ck(ok == false and type(why) == "string", "a running scan refuses WITH a reason")
+
+        ok, why = gate({ scanning = false, complete = false, owed = 9240 })
+        ck(ok == false and (why or ""):find("Rescan Items") ~= nil,
+           "an unscanned account is told to scan, not left guessing")
+
+        -- THE DEFECT'S OWN CASE
+        ok, why = gate({ scanning = false, complete = true, owed = 9240,
+                         tried = true, lastFrom = 9240 })
+        ck(ok == false and type(why) == "string",
+           "a pass that paid NOTHING off refuses the next open — and says why")
+        ck((why or ""):find("9240") ~= nil and (why or ""):find("relog") ~= nil,
+           "…naming the debt and the remedy (got: " .. tostring(why) .. ")")
+
+        -- THE FIX: progress re-opens the door
+        ok, why = gate({ scanning = false, complete = true, owed = 4000,
+                         tried = true, lastFrom = 9240 })
+        ck(ok == true and why == nil,
+           "THE FIX: a pass that paid the debt DOWN lets the next open run another")
+        ok = gate({ scanning = false, complete = true, owed = 1, tried = true, lastFrom = 2 })
+        ck(ok == true, "…however small the payment was")
+        ok = gate({ scanning = false, complete = true, owed = 9241,
+                    tried = true, lastFrom = 9240 })
+        ck(ok == false, "…while a debt that GREW does not re-open it (it cannot converge)")
+        ck(gate({ scanning = false, complete = true, owed = 5, tried = false }) == true,
+           "…and the first open of a session always runs")
+    end
+
+    ----------------------------------------------------------------------
+    -- BEHAVIOURAL: his cache shape, the real picker-open path, one call at a
+    -- time. A FEW HUNDRED rows is the shape; 9 240 is only the count, and
+    -- fixturing it buys nothing but minutes.
+    ----------------------------------------------------------------------
+    local function scanEnv()
+        local A = {}
+        local fnc = loadfile(P("itemScan.lua"))
+        if not fnc then return nil end
+        if not pcall(fnc, "Daseeki-Armory", A) then return nil end
+        A.Tag  = function() return "[Armory]" end
+        A.Wrap = function(_, _, s) return s end
+        A.SLOT_INVTYPES = { [1] = { INVTYPE_ROBE = true } }
+        return A
+    end
+
+    local NIL  = {}
+    local KEYS = { "CreateFrame", "GetTime", "GetBuildInfo", "time", "UnitClass", "print",
+                   "UIParent", "C_Item", "GetItemInfo", "GetItemInfoInstant",
+                   "ITEM_CLASSES_ALLOWED", "LOCALIZED_CLASS_NAMES_MALE",
+                   "LOCALIZED_CLASS_NAMES_FEMALE", "C_CreatureInfo", "DaseekiArmoryScanDB" }
+    for i = 1, 8 do KEYS[#KEYS + 1] = "DaseekiArmoryItemScanTipTextLeft" .. i end
+
+    local W = {}
+    local CHAT = {}
+    local function withStubs(fn)
+        local saved = {}
+        for _, k in ipairs(KEYS) do
+            local v = _G[k]; saved[k] = (v == nil) and NIL or v
+        end
+        local frame, shown = {}, nil
+        function frame:Hide() end
+        function frame:Show() end
+        function frame:SetScript() end
+        function frame:RegisterEvent() end
+        function frame:UnregisterAllEvents() end
+        function frame:SetOwner() end
+        function frame:ClearLines() end
+        function frame:SetItemByID(id)
+            shown = W.tip[id]
+            for i = 1, 8 do _G["DaseekiArmoryItemScanTipTextLeft" .. i] = nil end
+            for i, txt in ipairs(shown or {}) do
+                local t = txt
+                _G["DaseekiArmoryItemScanTipTextLeft" .. i] = { GetText = function() return t end }
+            end
+        end
+        function frame:NumLines() return shown and #shown or 0 end
+        _G.CreateFrame  = function() return frame end
+        _G.GetTime      = function() return W.now or 1000 end
+        _G.GetBuildInfo = function() return "1.15.9", "68808" end
+        _G.time         = function() return 1786000000 end
+        _G.UnitClass    = function() return "Warrior", "WARRIOR" end
+        _G.UIParent     = frame
+        _G.print        = function(s) CHAT[#CHAT + 1] = tostring(s) end
+        _G.C_CreatureInfo = nil
+        _G.ITEM_CLASSES_ALLOWED = "Classes: %s"
+        _G.LOCALIZED_CLASS_NAMES_MALE   = { ROGUE = "Rogue", WARRIOR = "Warrior" }
+        _G.LOCALIZED_CLASS_NAMES_FEMALE = nil
+        _G.GetItemInfo        = function(id) return W.names[id], nil, 4 end
+        _G.GetItemInfoInstant = function(id) return id, nil, nil, "INVTYPE_ROBE", 12345 end
+        _G.C_Item = {
+            IsItemDataCachedByID = function(id) return W.cached[id] and true or false end,
+            RequestLoadItemDataByID = function(id)
+                W.asks = W.asks + 1
+                if W.answers then
+                    W.cached[id] = true
+                    if W.warmTip[id] then W.tip[id] = W.warmTip[id] end
+                end
+            end,
+        }
+        local packed = { pcall(fn) }
+        for _, k in ipairs(KEYS) do
+            local v = saved[k]; _G[k] = (v ~= NIL) and v or nil
+        end
+        return unpack(packed)
+    end
+
+    -- HIS CACHE SHAPE: a few hundred real rows off a completed scan, every one
+    -- of them flagged unread by the stamp-3 migration, already ON capture 3.
+    local ROWS = 300
+    local function ownerShape(answers)
+        W.cached, W.tip, W.warmTip, W.names, W.asks, W.now = {}, {}, {}, {}, 0, 1000
+        W.answers = answers and true or false
+        local sv = Scan.NewCache()
+        for i = 1, ROWS do
+            local id = 20000 + i
+            W.names[id] = "Owner Item " .. i
+            W.tip[id]   = { W.names[id], "Binds when picked up" }      -- PARTIAL
+            -- one row in eight is a rogue piece once its data lands
+            if i % 8 == 0 then
+                W.warmTip[id] = { W.names[id], "Binds when picked up", "Chest",
+                                  "Leather", "Classes: Rogue" }
+            else
+                W.warmTip[id] = { W.names[id], "Binds when picked up", "Chest", "Leather" }
+            end
+            Scan.Put(sv, id, W.names[id], 4, 0, 0, true)
+        end
+        sv.scannedAt          = 1785862751
+        sv.restrictStamp      = Scan.RESTRICT_STAMP     -- ALREADY on 3, off disk
+        sv.restrictRepairedAt = 1785899160
+        sv.restrictLocked, sv.restrictUnreadable = 834, 0
+        return sv
+    end
+
+    -- A BOUNDED driver. Never a bare `while`: the ceiling is an assert, because
+    -- a repair state machine that will not finish must fail this harness rather
+    -- than run the machine out of memory.
+    local function runToIdle(A, cap)
+        local t = 0
+        while A:IsScanning() do
+            t = t + 1
+            assert(t <= (cap or 800),
+                   "TICK CEILING: the repair pass did not finish in " .. tostring(cap or 800))
+            W.now = W.now + 1
+            A:ScanTick(1)
+        end
+        return t
+    end
+
+    -- ── (1) THE PERMANENT REPRODUCTION: his shape, picker open, pass runs ────
+    local A1 = scanEnv()
+    ck(A1 ~= nil, "a headless itemScan environment loads for the reproduction")
+    if A1 then
+        local sv = ownerShape(true)          -- a client that DOES answer
+        CHAT = {}
+        local ok, started, ticks, owedBefore = withStubs(function()
+            _G.DaseekiArmoryScanDB = sv
+            local cache = A1:ItemScanCache()               -- login
+            local owed  = Scan.UnreadCount(cache)
+            local s     = A1:MaybeRepairRestrictions()     -- PICKER OPEN
+            local t     = runToIdle(A1)
+            return s, t, owed
+        end)
+        ck(ok == true, "(1) his shape drives the real picker-open path (" .. tostring(started) .. ")")
+        ck(owedBefore == ROWS, "(1) login leaves every real row owed (got "
+           .. tostring(owedBefore) .. " of " .. ROWS .. ")")
+        ck(started == true, "(1) THE PASS STARTS on the owner's own cache state")
+        ck(type(ticks) == "number" and ticks > 0,
+           "(1) …and it COMPLETES over the fixture (" .. tostring(ticks) .. " ticks)")
+        ck(sv.unreadCount == 0, "(1) …leaving nothing owed (got " .. tostring(sv.unreadCount) .. ")")
+        ck(#Scan.UnreadIds(sv) == 0, "…by the flags as well as the tally")
+        local expectLocks = math.floor(ROWS / 8)
+        ck(sv.restrictLocked == expectLocks,
+           "(1) …and it CAPTURED the class locks it came for (got "
+           .. tostring(sv.restrictLocked) .. " of " .. tostring(expectLocks) .. ")")
+        ck(select(3, Scan.Get(sv, 20008)) == ROGUE, "…on the rows that carry one")
+        ck(sv.repairBlocked == nil, "(1) …and nothing is blocked on a healthy finish")
+    end
+
+    -- ── (2) THE OWNER'S DEFECT: the pass pays nothing, the SECOND open ──────
+    local A2 = scanEnv()
+    if A2 then
+        local sv = ownerShape(false)         -- the client never returns item data
+        CHAT = {}
+        local ok, s1, s2, why2, said, status = withStubs(function()
+            _G.DaseekiArmoryScanDB = sv
+            local cache = A2:ItemScanCache()
+            local a = A2:MaybeRepairRestrictions()         -- PICKER OPEN #1
+            runToIdle(A2)
+            local before = #CHAT
+            local b, w   = A2:MaybeRepairRestrictions()    -- PICKER OPEN #2, same session
+            return a, b, w, #CHAT - before,
+                   table.concat(Scan.StatusReport(cache, A2:ItemScanStatus()), "\n")
+        end)
+        ck(ok == true, "(2) the degenerate pass runs headlessly")
+        ck(s1 == true, "(2) the first open starts a pass")
+        ck(sv.unreadCount == ROWS,
+           "(2) …which pays NOTHING off — his exact evidence (got "
+           .. tostring(sv.unreadCount) .. " still unread)")
+        ck(s2 == false, "(2) the SECOND open in the same session does not start another")
+        -- …and THIS is the bug: before the fix it returned false and said nothing.
+        ck(type(why2) == "string" and why2 ~= "",
+           "(2) SILENCE IS A META-BUG: the refusal carries a reason")
+        ck(said == 1, "(2) …spoken in chat, exactly once (got " .. tostring(said) .. " lines)")
+        ck(status:find("repair blocked: ") ~= nil,
+           "(2) …and surfaced in /darmory scanstatus as `repair blocked: <reason>`")
+        ck(status:find("a repair pass is still owed") ~= nil,
+           "…right beside the line that says a pass is owed, so the two agree")
+        ck(sv.repairBlocked == why2, "…persisted on the cache, so it survives the scrollback")
+    end
+
+    -- ── (3) NO SPAM: reopening the picker repeats nothing ───────────────────
+    local A3 = scanEnv()
+    if A3 then
+        local sv = ownerShape(false)
+        CHAT = {}
+        local ok, extra = withStubs(function()
+            _G.DaseekiArmoryScanDB = sv
+            A3:ItemScanCache()
+            A3:MaybeRepairRestrictions()
+            runToIdle(A3)
+            A3:MaybeRepairRestrictions()      -- speaks once
+            local before = #CHAT
+            for i = 1, 12 do                  -- bounded: the picker gets opened a lot
+                assert(i <= 12, "open ceiling")
+                A3:MaybeRepairRestrictions()
+            end
+            return #CHAT - before
+        end)
+        ck(ok == true, "(3) twelve more picker opens run")
+        ck(extra == 0, "(3) …and say nothing further: one reason, one line (got "
+           .. tostring(extra) .. ")")
+    end
+
+    -- ── (4) A HEALTHY CACHE NEVER COMPLAINS ─────────────────────────────────
+    local A4 = scanEnv()
+    if A4 then
+        W.cached, W.tip, W.warmTip, W.names, W.asks, W.answers = {}, {}, {}, {}, 0, true
+        local sv = Scan.NewCache()
+        Scan.Put(sv, 16905, "Bloodfang Chestpiece", 4, ROGUE, 0, false)
+        sv.scannedAt = 1785862751
+        CHAT = {}
+        local ok, started, why, lines, status = withStubs(function()
+            _G.DaseekiArmoryScanDB = sv
+            local cache = A4:ItemScanCache()
+            local s, w = A4:MaybeRepairRestrictions()
+            return s, w, #CHAT, table.concat(Scan.StatusReport(cache, nil), "\n")
+        end)
+        ck(ok == true, "(4) a healthy cache opens the picker")
+        ck(started == false and why == nil,
+           "(4) …starts no pass and reports no reason: there is no debt to be blocked about")
+        ck(lines == 0, "(4) …and says nothing in chat (got " .. tostring(lines) .. " lines)")
+        ck(status:find("repair blocked") == nil, "(4) …and scanstatus stays quiet too")
+        ck(status:find("a repair pass is still owed") == nil, "…because nothing is owed")
+    end
+
+    -- ── (5) THE LIVE-LOCK FINGERPRINT, made impossible ──────────────────────
+    -- An EMPTY repair queue while the tally says work is owed is the state that
+    -- invites MaybeRepairRestrictions in on every open of every session and turns
+    -- it away in silence every time. The flags are the truth; the tally is
+    -- reconciled to them, loudly, and the state ends.
+    local A5 = scanEnv()
+    if A5 then
+        W.cached, W.tip, W.warmTip, W.names, W.asks, W.answers = {}, {}, {}, {}, 0, true
+        local sv = Scan.NewCache()
+        Scan.Put(sv, 16905, "Bloodfang Chestpiece", 4, ROGUE, 0, false)   -- READ
+        sv.scannedAt   = 1785862751
+        sv.unreadCount = 9240                       -- a tally that is simply wrong
+        CHAT = {}
+        local ok, started, why, again, why2, lines = withStubs(function()
+            _G.DaseekiArmoryScanDB = sv
+            -- bind WITHOUT Normalize's recount: this is the tally lying to the gate
+            local cache = sv
+            A5.ItemScanCache = function() return cache end
+            local s, w = A5:MaybeRepairRestrictions()
+            local s2, w2 = A5:MaybeRepairRestrictions()      -- and again, next open
+            return s, w, s2, w2, #CHAT
+        end)
+        ck(ok == true, "(5) the impossible state is driven")
+        ck(started == false, "(5) no pass starts on an empty queue")
+        ck(type(why) == "string" and why:find("9240") ~= nil,
+           "(5) …but it is LOUD about it (got: " .. tostring(why) .. ")")
+        ck(sv.unreadCount == 0,
+           "(5) THE STATE IS ENDED: the tally is reconciled to the flags (got "
+           .. tostring(sv.unreadCount) .. ")")
+        ck(#Scan.UnreadIds(sv) == 0, "…which is what the flags actually say")
+        ck(again == false and why2 == nil,
+           "(5) …so the NEXT open finds a healthy cache and has nothing to report")
+        ck(lines == 1, "(5) …and the whole episode cost exactly one chat line (got "
+           .. tostring(lines) .. ")")
+        ck(A5:IsScanning() == false, "(5) …and left no half-started scan behind")
+    end
+
+    -- ── (6) MUTATION: each guard, broken, turns this suite red ──────────────
+    do
+        local MUT = {
+            ["latch measures the attempt, not the debt (THE BUG)"] = function(st)
+                if st.scanning or not st.complete then return false end
+                if (tonumber(st.owed) or 0) <= 0 then return false end
+                if st.tried then return false end          -- the shipped 1.3.1 line
+                return true
+            end,
+            ["a refused pass returns without a reason"] = function(st)
+                local okk = Scan.RepairGate(st)
+                return okk
+            end,
+            ["progress does not re-open the door"] = function(st)
+                if st.scanning or not st.complete then return false end
+                if (tonumber(st.owed) or 0) <= 0 then return false end
+                if st.tried then return false end
+                return true
+            end,
+            ["a healthy cache is treated as a refusal"] = function(st)
+                local okk = Scan.RepairGate(st)
+                return okk
+            end,
+        }
+        local CASES = {
+            { scanning = false, complete = true, owed = 300, tried = true, lastFrom = 300 },
+            { scanning = false, complete = true, owed = 100, tried = true, lastFrom = 300 },
+            { scanning = false, complete = true, owed = 0 },
+            { scanning = false, complete = false, owed = 300 },
+            { scanning = true,  complete = true, owed = 300 },
+            { scanning = false, complete = true, owed = 300 },
+        }
+        local names = {}
+        for k in pairs(MUT) do names[#names + 1] = k end
+        table.sort(names)
+        for _, nm in ipairs(names) do
+            local killed = false
+            for _, cse in ipairs(CASES) do
+                local realOk, realWhy = Scan.RepairGate(cse)
+                local mok, mwhy = MUT[nm](cse)
+                if (mok and true or false) ~= realOk then killed = true; break end
+                -- a mutant that keeps the verdict but drops the reason is still dead
+                if nm:find("reason") or nm:find("healthy") then
+                    if (mwhy ~= nil) ~= (realWhy ~= nil) then killed = true; break end
+                end
+            end
+            ck(killed, "mutation killed: " .. nm)
+        end
+    end
+
+    -- ── (7) THE SHIPPING PATH still reaches the gate ────────────────────────
+    do
+        local g = io.open(P("goalPicker.lua"), "r")
+        ck(g ~= nil, "goalPicker.lua is readable")
+        if g then
+            local s = g:read("*a"); g:close()
+            local call = s:find("Addon:MaybeRepairRestrictions%(%)")
+            local show = s:find("function Addon:ShowGoalPicker")
+            ck(call ~= nil and show ~= nil and call > show,
+               "the picker-open path still calls the repair, from inside ShowGoalPicker")
+        end
+        local h = io.open(P("itemScan.lua"), "r")
+        if h then
+            local s = h:read("*a"); h:close()
+            ck(s:find("function Scan%.RepairGate") ~= nil, "the gate is a pure, named rule")
+            ck(s:find("function Addon:BlockRepair") ~= nil, "the refusal has one voice")
+            ck(s:find("Addon%._restrictRepairFrom%s*=%s*owed") ~= nil,
+               "…and the latch records the debt the pass attacked, not merely that it ran")
+            ck(s:find("repair blocked: ") ~= nil, "…which /darmory scanstatus reads back")
+            ck(s:find("if ST%.queueTotal == 0 then ST = nil; return false end") == nil,
+               "the silent empty-queue return is GONE")
+        end
     end
 end)
 

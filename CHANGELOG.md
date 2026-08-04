@@ -4,6 +4,31 @@
 
 ### Fixed
 
+- **Opening the Goal picker starts the restriction repair again — and when it will not,
+  it tells you why.** The repair pass is meant to run when you open the picker and there
+  are class locks still unread. It was allowed exactly one attempt per session, and that
+  attempt was counted the moment a pass *started* — never mind whether the pass achieved
+  anything. So on a session where the pass ran and the game returned no item data for any
+  of the rows — it re-read 9,240 items, captured nothing, and reported "0 locked, 9,240
+  unreadable" — the door was then bolted for the rest of that session. Every later picker
+  open did nothing at all: no pass, no message, no change, while `/darmory scanstatus`
+  went on saying *a repair pass is still owed*. Two true statements with nothing joining
+  them, and no way in from either end.
+
+  The attempt is now measured against the **debt** rather than against the attempt. A
+  pass that pays some of it off lets the next picker open run another, so the cache is
+  paid down across opens instead of being abandoned after one try. A pass that pays
+  nothing off does not silently re-run — but it says so, once, in chat, naming the reason
+  and the remedy, and `/darmory scanstatus` grows a **`repair blocked:`** line that is
+  still there three minutes later when you go looking. Every other way the repair can
+  decline now speaks the same way: a scan already running, an account with no completed
+  scan yet, or a cache whose tally of unread rows disagrees with the rows themselves —
+  which is reconciled on the spot rather than left to invite the repair in and turn it
+  away for ever.
+
+  A repair that finishes without capturing a single lock now also says so where you can
+  see it, instead of leaving "0 locked" to be read as success.
+
 - **The Goal picker no longer offers items from other expansions.** Armory ships a
   bundled name list so the picker works before your first scan finishes. That list came
   from a source that reaches well past this game — and once your own scan had completed,
