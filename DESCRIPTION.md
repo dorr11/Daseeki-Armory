@@ -8,7 +8,7 @@ Per-character equipment set manager for WoW Classic Era: save full gear loadouts
 ## Features
 - Save and equip full gear sets per character, with a live character preview that dresses the model in the set you're viewing
 - **In-combat weapon swaps** — a set's keybind swaps main hand, off hand, and ranged instantly mid-fight; the rest of the set follows when combat ends
-- **Gear goals**: mark an item you're hunting on any set slot, searchable from every equippable item in the game (a one-time, throttled scan builds the item database on your first login — about a minute, once per account). Results are rarity-colored and filtered to what your class and faction can actually use, and a green check appears the moment the item is yours
+- **Gear goals**: mark an item you're hunting on any set slot, searchable from every equippable item in the game. The item database ships with the addon — all 9,240 of them — so the picker is complete the first time you open it, with nothing to scan and nothing to wait for. Results are rarity-colored and filtered to what your class and faction can actually use, and a green check appears the moment the item is yours
 - **Trinket cooldown readouts** straight on the trinket slots, on the character pane and the popout buttons
 - **Character stat panel** — Attributes, Melee, Ranged, Spell, Defense, and Resistances, computed to agree with the game (including talent spell crit and MP5 the default sheet under-reports)
 - Quality glow on your equipped gear, matching the Daseeki Bags look

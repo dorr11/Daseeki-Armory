@@ -1,10 +1,49 @@
 # Changelog
 
-## 1.3.1 — 2026-08-04
+## 1.3.1 — 2026-08-05
+
+### Changed
+
+- **The Goal picker now ships its entire item database. There is no scan, ever.**
+  Every equippable item in Classic Era — all 9,240 of them, by name and rarity — is
+  built into the addon. Open a slot on a brand-new account, seconds after your first
+  login, and the whole list is already there.
+
+  What this replaces: Armory used to build that list on your machine. A one-time walk
+  of 32,000 item ids, started by a timer fifteen seconds after you logged in, announced
+  in chat, taking about a minute, saved to your account, and repeatable through a
+  **Rescan Items** button in the picker when something looked wrong. All of that is
+  gone — the button, the timer, the progress readout, the "(unscanned)" warning on the
+  count line, and the once-per-account wait.
+
+  The reason is simply that it never needed to be a question. Classic Era is a frozen
+  game: the set of equippable items in it is identical on every account, on every realm,
+  on every login, and it has not changed in years. Asking every player to measure that
+  constant for themselves — and then storing their private copy of the answer — was the
+  last piece of the old design still doing work that a shipped file does better. It is
+  the same reasoning that moved the class and faction locks into the addon earlier in
+  this release, applied to the list those locks are read against.
+
+  **Nothing is asked of you and nothing is lost.** Your existing item cache is left
+  alone on disk, untouched and unread; the picker no longer consults it. There is no
+  migration, no rebuild and no first-login message. Items your client does not have are
+  quietly skipped, so a future game patch can only ever make the list shorter, never
+  wrong.
+
+  It is also **lighter**. The old bundled name list cost about 970 KB of memory at
+  login for roughly 5,300 names; the new catalog carries nearly twice as many items for
+  about 240 KB, because it is stored as text and read once rather than kept as a table
+  forever. The download grows by about 32 KB.
+
+  `/darmory scanstatus` has become **`/darmory data`**, and it is now three counts:
+  how many items, how many class and faction locks, and how many retired items this
+  build carries. The old name still works. Every question it used to answer — is a scan
+  running, how far along, when did it last finish, is anything still owed — no longer
+  has anything to refer to.
 
 ### Fixed
 
-- **The legendaries are back in the Goal picker, and a rescan no longer empties it.**
+- **The legendaries are back in the Goal picker.**
   *Thunderfury* had gone missing from the list. Nothing had hidden it — it carries no
   class lock, it is not on the retired-items list, no placeholder filter touches its
   name, and the picker's own rules answer "usable" for it on a warrior. It was being
@@ -21,16 +60,7 @@
   legendaries lead every slot and no cap can reach them; once the levels arrive, item
   level leads the order again exactly as before.
 
-  Underneath that, **Rescan Items was destroying your item cache.** Pulling the old
-  class-lock machinery out of the scan in this same release took the line that actually
-  *writes an item down* with it — it sat in the middle of the block that was removed. So
-  the scan walked the whole id space, reported progress, and announced "item scan
-  complete", having saved nothing at all: a real cache went from 10,504 items to zero,
-  after which the picker fell back to the bundled name list. Nobody who had not pressed
-  the button was affected, and pressing it is now safe again. If your list looks short or
-  your cache reads as empty, one **Rescan Items** rebuilds it.
-
-  Both are pinned by a sweep over every legendary and artifact-quality item in a real
+  This is pinned by a sweep over every legendary and artifact-quality item in a real
   client — *Thunderfury*, *Sulfuras*, the *Corrupted Ashbringer*, all four *Atiesh* and
   the rest — which now asserts, per item, that it is offered to exactly the classes that
   can wield it and that it survives into the visible list.
@@ -55,25 +85,35 @@
   from a tooltip, nothing is retried, nothing is repaired, nothing is owed, and every
   account on every character sees exactly the same answer the moment the picker opens.
 
-  **There is nothing to do and nothing to wait for.** Your existing cache is kept as it
-  is — no rescan, no repair pass, no minute of background traffic, no chat message. The
-  next time you open the Goal picker, Tier 3 and Atiesh are simply not in your warrior's
-  list. `/darmory scanstatus` is shorter by four lines for the same reason: with no
-  capture there is nothing to report about one, and it now just says how many locks this
-  build carries.
+  **There is nothing to do and nothing to wait for.** No repair pass, no minute of
+  background traffic, no chat message. The next time you open the Goal picker, Tier 3
+  and Atiesh are simply not in your warrior's list. `/darmory data` is shorter for the
+  same reason: with no capture there is nothing to report about one, and it now just
+  says how many locks this build carries.
 
   If an item ever turns out to be missing a lock, that is now a gap in a list that ships
   with the addon — the same gap for everyone, fixed in the next update — rather than
   something that went wrong on your account and has to heal itself there.
 
-- **Items that can no longer be obtained by anyone are out of the picker.** Five of them:
-  the two Warglaives of Azzinoth, *The Twin Blades of Azzinoth*, the original
-  *Ashbringer*, and *Andonisus, Reaper of Souls*. They are real records in your client,
-  which is why the previous release deliberately left them in — but no character can end
-  up owning one, so they are not goals. They are hidden the same way Blizzard's own
-  placeholders are: **Show unusable** does not bring them back, because there is no
-  character anywhere for whom they are merely unusable. This is a plain list inside the
-  addon, so it can be changed or emptied without a rescan.
+- **Items that can no longer be obtained by anyone are out of the picker.** Twelve of
+  them. Five by history: the two Warglaives of Azzinoth, *The Twin Blades of Azzinoth*,
+  the original *Ashbringer*, and *Andonisus, Reaper of Souls*. Seven more are the game
+  masters' own toolkit, named after Blizzard staff and carried by the client at artifact
+  rarity — the *Stone of Pierce*, *Lapidis*, *Goodman*, *Kurtz*, *Backus* and *Brownell*,
+  and *Alex's Ring of Audacity*. None of them was ever placed in a loot table on any
+  realm, in any event.
+
+  They are real records in your client, which is why an earlier release deliberately left
+  them in — but no character can end up owning one, so they are not goals. They are
+  hidden the same way Blizzard's own placeholders are: **Show unusable** does not bring
+  them back, because there is no character anywhere for whom they are merely unusable.
+  This is a plain list inside the addon, so it can be changed or emptied in one line.
+
+  With those seven added, **no artifact-quality item is offered at all**, which is
+  correct: Classic Era does not contain one you can obtain. Hiding them by *name* would
+  not have been safe — *Relic Stone of Piety* and *Stone of the Earth* are ordinary gear
+  a player can wear — so each is listed by item id, and each id was checked against the
+  client's own name for it before being written down.
 
   **Three items have come back off that list.** *Gressil, Dawn of Ruin*, *Iblis, Blade of
   the Fallen Seraph* and *Neretzek, The Blood Drinker* were listed on original-vanilla
@@ -92,31 +132,26 @@
   the picker, it still answers a search for "ashbringer", and only its unobtainable
   namesake is gone.
 
-- **The Goal picker no longer offers items from other expansions.** Armory ships a
-  bundled name list so the picker works before your first scan finishes. That list came
-  from a source that reaches well past this game — and once your own scan had completed,
-  Armory was still merging it in. So Wrath and Cataclysm gear that no Era character can
-  ever hold sat in the list: *Wrathful Gladiator's Tabard*, *Tabard of the Argent
-  Crusade*, *Gilneas Tabard*, the Exodar and Silvermoon City tabards, *Hallowed Helm*,
-  *Swift Brewfest Ram*, and a long tail of AtlasLoot's own section headings ("Warrior",
-  "Rogue", "Mage") parked on ids that mean nothing here. In a real cache that is
-  **1,889 entries the client has never heard of**, 95 of them beyond the range Armory
-  even scans.
+- **The Goal picker no longer offers items from other expansions.** Armory used to carry
+  a bundled name list, taken from a source that reaches well past this game, and merge it
+  into the picker. So Wrath and Cataclysm gear that no Era character can ever hold sat in
+  the list: *Wrathful Gladiator's Tabard*, *Tabard of the Argent Crusade*, *Gilneas
+  Tabard*, the Exodar and Silvermoon City tabards, *Hallowed Helm*, *Swift Brewfest Ram*,
+  and a long tail of AtlasLoot's own section headings ("Warrior", "Rogue", "Mage") parked
+  on ids that mean nothing here. Measured against a real client, that is **1,889 entries
+  it has never heard of**, 95 of them past the end of the item range entirely.
 
-  Your completed scan is a full census of what your client actually contains, so it is
-  now the *only* source the picker uses. The bundled list still fills the gap before
-  your first scan finishes — that has not changed — and after it, an id your client does
-  not have is simply not offered. Nothing real is lost: *Kingsfall*, *Might of Menethil*,
-  Atiesh and the rest of Naxxramas are in your client, so they are in your scan, so they
-  stay.
+  That list is not shipped any more at all — the built-in catalog replaced it, and the
+  catalog is a census of what an Era client actually contains, so it cannot hold that
+  kind of entry in the first place. Nothing real is lost: *Kingsfall*, *Might of
+  Menethil*, Atiesh and the rest of Naxxramas are all in it.
 
-  One thing this rule cannot reach: items that exist in your client but can no longer be
-  obtained by anyone. Your client genuinely has them, so a census of your client keeps
-  them. They are removed by the retired-items list above instead.
+  One thing this cannot reach: items that genuinely exist in the client but can no longer
+  be obtained by anyone. They are removed by the retired-items list above instead.
 
 - **Scrolling the Goal picker no longer jumps back to the top.** Any background refresh —
-  item names arriving from the server, a scan finishing — rebuilt the list and sent you
-  back to row one. Those refreshes arrive continuously while names are streaming in,
+  item levels arriving from the server — rebuilt the list and sent you back to row one.
+  Those refreshes arrive continuously while item data is streaming in,
   which made the list effectively unscrollable. Your position is now kept
   across every refresh you did not ask for, and adjusts if the list gets shorter under
   you. Typing in the search box, toggling **Show unusable**, or opening the picker still
@@ -130,15 +165,18 @@
   What you saw was a single uncoloured line that changed as you scrolled, with the items
   really there but never drawn. The list now fills all twelve rows, every row is tinted
   by rarity (grey through orange), and the count line updates again.
-- **The picker no longer shows an item under the wrong name.** Armory merges your
-  client's own scan with a bundled name list, the client always winning. Dropping an
-  entry as a Blizzard placeholder used to release its id back to the bundled list, which
-  does not agree with your client about what every id is — so a placeholder that had just
-  been filtered out reappeared under a stale name. That is why `Enchant Cloak -
-  Resistance` (the name of an *enchantment*, not of anything wearable) turned up in the
-  picker. Thirty-seven ids were doing this. The client's verdict on an id is now final.
+- **The picker no longer shows an item under the wrong name.** Armory used to merge your
+  client's own item data with a bundled name list, the client winning where they
+  disagreed. Dropping an entry as a Blizzard placeholder released its id back to the
+  bundled list, which does not agree with your client about what every id is — so a
+  placeholder that had just been filtered out reappeared under a stale name. That is why
+  `Enchant Cloak - Resistance` (the name of an *enchantment*, not of anything wearable)
+  turned up in the picker. Thirty-seven ids were doing this. There is no second list to
+  disagree with any more, so this cannot recur: the built-in catalog *is* the client's
+  own item data, and a name filtered out of it was never written into it in the first
+  place.
 
-- **Enchantment names are filtered out of the picker.** The bundled name list carries 123
+- **Enchantment names are filtered out of the picker.** The old bundled list carried 123
   entries like `Enchant Cloak - Resistance` and `Enchant 2H Weapon - Agility`; those name
   an effect, not an item, and none of them can be worn. The *recipes* are real and are
   untouched — `Formula: Enchant Cloak - Greater Resistance` still appears — and so is
@@ -152,32 +190,31 @@
   placeholders (`[PH] Brilliant Dawn Cap`), the gear worn by creatures
   (`Monster - Sword, Katana`), designer test pieces (`Test Glaive A`,
   `90 Epic Warrior Helm`) and retired duplicates (`Deprecated Dented Skullcap`). About
-  one in eight of everything the scan found is of that kind, and none of it can be
-  obtained by anyone. Armory now recognises those records and keeps them out of the
-  picker entirely.
+  one in eight of everything the client holds is of that kind, and none of it can be
+  obtained by anyone. Armory recognises those records and keeps them out of the picker
+  entirely.
 
   They are **not** revealed by **Show unusable**, deliberately: that tick box is for
   items *some other character* could equip, and these are not items at all. The name
-  rules were derived by reading a full scan of a live Era client — 10,504 equippable
-  items — and were checked against every one of the 9,241 real items that survive, so
+  rules were derived by reading a full census of a live Era client — 10,504 equippable
+  items — and were checked against every one of the 9,240 real items that survive, so
   nothing you can actually go and earn is hidden. Real gear whose name looks suspicious
   is safe: *Testament of Hope*, *Contest Winner's Tabard*, *Old Blunderbuss*,
   *Adept's Cloak*, *103 Pound Mightfish* and *Doomcaller's Footwraps* all still appear.
 
-  **You do not need to rescan.** The next time you log in, Armory re-reads the names
-  already in its cache and marks them; it takes a few hundredths of a second. If a
-  future update improves the rules, that too applies at the next login rather than
-  asking for another scan. The chat line at the end of a scan now also tells you how
-  many internal records it set aside.
+  **None of it is in the download.** Those 1,264 records are filtered out when the
+  catalog is built, so they never reach your machine at all — you are not shipped 12% of
+  a list only for your own client to spend every login deciding it is junk. If a future
+  update improves the rules, the improvement arrives with that update.
 
 ### New
 
-- **`/darmory scanstatus` tells you what the item scan knows, whenever you ask.** The
-  scan says its piece in chat once and then scrolls away, which is no help an hour later.
-  This prints the state instead of asking you to have witnessed it: how many items are
-  cached and how many of those are hidden internal records, how many class and faction
-  locks this build ships and how many items it hides as no-longer-obtainable, whether a
-  scan is running right now and how far through it is, and when the last full scan ran.
+- **`/darmory data` tells you what this build carries, whenever you ask.** Three counts,
+  identical on every account: how many items the catalog holds, how many class and
+  faction locks ship with it, and how many items it hides as no-longer-obtainable. If any
+  of them reads zero, that file failed to load, which is the one item-database fault this
+  design can still have — and now it is visible at a glance instead of showing up as a
+  short picker. `/darmory scanstatus` still works as a name for it.
 
 ### Unchanged, and deliberately so
 

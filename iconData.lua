@@ -112,17 +112,23 @@ function Addon:BuildIconList()
 end
 
 -- ── Item-name → icon search index ─────────────────────────────────────────────
--- So typing an item's name (e.g. "Gressil") returns its icon. Built once from the
--- bundled ItemNameDB (AtlasLoot-derived ~4.7k items); icons come from
+-- So typing an item's name (e.g. "Gressil") returns its icon. Icons come from
 -- GetItemInfoInstant — synchronous and offline for any item the client knows.
+--
+-- IT READS THE SHIPPED CATALOG NOW (1.3.1). This used to walk the bundled
+-- AtlasLoot snapshot (itemDB.lua, ~4.7k names, a third of which named nothing
+-- this client has), which is not shipped any more. catalog.lua is the client's
+-- own equippable item table — 9 240 rows, every one of them real here — so the
+-- icon search got both larger and truthful in the same change.
 function Addon:BuildItemSearch()
     if Addon._itemSearchBuilt then return Addon.ItemSearch end
     Addon._itemSearchBuilt = true
     Addon:BuildIconList()
     Addon._iconNameSeen = Addon._iconNameSeen or {}
     Addon.ItemSearch = Addon.ItemSearch or {}
-    if Addon.ItemNameDB then
-        for id, nm in pairs(Addon.ItemNameDB) do
+    local Scan = Addon.ItemScan
+    if Scan and Scan.CatalogEach then
+        Scan.CatalogEach(function(id, nm)
             local key = nm:lower()
             if not Addon._iconNameSeen[key] then
                 local _, _, _, _, icon = GetItemInfoInstant(id)
@@ -131,7 +137,7 @@ function Addon:BuildItemSearch()
                     Addon.ItemSearch[#Addon.ItemSearch + 1] = { tex = icon, name = key, id = icon, isItem = true }
                 end
             end
-        end
+        end)
     end
     return Addon.ItemSearch
 end

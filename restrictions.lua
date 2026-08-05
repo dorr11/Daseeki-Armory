@@ -879,10 +879,13 @@ Addon.StaticRestrictions = {
 [23668]=2,            -- PALADIN · Leggings of the Grand Crusader
 
 -- ═══════════════════════════════════════════════════════════════════════════
--- (b) SEED — Addon.ItemClassMask from the bundled itemDB.lua  (72 entries)
+-- (b) SEED — Addon.ItemClassMask from dev/itemDB-seed.lua  (72 entries)
 -- AtlasLoot-derived, and it speaks only for ids the evidence never captured.
 -- This is where the whole Naxxramas Tier-3 band comes from: the owner's client
 -- never had those items loaded, so no tooltip of his ever named their class.
+-- That seed is a GENERATOR INPUT now, not a shipped file: catalog.lua replaced
+-- it as the picker's name source in 1.3.1, but it is still the only place these
+-- masks exist, so it lives on in dev/ for the next regeneration.
 -- ═══════════════════════════════════════════════════════════════════════════
 [22416]=1,            -- WARRIOR · Dreadnaught Breastplate
 [22417]=1,            -- WARRIOR · Dreadnaught Legplates
@@ -972,7 +975,7 @@ Addon.StaticRestrictions = {
 }
 
 -- ═══════════════════════════════════════════════════════════════════════════
--- UNOBTAINABLE BY HISTORY  (5 entries)
+-- UNOBTAINABLE BY HISTORY  (12 entries)
 --
 -- Real records in the client for items no player can acquire on a live Era
 -- realm — never itemised into a loot table, or removed before the game froze.
@@ -981,7 +984,13 @@ Addon.StaticRestrictions = {
 -- wear, and there is no such character for these.
 --
 -- THIS IS A POLICY LIST, NOT A DERIVED FACT. Deleting a line puts the item
--- straight back into the picker — no code change, no rescan, no migration.
+-- straight back into the picker — no code change, no regeneration of the
+-- catalog, no migration. Which is exactly why the catalog does NOT bake these
+-- ids out: they are shipped, and then hidden by policy, so the policy stays
+-- one line away from being reversed.
+--
+-- EVERY ID HERE WAS RESOLVED AGAINST THE CLIENT'S OWN NAME at generation time;
+-- the generator refuses to write this file if any row disagrees.
 -- ═══════════════════════════════════════════════════════════════════════════
 Addon.StaticUnobtainable = {
 [13262]=true,         -- Ashbringer
@@ -989,6 +998,13 @@ Addon.StaticUnobtainable = {
 [18583]=true,         -- Warglaive of Azzinoth (Right)
 [18584]=true,         -- Warglaive of Azzinoth (Left)
 [22736]=true,         -- Andonisus, Reaper of Souls
+[6698]=true,          -- Stone of Pierce  [GM/developer records, never player-obtainable]
+[6707]=true,          -- Stone of Lapidis  [GM/developer records, never player-obtainable]
+[6708]=true,          -- Stone of Goodman  [GM/developer records, never player-obtainable]
+[6711]=true,          -- Stone of Kurtz  [GM/developer records, never player-obtainable]
+[6724]=true,          -- Stone of Backus  [GM/developer records, never player-obtainable]
+[6728]=true,          -- Stone of Brownell  [GM/developer records, never player-obtainable]
+[12947]=true,         -- Alex's Ring of Audacity  [GM/developer records, never player-obtainable]
 }
 
--- Entry count at generation time: 910 restrictions, 5 unobtainable.
+-- Entry count at generation time: 910 restrictions, 12 unobtainable.

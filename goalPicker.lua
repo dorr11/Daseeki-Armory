@@ -1,22 +1,35 @@
 --[[
     Daseeki Armory — goal item picker (search any item by name).
 
-    A themed search list of items that fit a given slot. Three NAME sources are
-    merged, highest-confidence first:
+    A themed search list of items that fit a given slot.
 
-      1. the SCANNED cache (itemScan.lua / DaseekiArmoryScanDB) — real client names
-         and real qualities;
-      2. the bundled AtlasLoot-derived name table (itemDB.lua) as the seed/fallback
-         ONLY WHILE NO SCAN HAS COMPLETED (see SEED RETIREMENT below);
-      3. the vanilla PvP rank-set ids (pvpItems.lua), whose names only exist at runtime.
+    THE PICKER SHIPS ITS ENTIRE ITEM DATABASE (1.3.1). There is one name source and
+    it is catalog.lua: all 9 240 equippable items the Era client holds, with the
+    client's own names and qualities, generated once by dev/gen-catalog.lua and
+    delivered with the addon. A brand-new account, first login, no wait: open a
+    slot and the whole list is there.
 
-    Icons and equip locations always come from GetItemInfoInstant (synchronous,
-    offline, never persisted so it cannot go stale). Shift-clicking an item link into
-    the search box picks that item directly, which covers anything all three miss.
+    WHAT THAT REPLACED. Three merged sources under a strict precedence order — a
+    per-account SavedVariables scan that each user had to run (a minute-long walk of
+    32 000 ids, auto-started by a login timer, repeatable through a "Rescan Items"
+    button), the bundled AtlasLoot snapshot as a stand-in until that scan finished,
+    and a runtime GetItemInfo pass for the PvP rank sets. Precedence, the `settled`
+    bookkeeping that enforced it, seed retirement, the scan-progress readout, the
+    "(unscanned)" warning on the count line and the scan -> re-filter push all
+    existed to manage sources that disagreed and a database that might not be built
+    yet. Neither problem exists when the database is shipped.
 
-    Rows are tinted by item RARITY (Borders.QualityTextRGB). Quality is not available
-    for an item the client has not loaded, so unresolved rows request a load and are
-    re-tinted when it arrives.
+    The PvP pass survives as a safety net (every one of its ids is already in the
+    catalog, so it adds nothing today) and shift-clicking an item link into the
+    search box still picks that item directly, which covers anything at all.
+
+    Icons and equip locations still come from GetItemInfoInstant — synchronous,
+    offline, never persisted, so they cannot go stale, and an id the catalog names
+    that this client does not have is dropped rather than offered.
+
+    Rows are tinted by item RARITY (Borders.QualityTextRGB), and the quality comes
+    from the catalog, so it is known for every row before the frame is drawn. Rows
+    still ask the client to load, but only so the item LEVEL can join the sort.
 
     CLASS AND FACTION LOCKS ARE NOT A SOURCE HERE ANY MORE (1.3.1). They come from
     restrictions.lua — shipped data, identical on every account — and the row
@@ -29,46 +42,33 @@
     turns the filter off for edge cases.
 
     Rows that are not ITEMS at all — Blizzard's placeholders, creature-equipment art,
-    designer test gear, retired duplicates, enchantment-effect names — never enter the
-    index (Scan.IsInternalName / the cached internal flag). Items that ARE real but
-    that no player can obtain on a live realm (Addon.StaticUnobtainable) are dropped
-    by the row predicate. "Show unusable" does NOT bring either kind back: they are
-    not unusable, they are unobtainable by everyone, and no character anywhere can
-    get one.
+    designer test gear, retired duplicates, enchantment-effect names — are NOT IN THE
+    CATALOG. The denylist (Scan.IsInternalName) is applied by dev/gen-catalog.lua at
+    generation time, so those 1 264 rows were never shipped and this index has
+    nothing to filter out. Items that ARE real but that no player can obtain on a
+    live realm (Addon.StaticUnobtainable — the Ashbringer, the Warglaives, the seven
+    GM stones) ARE shipped, and are dropped by the row predicate instead, because
+    that list is policy a person must be able to reverse in one line. "Show unusable"
+    does NOT bring either kind back: they are not unusable, they are unobtainable by
+    everyone, and no character anywhere can get one.
 
-    SOURCE PRECEDENCE IS ABSOLUTE (1.3.1). Any id the SCAN covered is settled by the
-    scan, whatever it decided — kept, dropped as internal, or rejected for its equip
-    location. The bundled seed is an AtlasLoot snapshot whose ids do not all agree
-    with this client, so it may only speak for ids the scan never saw.
+    THE SEED IS GONE, AND SO IS EVERYTHING THAT MANAGED IT. The AtlasLoot snapshot
+    (itemDB.lua) is no longer shipped at all; it survives as dev/itemDB-seed.lua,
+    a generator input for the Tier-3 class masks that no other source carries. The
+    census that justified retiring it stands as the reason the catalog is trusted
+    instead: against the owner's completed cache (10 504 ids, Era build 68940),
+    1 889 of the snapshot's 5 289 rows had no id in this client at all — Wrath and
+    Cataclysm gear, TBC city tabards, and 24 AtlasLoot SECTION HEADINGS ("Warrior",
+    "Rogue", "Mage") parked on 300000-325000 ids. Those were never "items the scan
+    missed"; they were ids that mean something else here. The catalog is the client's
+    own item table, so it cannot contain that class of error.
 
-    SEED RETIREMENT (1.3.1). Once a scan has COMPLETED, the seed is not consulted at
-    all. The id walk is GetItemInfoInstant over the client's own item space, so it is
-    ground truth for what this client knows: an id the completed scan never found is
-    an id the client does not have, and no character on this realm can obtain it. The
-    seed's leftovers are not "items the scan missed", they are ids that mean something
-    else (or nothing) here. Census against the owner's real completed cache (10 504 ids,
-    Era build 68940): 1 889 of the bundled 5 289 rows have no id in this client at all.
-    95 of those sit ABOVE the scanned range entirely — Wrath and Cataclysm gear
-    (Wrathful Gladiator's Tabard, Tabard of the Argent Crusade, Gilneas Tabard), the TBC
-    city tabards (Exodar, Silvermoon City), TBC holiday gear (Hallowed Helm, Swift
-    Brewfest Ram) and 24 AtlasLoot SECTION HEADINGS ("Warrior", "Rogue", "Mage") parked
-    on 300000-325000 ids. The seed therefore exists for exactly one purpose: naming rows
-    before the first scan finishes. Addon.GoalSeedAllowed(cache) is that rule, pure and
-    harness-gated.
-
-    NOTE what seed retirement does NOT do: ids 18582-18584 (The Twin Blades of
-    Azzinoth, both Warglaives), 22736 (Andonisus) and 23054 (Gressil) ARE in this
-    client's item space and the scan finds them. Those are unobtainable by HISTORY,
-    not by client data, so seed retirement cannot see them — they are removed by
-    Addon.StaticUnobtainable in restrictions.lua instead, which IS the hand-written
-    list of what Blizzard retired, kept as data a person can edit in one line.
-
-    SCROLL POSITION SURVIVES A REFRESH (1.3.1). A background refresh — item names
-    streaming in, a scan finishing — re-filters the list under the reader. It must
-    not throw them back to the top; Rows.NextOffset keeps the current offset,
-    clamped to the new list. A refresh the READER asked for (a new query, toggling
-    "Show unusable", opening the picker) does go back to the top, because row 400 of
-    the previous list means nothing in the new one.
+    SCROLL POSITION SURVIVES A REFRESH (1.3.1). A background refresh — item levels
+    streaming in — re-filters the list under the reader. It must not throw them back
+    to the top; Rows.NextOffset keeps the current offset, clamped to the new list. A
+    refresh the READER asked for (a new query, toggling "Show unusable", opening the
+    picker) does go back to the top, because row 400 of the previous list means
+    nothing in the new one.
 
     An EMPTY search box lists the whole slot (browse mode), exactly as it has since
     1.0.0. There is no minimum query length and no row is ever the current goal echoed
@@ -242,108 +242,78 @@ function Addon:ItemUsableByClass(e, ctx)
     return Scan.Usable(e, ctx or Addon:ScanContext(false))
 end
 
--- ── SEED RETIREMENT ───────────────────────────────────────────────────────────
--- May the bundled AtlasLoot table speak at all? Only before a scan has completed.
---
--- The scan is a GetItemInfoInstant walk of ids 1..32000 — a purely local lookup
--- against the client's own item database — so a completed scan is an exhaustive
--- census of what this client knows. An id it never found is an id this client
--- does not have; a name the seed offers for such an id is a name from a different
--- game (the bundled table is an AtlasLoot snapshot that reaches into TBC and
--- beyond) or, more often, not an item name at all. Either way nothing a player
--- can obtain here is behind it, so it must not be offered as a goal.
---
--- Pure on purpose: this is the whole rule, and the harness drives it directly.
-function Addon.GoalSeedAllowed(cache)
-    return not Scan.IsComplete(cache)
-end
-
--- ── The merged item index ─────────────────────────────────────────────────────
+-- ── The item index ────────────────────────────────────────────────────────────
 -- Entry: { id, name(lower), display, icon, equipLoc, classID, subclassID,
 --          quality, internal, scanned }
 --
--- NO CLASS MASK AND NO FACTION LIVE ON AN ENTRY (1.3.1). They are shipped facts
--- keyed by item id, and the row predicate looks them up. An index that copied them
--- would be a second place for a lock to live, which is a second place for it to be
--- wrong — the exact failure mode the repair pass existed to paper over.
+-- ONE SOURCE NOW (1.3.1). This used to merge three, in a strict precedence order,
+-- because none of them was trustworthy on its own: a per-account scan cache that
+-- might be empty or half-built, a bundled AtlasLoot snapshot whose ids did not all
+-- mean the same thing on this client, and a runtime GetItemInfo pass for the PvP
+-- rank sets. The precedence rule, the `settled` bookkeeping that enforced it, and
+-- the seed-retirement predicate that decided when the snapshot was allowed to
+-- speak at all — every bit of that existed to manage disagreement between sources.
 --
--- Rebuilt whenever the scan cache changes (stamp = completion time + item count).
+-- catalog.lua removed the disagreement by removing the sources. It is the client's
+-- own item table, captured once, filtered once, shipped — so it is complete on
+-- first login and identical on every account, and there is nothing for a second
+-- source to fill in. `settled` survives only as a duplicate guard.
+--
+-- NO CLASS MASK AND NO FACTION LIVE ON AN ENTRY. They are shipped facts keyed by
+-- item id, and the row predicate looks them up. An index that copied them would be
+-- a second place for a lock to live, which is a second place for it to be wrong.
+--
+-- NEITHER DOES equipLoc, icon, classID OR subclassID LIVE IN THE CATALOG.
+-- GetItemInfoInstant answers all four offline and synchronously for any id the
+-- client holds, so they are re-derived here. That is not a compromise, it is the
+-- safety net: an id the catalog names but THIS client does not have answers nil
+-- and the row is dropped, so a catalog built against a different build quietly
+-- offers less rather than offering phantoms.
+--
+-- NO STAMP, BECAUSE NOTHING CAN INVALIDATE IT. The catalog is shipped data and
+-- cannot change while the client is running; the restriction table likewise. The
+-- one thing that can still arrive late is a PvP name (see below), and that is what
+-- _goalPvPMissing tracks.
 function Addon:BuildGoalItemDB()
-    local cache = Addon:ItemScanCache()
-    -- the denylist stamp is part of the key: growing INTERNAL_PATTERNS must rebuild
-    -- the index, not wait for the next scan. The restriction table needs no stamp:
-    -- it is shipped with the addon and cannot change while the client is running.
-    local stamp = tostring(cache.scannedAt or 0) .. "/" .. tostring(cache.count or 0)
-                  .. "/" .. tostring(cache.internalStamp or 0)
-    if Addon.GoalItemDB and Addon._goalDBStamp == stamp then return Addon.GoalItemDB end
+    if Addon.GoalItemDB then return Addon.GoalItemDB end
 
     local list, settled = {}, {}
-    -- `settled` is every id a HIGHER-confidence source has already spoken for,
-    -- whatever it decided — kept, dropped as internal, or rejected for its equip
-    -- location. A lower source may never speak for a settled id again.
-    --
-    -- That is stricter than the "already in the list" test it replaces, and the
-    -- difference is a real defect (owner screenshot, 1.3.1): the internal drop
-    -- returns BEFORE the id is recorded, so dropping the client's placeholder at
-    -- id 13794 handed that id straight back to the bundled seed — which names
-    -- 13794 "Enchant Cloak - Resistance", an enchantment EFFECT, while the client
-    -- calls it "[PH] Shining Dawn Coif". The picker then showed the seed's wrong
-    -- name for a row the denylist had just removed. 37 ids in the owner's cache
-    -- were resurrecting like that, 7 of them as "Enchant …" rows.
-    --
-    -- itemDB.lua is an AtlasLoot-derived SNAPSHOT; where it and the client
-    -- disagree about what an id is, the client wins, always.
-    local function add(id, name, quality, scanned, internal)
+
+    local function add(id, name, quality)
         if not id or settled[id] then return end
         settled[id] = true
         if type(name) ~= "string" or name == "" then return end
-        if internal == nil then internal = Scan.IsInternalName(name) end
-        if internal then return end
         local _, _, _, equipLoc, icon, classID, subclassID = GetItemInfoInstant(id)
         if not (icon and equipLoc and equipLoc ~= "" and equipLoc ~= "INVTYPE_NON_EQUIP") then return end
         list[#list + 1] = {
             id = id, name = name:lower(), display = name, icon = icon,
             equipLoc = equipLoc, classID = classID, subclassID = subclassID,
-            quality = quality, internal = false, scanned = scanned or false,
+            quality = quality, internal = false, scanned = true,
         }
     end
 
-    -- 1 — the scan (authoritative)
-    for id in pairs(cache.names) do
-        local nm, q, internal = Scan.Get(cache, id)
-        add(id, nm, q, true, internal)
-    end
+    -- 1 — THE SHIPPED CATALOG. Blizzard's scaffolding is already absent (the
+    -- denylist was applied when the file was generated), so there is no internal
+    -- check to run here and no placeholder for a lower source to inherit.
+    Scan.CatalogEach(add)
 
-    -- 2 — the bundled seed, ONLY while the scan has not yet spoken for this client.
-    -- Once it has, the cache is the whole index: see SEED RETIREMENT at the top.
-    -- It supplies NAMES only; its ItemClassMask has been folded into the shipped
-    -- restrictions.lua by dev/gen-restrictions.lua, so it is not consulted for a
-    -- lock at runtime any more.
-    local seedAllowed = Addon.GoalSeedAllowed(cache)
-    if seedAllowed and Addon.ItemNameDB then
-        for id, nm in pairs(Addon.ItemNameDB) do
-            add(id, nm, nil, false)
-        end
-    end
-
-    -- 3 — PvP rank pieces: no bundled name, so ask the CLIENT for one. This pass
-    -- survives seed retirement because its evidence is GetItemInfo, not the seed —
-    -- a name only comes back for an id this client actually has. After a completed
-    -- scan every one of these ids is already settled, so it is a no-op anyway.
+    -- 2 — PvP rank pieces, kept as a SAFETY NET rather than as a source. Every one
+    -- of the 186 ids is in the catalog today, so this loop adds nothing; it stays
+    -- because its evidence is the client itself, which means a future catalog that
+    -- somehow missed a rank piece still names it. A name that has not arrived yet
+    -- is counted, not guessed at.
     local missing = 0
     for _, id in ipairs(Addon.PvPItemIDs or {}) do
         if not settled[id] then
             local nm, _, q = GetItemInfo(id)
-            if nm then add(id, nm, q, false)
+            if nm then add(id, nm, q)
             else missing = missing + 1 end
         end
     end
 
-    Addon.GoalItemDB      = list
-    Addon._goalDBStamp    = stamp
-    -- How many PvP ids still have no name. While this is > 0 an incoming
-    -- GET_ITEM_INFO_RECEIVED is worth a full rebuild; once it hits 0 (always, after a
-    -- completed scan) the streaming refresh is a re-filter only, never a rebuild.
+    Addon.GoalItemDB = list
+    -- While this is > 0 an incoming GET_ITEM_INFO_RECEIVED is worth a full rebuild;
+    -- at 0 (which is the shipped state) the streaming refresh is a re-filter only.
     Addon._goalPvPMissing = missing
     return list
 end
@@ -351,7 +321,7 @@ end
 -- Back-compat shim: the old two-table model exposed this and the OnEvent refresh
 -- called it. Unresolved PvP names now stream in through the same rebuild path.
 function Addon:BuildGoalPvP()
-    Addon.GoalItemDB, Addon._goalDBStamp = nil, nil
+    Addon.GoalItemDB = nil
     return Addon:BuildGoalItemDB()
 end
 
@@ -513,22 +483,16 @@ local function ensure()
         f.rows[i] = r
     end
 
-    -- ── footer: rescan + the usability toggle ────────────────────────────────
-    f.rescan = makeButton(f, "Rescan Items", 14, FOOTER_Y, 118, 22, function()
-        if Addon:IsScanning() then return end
-        Addon:StartItemScan({ force = true })
-        f:SyncScanUI()
-    end)
-    f.rescan:SetScript("OnEnter", function(self)
-        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-        GameTooltip:AddLine("Rescan Items")
-        GameTooltip:AddLine("Re-reads every equippable item from the client and caches its name,"
-            .. " rarity and class/faction locks.", 0.7, 0.7, 0.7, true)
-        GameTooltip:AddLine("Account-wide; takes about a minute. Safe to keep playing.", 0.7, 0.7, 0.7, true)
-        GameTooltip:Show()
-    end)
-    f.rescan:SetScript("OnLeave", function() GameTooltip:Hide() end)
-
+    -- ── footer: the usability toggle, and nothing else ───────────────────────
+    -- "RESCAN ITEMS" USED TO SIT HERE, at x=14, with a tooltip promising "about a
+    -- minute" and "safe to keep playing". It is gone, along with the "Scanning…"
+    -- label it swapped to, the 0.25s progress poll behind it, and the
+    -- "(unscanned — press Rescan Items)" suffix on the count line. There is
+    -- nothing left for it to rebuild: the item database ships with the addon.
+    --
+    -- Removing a button is a user-visible change and this is the whole point of
+    -- it — the picker no longer has a maintenance control, because the picker no
+    -- longer has state that a user could be responsible for maintaining.
     f.showUnusable = makeCheckbox(f, "Show unusable", W - 148, FOOTER_Y + 1,
         function() return pickerSettings().showUnusable end,
         function(v)
@@ -550,9 +514,9 @@ local function ensure()
         self._refreshPending = true
         C_Timer.After(0.3, function()
             self._refreshPending = nil
-            if self:IsShown() and not Addon:IsScanning() then
+            if self:IsShown() then
                 if (Addon._goalPvPMissing or 0) > 0 then
-                    Addon.GoalItemDB, Addon._goalDBStamp = nil, nil
+                    Addon.GoalItemDB = nil
                 end
                 -- NOBODY ASKED FOR THIS ONE. It is the item-info stream catching up,
                 -- and it arrives in bursts — so it keeps the reader's scroll position.
@@ -571,47 +535,15 @@ local function ensure()
         self:RefreshList()
     end
 
-    -- The picker POLLS the scan rather than being called back by it, so a scan the
-    -- picker did not start (the once-per-account auto scan at login) still shows its
-    -- progress if the owner opens the picker while it is running.
-    function f:SyncScanUI()
-        local scanning = Addon:IsScanning()
-        local label = scanning and "Scanning…" or "Rescan Items"
-        if self.rescan.SetText then self.rescan:SetText(label) end
-        if self.rescan._label then self.rescan._label:SetText(label) end
-        if scanning then self.rescan:Disable() else self.rescan:Enable() end
-        if scanning and not self._scanPoll then
-            self._scanPoll = true
-            local function poll()
-                if not picker or not picker._scanPoll then return end
-                if Addon:IsScanning() then
-                    picker:ShowScanProgress(Addon:ItemScanStatus())
-                    C_Timer.After(0.25, poll)
-                else
-                    picker._scanPoll = nil
-                    picker:ScanFinished()
-                end
-            end
-            poll()
-        end
-    end
-
-    function f:ShowScanProgress(st)
-        if not st then return end
-        self:SyncScanUI()
-        if st.phase == "instant" then
-            self.countText:SetText(string.format("Scanning item ids… %d%%  (%d equippable found)",
-                st.percent or 0, st.found or 0))
-        else
-            self.countText:SetText(string.format("Loading items… %d / %d  (%d%%)",
-                st.cursor or 0, st.total or 0, st.percent or 0))
-        end
-    end
-
-    function f:ScanFinished()
-        self:SyncScanUI()
-        if self:IsShown() then self:Requery(true) end
-    end
+    -- SyncScanUI / ShowScanProgress / ScanFinished USED TO LIVE HERE — the button
+    -- label swap, the 0.25s progress poll, and the "Scanning item ids… 43%" and
+    -- "Loading items… 2140 / 9240" lines it wrote over the count text. The picker
+    -- polled rather than being called back, so that a scan it did not start (the
+    -- login auto-scan) would still show progress if the owner opened the picker
+    -- while it was running.
+    --
+    -- None of it has anything to describe now. There is no scan on any path a
+    -- player can reach, so the picker has no process to report on — only a list.
 
     function f:RefreshList()
         local list  = self._list or {}
@@ -643,27 +575,28 @@ local function ensure()
                 r._id = nil; r:Hide()
             end
         end
-        if not Addon:IsScanning() then
-            local n = #list
-            local cache = Addon:ItemScanCache()
-            local suffix = Scan.IsComplete(cache) and "" or "  (unscanned — press Rescan Items)"
-            self.countText:SetText((n >= MAX_RESULTS and (MAX_RESULTS .. "+ items") or (n .. " items")) .. suffix)
-        end
+        -- The count line is a count, full stop. It used to carry
+        -- "(unscanned — press Rescan Items)" whenever this account had never
+        -- completed a scan, which was the picker admitting the list in front of
+        -- you might be missing most of the game. There is no such state to warn
+        -- about: the list is complete the first time it is ever drawn.
+        local n = #list
+        self.countText:SetText(n >= MAX_RESULTS and (MAX_RESULTS .. "+ items") or (n .. " items"))
     end
 
     picker = f
     return f
 end
 
--- ── THE SCAN → RE-FILTER SEAM ────────────────────────────────────────────────
--- Called by itemScan.lua the moment a scan finishes.
+-- ── An external re-filter ────────────────────────────────────────────────────
+-- This existed as THE SCAN -> RE-FILTER SEAM: itemScan.lua called it the moment a
+-- scan finished, because otherwise an open picker would keep showing the rows it
+-- had at open time until it was closed and reopened. No scan reaches a player any
+-- more, and the developer scan deliberately does NOT call it (a capture made for
+-- the next release must not rewrite the list under the person looking at it).
 --
--- Without it the ONLY thing that re-filters an open picker is the picker's own
--- 0.25s poll (f:SyncScanUI -> f:ScanFinished), and that poll is armed only when
--- SyncScanUI happens to be called while a scan is already running. So a scan could
--- finish and the open list would keep showing the rows it had at open time until
--- the picker was closed and reopened. The fix is a push, not a poll:
--- FinishItemScan invalidates the index and then calls this.
+-- The entry point stays because it is the general "something changed, re-filter
+-- what is on screen" door, and it is what the harness drives.
 --
 -- Scroll position is preserved: this refresh is not one the reader asked for.
 function Addon:RefreshGoalPicker(preserveScroll)
@@ -673,12 +606,15 @@ function Addon:RefreshGoalPicker(preserveScroll)
     return true
 end
 
--- Warm the client cache for set-piece ids so their names resolve (called once,
--- a few seconds after login and again when the picker opens). Redundant once a
--- scan has completed — those ids are then already in the cache — so it is skipped.
+-- Warm the client cache for the PvP rank-set ids so their names resolve.
+--
+-- REDUNDANT AND KEPT DELIBERATELY SMALL. All 186 ids are in the shipped catalog,
+-- so the index never needs these names; what warming still buys is the item LEVEL
+-- for the sort, which only GetItemInfo can answer and only for a loaded item. It
+-- runs once, costs nothing on a warm client, and is the sole remaining reason the
+-- picker asks the client for anything ahead of time.
 function Addon:WarmGoalItems()
     if Addon._pvpWarmed then return end
-    if Scan.IsComplete(Addon:ItemScanCache()) then Addon._pvpWarmed = true; return end
     Addon._pvpWarmed = true
     for _, id in ipairs(Addon.PvPItemIDs or {}) do GetItemInfo(id) end
 end
@@ -686,16 +622,16 @@ end
 function Addon:ShowGoalPicker(slotId, onPick)
     local f = ensure()
     Addon:WarmGoalItems()
-    -- NOTHING HAPPENS HERE ANY MORE, and that is the release (1.3.1). Opening the
-    -- picker used to kick off a lazy restriction-repair pass — throttled server
+    -- NOTHING HAPPENS HERE ANY MORE, and that is the release. Opening the picker
+    -- used to kick off a lazy restriction-repair pass (1.3.0: throttled server
     -- traffic, a chat line, a session latch, a refusal reason to explain when the
-    -- latch said no. The locks are shipped data now, so opening the picker opens
+    -- latch said no), and then to sync a rescan button against a running scan.
+    -- Both the locks and the items are shipped data, so opening the picker opens
     -- the picker.
     f._onPick   = onPick
     f._slotId   = slotId
     f._validLoc = Addon.SLOT_INVTYPES[slotId] or {}
     f.search:SetText("")
-    f:SyncScanUI()
     f:Requery()
     f:Show(); f:Raise()
     f.search:SetFocus()

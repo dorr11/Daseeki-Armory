@@ -1,18 +1,36 @@
 --[[
-    Daseeki Armory — item-database scan + usability model.
+    Daseeki Armory — the item database, the usability model, and the developer
+    tool that captures the first of those two.
 
-    WHY THIS FILE EXISTS
-    --------------------
-    The goal picker used to search one bundled, AtlasLoot-derived name table
-    (itemDB.lua, Addon.ItemNameDB). That table is a snapshot: it misses items
-    outright and its names can be stale. The consequence the owner reported was
-    items simply absent from the picker.
+    WHY THIS FILE EXISTS, AND WHAT CHANGED UNDER IT (1.3.1)
+    ------------------------------------------------------
+    THE ITEM DATABASE IS SHIPPED. catalog.lua carries all 9 240 equippable items
+    the Era client holds, by id, with the client's own name and quality, and the
+    goal picker builds its index straight from it. A player who has never scanned
+    anything — a brand-new account, five seconds after first login — opens a slot
+    and sees the complete list. Scan.CatalogEach is the reader; see the section on
+    it below.
 
-    The fix is an in-game SCAN of the client's own item space, cached to
-    SavedVariables. The client ships the item *record* locally, so
-    GetItemInfoInstant(id) answers equip location / icon / class / subclass for
-    ANY id with no server round-trip; only the NAME and the QUALITY need the item
-    loaded from the server. So the scan is two phases:
+    THAT REPLACED A SCAN, AND THE REASONING IS THE SAME ONE THAT REPLACED THE
+    RUNTIME RESTRICTION CAPTURE ONE RELEASE EARLIER. Classic Era is a frozen
+    client: the set of equippable items in it is a constant, identical on every
+    account, every realm and every login. Until now each user measured that
+    constant for themselves — a minute-long walk of 32 000 ids, announced in chat,
+    armed by a first-login timer, repeatable through a "Rescan Items" button, and
+    persisted to a per-account SavedVariable. The owner's objection was exactly
+    right: "I thought we decided to move toward a static list." A constant does not
+    need measuring by the person reading it. It needs shipping.
+
+    So the user-facing scan is gone — no auto-run, no button, no progress text, no
+    "unscanned" suffix on the picker's count, and nothing writes
+    DaseekiArmoryScanDB on any path a player can reach.
+
+    THE SCAN ITSELF SURVIVES AS A DEVELOPER TOOL, because it is how the shipped
+    files get REGENERATED for a new client build: a developer arms a flag, runs it
+    against a live client, logs out, and points dev/gen-catalog.lua and
+    dev/gen-restrictions.lua at the resulting SavedVariables. It is gated behind an
+    undocumented command and a global flag; see THE SCAN SURVIVES AS A DEVELOPER
+    TOOL near the bottom of this file. Its two phases are unchanged:
 
         phase 1  "instant"  — walk the id space with GetItemInfoInstant and keep
                               the ids whose equip location is one Armory manages.
@@ -22,8 +40,8 @@
                               credit-limited window and record name + quality.
 
     Only name / quality / the internal flag are persisted; everything else is
-    re-derived instantly from GetItemInfoInstant at load, which keeps the cache
-    small and immune to client data changes.
+    re-derived instantly from GetItemInfoInstant, which keeps the capture small
+    and immune to client data changes.
 
     THE SCAN NO LONGER READS RESTRICTIONS AT ALL  (1.3.1, and this is the whole
     point of the release). Class and faction locks are STATIC FACTS of a frozen
@@ -56,27 +74,44 @@
     the game's item list: it also holds placeholders ("[PH] …"), creature-equipment
     art ("Monster - Sword, Katana"), designer test gear and retired duplicates.
     Roughly 12% of everything the walk finds is of that kind and none of it can be
-    obtained by any player, so each record carries an `internal` flag
-    (INTERNAL_PATTERNS, derived from a real 10 504-item cache) and the goal picker's
-    index drops those rows outright. They stay IN the cache so a rescan does not
-    have to re-fight them, and "Show unusable" does not reveal them — see the
-    INTERNAL / UNOBTAINABLE section below.
+    obtained by any player, so INTERNAL_PATTERNS below condemns it.
+
+    THAT DENYLIST IS NOW APPLIED AT GENERATION TIME, NOT AT RUNTIME. dev/gen-
+    catalog.lua loads this very file, asks this very function, and simply does not
+    write the 1 264 condemned rows into catalog.lua. They are not facts a user
+    needs, so they are not shipped, and no client re-decides every login that
+    "Monster - Sword, Katana" is not a goal. The patterns stay here because they
+    are the definition — and because the generator reads them from here, the
+    shipped catalog and the shipped denylist cannot drift apart.
+
+    The trade that comes with baking it in: a new pattern used to reach an existing
+    cache on the next login (Normalize re-derived the flag on a stamp bump). It now
+    reaches users on the next RELEASE, with the regenerated catalog. For a frozen
+    client that is the right trade — the junk is not moving.
 
     Published surface:
         Addon.ItemScan            -- the PURE layer (no WoW API at load; harness-gated)
-        Addon:ItemScanCache()     -- the SavedVariables cache, normalised
+        Scan.CatalogEach(fn)      -- stream the shipped item catalog
+        Scan.CatalogCount()       -- how many items this build ships
+        Scan.StatusReport()       -- the /darmory data lines (shipped data only)
+        Addon:ScanContext(showUnusable)  -- the viewing character's filter context
+
+    …and the DEVELOPER surface, which no player path reaches:
+        Addon:IsDevScanEnabled()  -- is the dev flag armed?
+        Addon:StartDevScan()      -- the gated entry point (/darmory devscan)
+        Addon:ItemScanCache()     -- the SavedVariables capture, normalised
         Addon:StartItemScan(opts) -- opts = { force=, onProgress=, onDone= }
         Addon:StopItemScan()
         Addon:IsScanning()
         Addon:ItemScanStatus()    -- progress record, or nil when idle
-        Addon:ScanContext(showUnusable)  -- the viewing character's filter context
-        Addon:InitItemScan()      -- login hook (binds the SV, auto-runs once)
 
-    SavedVariables: DaseekiArmoryScanDB (## SavedVariables — ACCOUNT-wide, not
-    per-character). The scan result is a property of the CLIENT, not of a
-    character, so scanning once per account rather than once per alt is the
-    correct scope. This is a NEW global; the per-character DaseekiArmoryDB is
-    untouched (additive only).
+    SavedVariables: DaseekiArmoryScanDB is RETIRED (1.3.1). It is still declared in
+    the TOC — a declaration is removed a couple of releases after its last writer,
+    not in the same build, so a downgrade cannot meet an undeclared global — but
+    nothing in normal play reads it, writes it or even creates it. Whatever an
+    older build left on disk stays there, inert, until the declaration goes. The
+    only writer left is the developer scan above. The per-character DaseekiArmoryDB
+    is untouched.
 --]]
 
 local ADDON, Addon = ...
@@ -101,8 +136,9 @@ end
 Scan.HasBit = hasBit
 
 ----------------------------------------------------------------------
--- Class model. CLASS_BIT matches Addon.ItemClassMask in itemDB.lua verbatim
--- (that bundled table is a valid seed source for the same field).
+-- Class model. CLASS_BIT matches Addon.ItemClassMask in dev/itemDB-seed.lua
+-- verbatim — that AtlasLoot-derived table is a generator input for the same
+-- field, and dev/gen-restrictions.lua keeps its own copy of this model in step.
 ----------------------------------------------------------------------
 Scan.CLASS_BIT = {
     WARRIOR = 1, PALADIN = 2, HUNTER = 4, ROGUE = 8, PRIEST = 16,
@@ -177,6 +213,64 @@ function Scan.UnobtainableCount()
     local n = 0
     for _ in pairs(Addon.StaticUnobtainable or {}) do n = n + 1 end
     return n
+end
+
+----------------------------------------------------------------------
+-- THE SHIPPED ITEM CATALOG
+--
+-- catalog.lua (generated by dev/gen-catalog.lua, loaded BEFORE this file)
+-- publishes:
+--
+--     Addon.StaticCatalogRaw    one long string, one line per item:
+--                                   <itemID> <quality> <name>
+--     Addon.StaticCatalogCount  the number of lines, as a literal
+--
+-- THIS IS THE ITEM DATABASE. Not a seed for one, not a fallback while something
+-- else warms up — the whole thing, 9 240 equippable items, shipped. Nobody scans
+-- anything to get it.
+--
+-- WHY IT IS A STRING. Both consumers (the picker's index build, the icon search
+-- index) walk it once and never look again, so the only thing a hash table would
+-- add is 1.1 MB of permanent residency in every client to serve two linear
+-- passes. As a string it is 240 KB. The measurements behind that choice — five
+-- formats, on this exact payload, under the vendored Lua 5.1 — are recorded in
+-- dev/gen-catalog.lua.
+--
+-- THE PARSER LIVES HERE, not in the generated file, because generated files
+-- should be data and nothing else. It is pure, so the harness drives it directly.
+--
+-- [^\r\n]+ IS NOT PARANOIA. catalog.lua is written into a CRLF working tree, so
+-- the separator between two records on disk is "\r\n". A name captured with
+-- [^\n]+ would arrive carrying a trailing carriage return, which would corrupt
+-- every display name and every search key in the picker, subtly, on Windows only.
+----------------------------------------------------------------------
+
+-- A hard ceiling on the walk. The shipped payload is ~9 240 rows; 60 000 is far
+-- past any plausible growth and still finite, so a corrupted string cannot spin
+-- the login frame. (Headless discipline, same rule the generators run under.)
+Scan.CATALOG_CEILING = 60000
+
+-- fn(id, name, quality) for every catalog row, in the file's order (ids ascending).
+-- `raw` overrides the shipped string, which is how the harness feeds fixtures.
+-- -> the number of rows visited
+function Scan.CatalogEach(fn, raw)
+    local s = raw or Addon.StaticCatalogRaw
+    if type(s) ~= "string" or s == "" or type(fn) ~= "function" then return 0 end
+    local n = 0
+    for sid, sq, name in s:gmatch("(%d+) (%d+) ([^\r\n]+)") do
+        n = n + 1
+        if n > Scan.CATALOG_CEILING then return n - 1 end
+        fn(tonumber(sid), name, tonumber(sq))
+    end
+    return n
+end
+
+-- How many items the addon ships. Reads the LITERAL the generator wrote rather
+-- than parsing 240 KB to count newlines — which is the whole reason that literal
+-- is in the file. Zero means catalog.lua did not load, and that is the one item-
+-- database fault that can still exist; /darmory data shows it at a glance.
+function Scan.CatalogCount()
+    return tonumber(Addon.StaticCatalogCount) or 0
 end
 
 -- Per-class weapon/armor proficiency by numeric subclass id (locale-safe).
@@ -554,82 +648,45 @@ function Scan.IsComplete(cache)
 end
 
 ----------------------------------------------------------------------
--- THE QUERYABLE STATE  (/darmory scanstatus)
+-- THE QUERYABLE STATE  (/darmory data)
 --
--- The scan announces itself in chat once and then scrolls away, which is no use
--- to anyone trying to answer "is it still running?" three minutes later.
--- StatusReport turns the cache (plus the live scan status, when there is one)
--- into the lines the slash command prints.
+-- IT IS A REPORT ON SHIPPED DATA NOW, AND THAT IS THE WHOLE RELEASE (1.3.1).
 --
--- IT GOT SHORTER, and that is the report (1.3.1). It used to carry a line for
--- rows still unread, a line for the last repair pass, a line for why a repair had
--- been refused, and a capture stamp — four surfaces that existed only to explain
--- a restriction capture that could fail. The capture is gone, so the questions are
--- gone; what replaces all of it is one line saying how many locks the addon ships.
--- If that number is 0 the shipped table did not load, which is the only
--- restriction fault that can still exist and is now visible at a glance.
+-- Every previous version of this report answered questions about a PROCESS: is
+-- the scan still running, how far has it got, when did it last finish, how many
+-- rows are still unread, why did the last repair pass refuse, which capture stamp
+-- is current. Those were real questions, because the item database was something
+-- each user had to produce for themselves and the production could fail.
 --
--- PURE. It walks the cache it is handed and touches no WoW API, so the harness
--- pins the shape of the report rather than the fact that a print happened.
+-- The database is shipped. So the questions are gone — all of them — and what is
+-- left is a three-line inventory of what this build contains:
 --
---   cache : the SavedVariables scan cache (Addon:ItemScanCache())
---   live  : Addon:ItemScanStatus() when a scan is running, else nil
+--     catalog:      9240 items
+--     restrictions: 910 class/faction locks
+--     hidden:       12 unobtainable-by-history
+--
+-- A zero on any line means that shipped file did not load, which is the only
+-- item-database fault that can still exist in this design and is now visible at a
+-- glance instead of being inferred from an empty picker.
+--
+-- PURE, and it no longer takes any arguments. There is no cache to walk and no
+-- live status to interrogate; it reads the three shipped tables and returns text.
 --   -> array of plain strings, one per line, no colour codes
 ----------------------------------------------------------------------
-local function stampText(t)
-    t = tonumber(t)
-    if not t or t <= 0 then return "never" end
-    if type(date) == "function" then
-        local ok, s = pcall(date, "%Y-%m-%d %H:%M", t)
-        if ok and s then return s end
-    end
-    return tostring(t)
-end
-
-function Scan.StatusReport(cache, live)
+function Scan.StatusReport()
     local out = {}
     local function line(s) out[#out + 1] = s end
 
-    local locks = Scan.StaticCount()
+    local items  = Scan.CatalogCount()
+    local locks  = Scan.StaticCount()
     local hidden = Scan.UnobtainableCount()
 
-    if type(cache) ~= "table" or type(cache.names) ~= "table" then
-        line("no item cache yet — the scan has never run.")
-        line(("restrictions: static table, %d entries (%d unobtainable-by-history)")
-             :format(locks, hidden))
-        return out
-    end
-
-    -- one walk answers every count, so the report can never disagree with itself
-    local total, internal = 0, 0
-    for id in pairs(cache.names) do
-        total = total + 1
-        local _, isInternal = Scan.UnpackMeta(cache.meta and cache.meta[id])
-        if isInternal then internal = internal + 1 end
-    end
-
-    line(("cache: %d ids — %d offerable, %d internal/unobtainable hidden")
-         :format(total, total - internal, internal))
-    line(("restrictions: static table, %d entries (%d unobtainable-by-history)")
-         :format(locks, hidden))
-
-    if live then
-        if live.phase == "instant" then
-            line(("scan: RUNNING — walking item ids %d / %d (%d%%), %d equippable found")
-                 :format(live.cursor or 0, live.total or 0, live.percent or 0, live.found or 0))
-        else
-            line(("scan: RUNNING — loading items %d / %d (%d%%)")
-                 :format(live.cursor or 0, live.total or 0, live.percent or 0))
-        end
-    else
-        line("scan: idle")
-    end
-
-    line(("last full scan: %s%s"):format(stampText(cache.scannedAt),
-         cache.build and (" (build " .. tostring(cache.build)
-                          .. ", ids " .. tostring(cache.ranges or "?") .. ")") or ""))
-    line(("stamps: cache v%s, denylist %s")
-         :format(tostring(cache.version), tostring(cache.internalStamp)))
+    line(("catalog:      %d items%s"):format(items,
+        items == 0 and "   <- catalog.lua did not load" or ""))
+    line(("restrictions: %d class/faction locks%s"):format(locks,
+        locks == 0 and "   <- restrictions.lua did not load" or ""))
+    line(("hidden:       %d unobtainable-by-history"):format(hidden))
+    line("shipped with the addon — identical on every account. Nothing to scan.")
     return out
 end
 
@@ -1052,7 +1109,9 @@ function Addon:FinishItemScan()
     cache.scannedAt = (type(time) == "function" and time()) or 0
     cache.ranges    = Scan.RangesLabel(st.ranges)
     cache.build     = select(2, GetBuildInfo())
-    cache.autoScanTried = nil    -- a completed scan re-arms the auto path for a future reset
+    -- The auto-scan one-shot marker was CLEARED here, so that wiping the cache
+    -- would re-arm the login scan. There is no auto path left to re-arm, and a
+    -- stale marker left on disk by an older build is simply never read again.
 
     local n, internal = 0, 0
     for id in pairs(cache.names) do
@@ -1064,72 +1123,85 @@ function Addon:FinishItemScan()
     cache.internalCount = internal
     cache.internalStamp = Scan.INTERNAL_STAMP
 
-    -- the picker's index is derived from the cache; force a rebuild
-    Addon.GoalItemDB, Addon._goalDBStamp = nil, nil
-    -- …and PUSH that rebuild into an open picker rather than waiting for its own
-    -- poll to notice, so a scan that finishes while the picker is open fills the
-    -- list the owner is looking at instead of the next one he opens.
-    if Addon.RefreshGoalPicker then pcall(Addon.RefreshGoalPicker, Addon, true) end
+    -- THE PICKER IS NOT TOLD, because it is not listening. Its index is built from
+    -- catalog.lua and owes nothing to this cache, so a finished scan changes
+    -- nothing a player can see — which is exactly right: this scan ran to produce
+    -- a file for a DEVELOPER to feed to dev/gen-catalog.lua, and its output reaches
+    -- users in the next release, not in the next frame. (This is where the old
+    -- build invalidated Addon.GoalItemDB and pushed a refresh into an open picker.)
 
     local secs = Scan.FormatDuration(GetTime() - st.started) or "?"
-    -- The internal count is reported, not hidden: the owner should be able to see
-    -- that ~12% of what the client holds is Blizzard's own scaffolding, and that
-    -- Armory kept it out of the picker on purpose. There is no "restricted" tally
-    -- any more — the locks are shipped data, the same on every account, and
-    -- /darmory scanstatus reports how many of them there are.
-    print(string.format("%s item scan complete — %d equippable items cached "
-        .. "(%d internal/unobtainable hidden) in %s.%s",
+    print(string.format("%s DEV scan complete — %d equippable items cached "
+        .. "(%d internal/unobtainable) in %s.%s",
         Addon:Tag(), n - internal, internal, secs,
         st.failed > 0 and (" " .. st.failed .. " could not be loaded.") or ""))
+    print(Addon:Wrap("muted", "  Log out to flush SavedVariables, then run "
+        .. "dev/gen-catalog.lua and dev/gen-restrictions.lua against it."))
 
     if st.onDone then st.onDone(cache, st, false) end
 end
 
 ----------------------------------------------------------------------
--- Login hook. Auto-runs ONCE on an empty cache (the owner directive's "auto-run
--- if the cache is empty" marker), delayed so it never competes with the login
--- burst.
+-- THERE IS NO LOGIN HOOK ANY MORE, AND THAT IS THE POINT OF THE RELEASE.
 --
--- WHERE THE MARKER IS SET IS THE WHOLE POINT (release verification N5).
--- It used to be stamped HERE, at login, before the 15s timer was even armed.
--- cache is DaseekiArmoryScanDB — SavedVariables — so any logout, /reload or
--- disconnect inside that 15s window wrote autoScanTried = true to disk for a scan
--- that never ran. The auto path was then permanently disarmed on that account:
--- IsComplete() is false (no scan ever finished) and the marker is true, so this
--- function returns early on every login for ever after, in silence. The owner's
--- only way out was to find "Rescan Items" in the goal picker by themselves.
+-- What used to be here: Addon:InitItemScan(), called from core.lua's login path.
+-- It bound the SavedVariables cache, checked whether this account had ever
+-- completed a scan, and if not armed a 15-second timer that announced "building
+-- the item database for the first time — this runs once per account and takes
+-- about a minute" and then walked 32 000 item ids. It carried a one-shot latch
+-- (autoScanTried) whose placement had already been a release-verification defect
+-- once, because a logout inside the 15-second window disarmed the auto path for
+-- that account permanently and silently.
 --
--- The marker is therefore set inside the callback, immediately before the scan
--- actually starts, and AFTER the callback's own guards — so a 15s window that is
--- cut short by a logout costs nothing, and a timer that fires into an already
--- running scan does not burn the one-shot either.
+-- ALL OF IT IS GONE, because the thing it was building is now shipped in
+-- catalog.lua. A frozen client's item list is a constant; asking every user to
+-- measure it, once per account, behind a timer, with a latch to stop the measuring
+-- from nagging them, was the old architecture leaking through. Nothing on the
+-- login path touches the scan, nothing touches DaseekiArmoryScanDB, and a fresh
+-- account gets a complete picker with no wait and no announcement.
 --
--- FINAL SEMANTICS (autoScanTried is a latch on the AUTO path only):
---   armed        cache not complete and no marker -> one attempt per login
---   latched      set only when this callback reaches StartItemScan
---   interrupted  a scan that STARTED but never finished keeps the marker: the
---                auto path does not retry it (that is the "does not nag forever"
---                property — a scan that hangs the client must not restart itself
---                every login), and Rescan Items is the manual door
---   terminal     completion is the real terminal state: FinishItemScan sets
---                scannedAt/count, so IsComplete() gates every future login, and
---                clears the marker so a later cache wipe re-arms the auto path
+-- WHAT THIS DELETES BESIDES THE TIMER: AUTO_SCAN_DELAY, the autoScanTried latch
+-- and every question about its placement, the first-login chat line, and the
+-- reason Addon:ItemScanCache() was ever called during normal play. The cache is
+-- not created, not normalised and not written on any path a player can reach.
+--
+-- ═══════════════════════════════════════════════════════════════════════════
+-- THE SCAN SURVIVES AS A DEVELOPER TOOL, and only as one.
+--
+-- The runner above is not dead code and must not be deleted: it is how catalog.lua
+-- and restrictions.lua get REGENERATED. A developer runs it against a live client,
+-- the result lands in their own SavedVariables, and dev/gen-catalog.lua and
+-- dev/gen-restrictions.lua read that file to build the shipped tables. Deleting
+-- the scan would mean the next client build could never be captured — the data
+-- would be frozen at whatever the last release happened to know.
+--
+-- SO IT IS GATED, TWICE OVER, and neither gate can be tripped by accident:
+--
+--   1. the command that starts it (/darmory devscan) is undocumented — it is not
+--      in the slash help, not in the options UI, and not in any tooltip;
+--   2. it refuses to run unless the global named below is truthy, which a player
+--      has no reason to set and no path to set by accident.
+--
+--      /run DASEEKI_ARMORY_DEV = true
+--      /darmory devscan
+--
+-- A GLOBAL RATHER THAN A SAVED SETTING, deliberately: it evaporates on /reload, so
+-- a developer cannot leave a machine armed, and it can never be persisted into a
+-- user's SavedVariables by a stray click.
 ----------------------------------------------------------------------
-Addon.AUTO_SCAN_DELAY = 15
+Addon.DEV_SCAN_FLAG = "DASEEKI_ARMORY_DEV"
 
-function Addon:InitItemScan()
-    local cache = Addon:ItemScanCache()
-    if Scan.IsComplete(cache) or cache.autoScanTried then return end
-    C_Timer.After(Addon.AUTO_SCAN_DELAY, function()
-        if Addon:IsScanning() then return end
-        local c = Addon:ItemScanCache()
-        if Scan.IsComplete(c) then return end
-        print(Addon:Tag() .. " building the item database for the first time — "
-              .. "this runs once per account and takes about a minute. "
-              .. Addon:Wrap("muted", "(Goal picker -> Rescan Items to redo it.)"))
-        -- N5: the latch closes HERE, on a scan that is actually starting — never at
-        -- login, where an early logout would disarm the auto path for good.
-        c.autoScanTried = true
-        Addon:StartItemScan()
-    end)
+function Addon:IsDevScanEnabled()
+    return _G[Addon.DEV_SCAN_FLAG] and true or false
+end
+
+-- -> started(boolean), reason(string|nil)
+function Addon:StartDevScan()
+    if not Addon:IsDevScanEnabled() then
+        return false, "the item scan is a developer tool in this build. "
+            .. "It is how catalog.lua gets regenerated for a new client, not "
+            .. "something the picker needs — the item database is shipped."
+    end
+    if Addon:IsScanning() then return false, "a scan is already running." end
+    return Addon:StartItemScan({ force = true })
 end

@@ -5,17 +5,25 @@
         /darmory widget     toggle the on-screen set switcher
         /darmory list       print this character's sets
         /darmory stats      toggle the stats panel attached to the character window
-        /darmory scanstatus what the item scan knows, right now
+        /darmory data       what this build ships: items, locks, hidden
 
     `stats` exists so the attach setting stays reachable when Daseeki-Core is absent
     (the options hub needs Core; this command does not).
 
-    `scanstatus` exists because the scan announces itself in chat exactly once and
-    then scrolls away. "Is it still running?", "how many items did it find?" and
-    "how many class locks does this build ship?" are questions with real answers
-    sitting in the cache and in restrictions.lua, so they are queryable rather than
-    something the owner has to have witnessed. The lines come from
-    Scan.StatusReport, which is pure and harness-gated.
+    `data` WAS `scanstatus`, AND THE RENAME IS THE RELEASE (1.3.1). It used to
+    answer questions about a process — is the scan still running, how far has it
+    got, when did it last finish, how many rows are still unread — because the item
+    database was something each user produced for themselves. The database is
+    shipped now, so the only honest question left is "what is in this build?", and
+    the answer is three counts that are identical on every account. `scanstatus`
+    still works as an alias: it is in muscle memory and in a release note, and
+    silently failing a command someone learned is worse than answering it.
+
+    THE UNDOCUMENTED ONE: /darmory devscan. It runs the item scan that captures a
+    new client build for dev/gen-catalog.lua. It is deliberately absent from the
+    list above, from the options UI and from every tooltip, and it refuses to run
+    unless a global flag is armed — see THE SCAN SURVIVES AS A DEVELOPER TOOL in
+    itemScan.lua. A player who finds it by accident gets an explanation, not a scan.
 --]]
 
 local _, Addon = ...
@@ -48,15 +56,34 @@ SlashCmdList["DASEEKIARMORY"] = function(msg)
         end
         print(Addon:Tag() .. " " .. msg)
         return
-    elseif cmd == "scanstatus" or cmd == "scan" then
+    elseif cmd == "data" or cmd == "scanstatus" or cmd == "scan" then
         local Scan = Addon.ItemScan
         if not (Scan and Scan.StatusReport) then
-            print(Addon:Tag() .. " item scan module is not loaded.")
+            print(Addon:Tag() .. " the item module is not loaded.")
             return
         end
-        print(Addon:Tag() .. " item scan status:")
-        for _, line in ipairs(Scan.StatusReport(Addon:ItemScanCache(), Addon:ItemScanStatus())) do
+        print(Addon:Tag() .. " shipped item data:")
+        for _, line in ipairs(Scan.StatusReport()) do
             print("  " .. line)
+        end
+        return
+
+    -- UNDOCUMENTED, AND GATED. The scan exists to regenerate catalog.lua and
+    -- restrictions.lua for a new client build; it is not something a player needs
+    -- and it must not be startable by one. Addon:StartDevScan refuses unless the
+    -- developer flag is armed and explains itself when it does.
+    elseif cmd == "devscan" then
+        if not Addon.StartDevScan then
+            print(Addon:Tag() .. " the item module is not loaded.")
+            return
+        end
+        local started, why = Addon:StartDevScan()
+        if started then
+            print(Addon:Tag() .. " DEV scan started — walking the client's item space. "
+                .. "This does not affect the goal picker; it captures a file for "
+                .. "dev/gen-catalog.lua.")
+        else
+            print(Addon:Tag() .. " " .. tostring(why))
         end
         return
     elseif cmd == "list" then

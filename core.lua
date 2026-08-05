@@ -258,7 +258,13 @@ function Addon:OnLogin()
     if Addon.InitBorders   then Addon:InitBorders()   end
     if Addon.ApplySetBindings then Addon:ApplySetBindings() end
     if Addon.InitGoals then Addon:InitGoals() end
-    if Addon.InitItemScan then Addon:InitItemScan() end
+    -- Addon:InitItemScan() USED TO BE CALLED HERE. It bound the account-wide scan
+    -- cache and, on an account that had never completed a scan, armed a 15-second
+    -- timer that announced "building the item database for the first time" and
+    -- walked 32 000 item ids. The item database is shipped in catalog.lua now, so
+    -- there is nothing to build, nothing to announce, and no SavedVariable to bind:
+    -- the login path does not touch the scan at all. (The scan survives as a
+    -- developer tool behind /darmory devscan's flag; see itemScan.lua.)
     if Addon.WarmGoalItems then C_Timer.After(5, function() Addon:WarmGoalItems() end) end
 
     -- Macro entry points, unique to Armory so they never collide with ItemRack's

@@ -1389,15 +1389,19 @@ end)
 -- Like trinkets.lua and borders.lua, itemScan.lua is loaded with NO WoW API
 -- present at all, which is the property the first suite asserts.
 --
--- restrictions.lua is loaded FIRST, into the SAME Addon table, exactly as the TOC
--- orders it. That is deliberate: the filter reads Addon.StaticRestrictions, so a
--- harness that stubbed the table would be testing a different program. ScanAddon
--- is that Addon table, published so the suites can read the shipped data itself.
+-- BOTH SHIPPED DATA FILES ARE LOADED FIRST, into the SAME Addon table, exactly as
+-- the TOC orders them. That is deliberate: the filter reads
+-- Addon.StaticRestrictions and the index reads Addon.StaticCatalogRaw, so a
+-- harness that stubbed either would be testing a different program. ScanAddon is
+-- that Addon table, published so the suites can read the shipped data itself.
 ----------------------------------------------------------------------
 local Scan, ScanAddon
 do
     local A = {}
     ScanAddon = A
+    local cf, cerr = loadfile(P("catalog.lua"))
+    if cf then pcall(cf, "Daseeki-Armory", A) end
+    ScanAddon._catalogLoadError = (not cf) and tostring(cerr) or nil
     local rf, rerr = loadfile(P("restrictions.lua"))
     if rf then pcall(rf, "Daseeki-Armory", A) end
     ScanAddon._restrictionsLoadError = (not rf) and tostring(rerr) or nil
@@ -2380,14 +2384,19 @@ suite("goal-picker-empty-query", function(ck)
     ck(src ~= nil, "goalPicker.lua is readable")
     if src then
         local s = src:read("*a"); src:close()
-        ck(s:find("if internal then return end") ~= nil,
-           "the index builder drops internal rows before they become entries")
-        ck(s:find("Scan%.IsInternalName") ~= nil,
-           "…deriving the flag for the seed tables, which were never scanned")
+        -- THE INDEX BUILDER NO LONGER FILTERS INTERNAL ROWS, and that is correct:
+        -- dev/gen-catalog.lua applied the denylist at generation time, so there is
+        -- not one internal row in catalog.lua for the builder to drop. A filter
+        -- here would be a second mechanism for a decision already made.
+        ck(s:find("if internal then return end") == nil,
+           "the index builder has no internal filter — the catalog ships without them")
+        ck(s:find("Scan%.CatalogEach") ~= nil, "…because it builds from the shipped catalog")
         ck(s:find("Scan%.Matches") ~= nil, "the row filter runs the shared predicate")
         ck(s:find("Scan%.NormalizeQuery") ~= nil, "…over a normalised query")
-        ck(s:find("internalStamp") ~= nil,
-           "the index cache key includes the denylist stamp, so a pattern fix rebuilds it")
+        ck(s:find("internalStamp") == nil,
+           "no denylist stamp in the index key: shipped data cannot change mid-session")
+        ck(s:find("Addon:ItemScanCache") == nil,
+           "…and the picker never touches the retired scan cache")
     end
 end)
 
@@ -2441,7 +2450,23 @@ suite("goal-picker-row-model", function(ck)
     ck(src:find("GET_ITEM_INFO_RECEIVED") ~= nil, "…and re-tints when it does")
     ck(src:find("Scan%.Usable") ~= nil, "the result filter runs the shared usability predicate")
     ck(src:find("Addon:ScanContext") ~= nil, "…against the VIEWING character's context")
-    ck(src:find("StartItemScan") ~= nil, "the picker can start a rescan")
+    -- THE PICKER HAS NO SCAN CONTROL AT ALL (1.3.1). "Rescan Items", its
+    -- "Scanning…" label, the progress poll and the "(unscanned)" suffix are gone
+    -- with the scan they described. The footer is one checkbox.
+    --
+    -- These look for CODE, not for the words. The comments above each removal say
+    -- what used to be there and why it went, deliberately — a deletion nobody can
+    -- read the reason for gets reinstated by the next person. So the assertions
+    -- name the constructs: the button field, its factory call, the sync function,
+    -- the suffix variable, and any call into the runner.
+    ck(src:find("StartItemScan") == nil, "the picker cannot start a scan")
+    ck(src:find("f%.rescan") == nil, "…there is no rescan button on the frame")
+    ck(src:find('makeButton%(f, "Rescan') == nil, "…and nothing builds one")
+    ck(src:find("function f:SyncScanUI") == nil, "…no scan-UI sync function survives")
+    ck(src:find("function f:ShowScanProgress") == nil, "…nor a progress readout")
+    ck(src:find("function f:ScanFinished") == nil, "…nor a scan-finished handler")
+    ck(src:find("local suffix") == nil, "…and the count line has no suffix to append")
+    ck(src:find("Addon:IsScanning") == nil, "…the picker never asks whether a scan is running")
     ck(src:find("showUnusable") ~= nil, "…and exposes the show-unusable escape hatch")
     -- The cap must come after the sort, or "highest ilvl first" is a lie on big
     -- result sets. Both now live inside Rows.SortAndCap, which is what makes the
@@ -2758,204 +2783,290 @@ suite("goal-picker-row-pool", function(ck)
     local evtRequery = evt and src:find("self:Requery%(true%)", evt)
     ck(evtRequery ~= nil,
        "the item-info stream refresh preserves the scroll position")
-    ck(src:find("if self:IsShown%(%) then self:Requery%(true%) end") ~= nil,
-       "…and so does the one that runs when a scan or repair finishes")
+    -- The external door (Addon:RefreshGoalPicker) preserves too. It used to be
+    -- called by FinishItemScan; no scan reaches a player now, so what it pins is
+    -- the general "something changed" path, not a scan seam.
+    ck(src:find("picker:Requery%(preserveScroll ~= false%)") ~= nil,
+       "…and so does an externally requested re-filter")
     ck(src:find("picker:Requery%(%)\n%s*end%)\n%s*search:SetScript%(\"OnEscapePressed") ~= nil,
        "…while typing in the search box goes back to the top")
     ck(src:find("if picker then picker:Requery%(%) end") ~= nil,
        "…as does toggling Show unusable")
-    ck(src:find("f:SyncScanUI%(%)\n%s*f:Requery%(%)") ~= nil,
-       "…and as does opening the picker")
+    ck(src:find("f\\.search:SetText%(\"\"%)\n%s*f:Requery%(%)") ~= nil
+       or src:find('f%.search:SetText%(""%)\r?\n%s*f:Requery%(%)') ~= nil,
+       "…and as does opening the picker, which now goes straight from clearing "
+       .. "the search box to the query with no scan-UI sync in between")
 end)
 
 ----------------------------------------------------------------------
--- THE SEED MAY NOT OVERRIDE THE CLIENT  (1.3.1)
+-- THE CATALOG IS THE PICKER'S ONLY SOURCE  (1.3.1)
 --
--- THE DEFECT (owner screenshot): the picker offered "Enchant Cloak -
--- Resistance", the name of an enchantment EFFECT. It reached the list through a
--- fall-through introduced with the denylist: goalPicker's `add` returned on an
--- internal row BEFORE recording that the id had been dealt with, so the bundled
--- AtlasLoot seed — whose ids do not all agree with this client — got to name it
--- on the next pass. Id 13794 is "[PH] Shining Dawn Coif" in the owner's client
--- and "Enchant Cloak - Resistance" in the seed; the denylist removed the former
--- and the seed put the latter back. 37 ids in the owner's cache were resurrecting
--- like that, 7 of them as "Enchant …" rows, the rest under equally wrong names
--- ("Instant Poison V" for "Monster - Axe, 2H Pendulum of Doom").
+-- WHAT THIS SUITE REPLACED, and why the replacement is smaller. It used to be
+-- "THE SEED MAY NOT OVERRIDE THE CLIENT": a precedence suite guarding a rule that
+-- three name sources had to obey, written after a real defect (owner screenshot)
+-- in which the picker offered "Enchant Cloak - Resistance" — the name of an
+-- enchantment EFFECT. That row reached the list because goalPicker's `add`
+-- returned on an internal row BEFORE recording that the id had been dealt with,
+-- so the bundled AtlasLoot seed got to name it on the next pass: id 13794 is
+-- "[PH] Shining Dawn Coif" in the client and "Enchant Cloak - Resistance" in the
+-- seed, and 37 ids in the owner's cache were resurrecting like that.
+--
+-- There is one source now, so that whole class of defect is unreachable: a seed
+-- cannot contradict the client when there is no seed, and an internal row cannot
+-- be handed back when the catalog was generated without one. The suite that
+-- remains proves the new shape rather than policing the old rule — including,
+-- directly against the shipped file, that the defect's own fixture ids are simply
+-- not in it.
 ----------------------------------------------------------------------
-suite("goal-picker-source-precedence", function(ck)
-    -- ── BEHAVIOURAL: drive the real BuildGoalItemDB over the real defect ─────
-    -- goalPicker.lua touches the WoW API only from inside functions, so the index
-    -- builder can be run headlessly against stubs. The fixture is the owner's own
-    -- id 13794: "[PH] Shining Dawn Coif" in the client, "Enchant Cloak -
-    -- Resistance" in the bundled seed.
-    --
-    -- `scanned` switches the fixture between the two regimes the 1.3.1 SEED
-    -- RETIREMENT rule distinguishes: before the first completed scan the seed is
-    -- the only name source there is, after it the cache is the whole index.
-    local function buildFixture(scanned)
-        local A = { ItemScan = Scan }
+suite("goal-picker-catalog-source", function(ck)
+    if type(Scan) ~= "table" then ck(false, "itemScan.lua did not load"); return end
+
+    -- ── THE PARSER, on fixtures ─────────────────────────────────────────────
+    ck(type(Scan.CatalogEach) == "function", "the catalog reader is published as Scan.CatalogEach")
+    ck(type(Scan.CatalogCount) == "function", "…with a count that needs no parse")
+
+    local function collect(raw)
+        local out, order = {}, {}
+        local n = Scan.CatalogEach(function(id, name, q)
+            out[id] = { name = name, q = q }; order[#order + 1] = id
+        end, raw)
+        return out, n, order
+    end
+
+    local got, n, order = collect("25 1 Worn Shortsword\n19019 5 Thunderfury, Blessed Blade of the Windseeker\n12640 4 Lionheart Helm")
+    ck(n == 3, "three records parse from three lines (got " .. tostring(n) .. ")")
+    ck(got[25] and got[25].name == "Worn Shortsword" and got[25].q == 1, "id, quality and name all arrive")
+    ck(got[19019] and got[19019].name == "Thunderfury, Blessed Blade of the Windseeker",
+       "a name with commas and spaces survives — the name runs to end of line")
+    ck(order[1] == 25 and order[2] == 19019 and order[3] == 12640,
+       "…in file order, which the generator writes ascending")
+
+    -- CRLF: catalog.lua is written into a CRLF working tree, so this is not a
+    -- hypothetical. A reader that split on "\n" alone would hand every name back
+    -- with a trailing carriage return — invisible in a diff, wrong in the picker,
+    -- and wrong only on Windows.
+    local crlf = collect("25 1 Worn Shortsword\r\n19019 5 Thunderfury\r\n")
+    ck(crlf[25] and crlf[25].name == "Worn Shortsword",
+       "CRLF: no carriage return leaks into the name")
+    ck(crlf[19019] and crlf[19019].name == "Thunderfury", "…on any line")
+
+    -- a name that begins with digits must not be re-split
+    local digits = collect("12345 2 30 Pound Fish Trophy")
+    ck(digits[12345] and digits[12345].name == "30 Pound Fish Trophy" and digits[12345].q == 2,
+       "a name that STARTS with a number is not mistaken for the id/quality fields")
+
+    ck(Scan.CatalogEach(function() end, "") == 0, "an empty payload yields nothing")
+    ck(Scan.CatalogEach(function() end, nil, nil) >= 0, "a nil payload does not raise")
+    ck(Scan.CatalogEach(nil, "25 1 Worn Shortsword") == 0, "a nil callback yields nothing")
+
+    -- HEADLESS DISCIPLINE: the walk is ceilinged, so a corrupted string cannot
+    -- spin the login frame.
+    ck(type(Scan.CATALOG_CEILING) == "number" and Scan.CATALOG_CEILING > 9240,
+       "the walk carries an iteration ceiling above the shipped row count")
+    local big = {}
+    for i = 1, 50 do big[i] = i .. " 1 Item " .. i end
+    local savedCeil = Scan.CATALOG_CEILING
+    Scan.CATALOG_CEILING = 10
+    local capped = Scan.CatalogEach(function() end, table.concat(big, "\n"))
+    Scan.CATALOG_CEILING = savedCeil
+    ck(capped == 10, "…and it really stops there (got " .. tostring(capped) .. ")")
+
+    -- ── THE SHIPPED FILE ────────────────────────────────────────────────────
+    local A = {}
+    local cfn, cerr = loadfile(P("catalog.lua"))
+    ck(cfn ~= nil, "catalog.lua compiles" .. (cfn and "" or (" -> " .. tostring(cerr))))
+    if not cfn then return end
+    ck(pcall(cfn, "Daseeki-Armory", A), "…and loads with no WoW API present")
+    ck(type(A.StaticCatalogRaw) == "string", "it publishes Addon.StaticCatalogRaw")
+    ck(type(A.StaticCatalogCount) == "number", "…and a literal Addon.StaticCatalogCount")
+
+    local shipped, shippedN = {}, 0
+    local dupes, badQ = 0, 0
+    Scan.CatalogEach(function(id, name, q)
+        shippedN = shippedN + 1
+        if shipped[id] then dupes = dupes + 1 end
+        if type(q) ~= "number" or q < 0 or q > 7 then badQ = badQ + 1 end
+        shipped[id] = name
+    end, A.StaticCatalogRaw)
+
+    ck(shippedN == A.StaticCatalogCount,
+       "the declared count matches the payload (" .. shippedN .. " vs "
+       .. tostring(A.StaticCatalogCount) .. ")")
+    ck(shippedN == 9240, "the shipped catalog is 9 240 items (got " .. shippedN .. ")")
+    ck(dupes == 0, "no id appears twice")
+    ck(badQ == 0, "every quality is a real 0..7")
+
+    -- THE DENYLIST IS BAKED IN. Not one internal name survived generation, which
+    -- is why the index builder has no internal filter left.
+    local leaked, leakName = 0, nil
+    for id, name in pairs(shipped) do
+        if Scan.IsInternalName(name) then
+            leaked = leaked + 1
+            if not leakName then leakName = id .. " " .. name end
+        end
+    end
+    ck(leaked == 0, "NOT ONE internal record is in the shipped catalog (leak: "
+       .. tostring(leakName) .. ")")
+
+    -- the old defect's own ids, checked directly against the shipped file
+    ck(shipped[13794] == nil,
+       "the 1.3.1 defect id 13794 ([PH] Shining Dawn Coif) is not shipped at all")
+    for _, nm in pairs(shipped) do
+        if nm == "Enchant Cloak - Resistance" then leaked = leaked + 1 end
+    end
+    ck(leaked == 0, "…and no row anywhere is named 'Enchant Cloak - Resistance'")
+
+    -- and the items that MUST be there
+    ck(shipped[19019] == "Thunderfury, Blessed Blade of the Windseeker",
+       "Thunderfury ships, under the client's own name")
+    ck(shipped[17182] == "Sulfuras, Hand of Ragnaros", "…and Sulfuras")
+    ck(shipped[22691] == "Corrupted Ashbringer", "…and the Ashbringer you can actually chase")
+    ck(shipped[12640] == "Lionheart Helm", "…and ordinary gear")
+
+    -- EVERY RESTRICTED ID IS IN THE CATALOG. A lock on an id the picker can never
+    -- offer is a lock that does nothing; this is what proves the two shipped files
+    -- were generated from the same evidence.
+    local R = {}
+    local rfn = loadfile(P("restrictions.lua"))
+    if rfn then pcall(rfn, "Daseeki-Armory", R) end
+    local orphanLock, orphanHide = 0, 0
+    for id in pairs(R.StaticRestrictions or {}) do
+        if not shipped[id] then orphanLock = orphanLock + 1 end
+    end
+    for id in pairs(R.StaticUnobtainable or {}) do
+        if not shipped[id] then orphanHide = orphanHide + 1 end
+    end
+    ck(orphanLock == 0, "every class/faction lock names an id the catalog ships (" .. orphanLock .. " orphans)")
+    ck(orphanHide == 0, "…and so does every hidden-by-history id (" .. orphanHide .. " orphans)")
+
+    -- THE HIDDEN LIST IS *NOT* BAKED OUT, deliberately. Those ids ship and are
+    -- dropped by the row predicate, so deleting a line from restrictions.lua puts
+    -- the item straight back with no regeneration — which is the promise that list
+    -- has always carried.
+    ck(shipped[13262] == "Ashbringer",
+       "an unobtainable item is still IN the catalog — the hidden list stays policy")
+    ck(shipped[6698] == "Stone of Pierce", "…including the GM records")
+
+    -- ── THE INDEX BUILDER, driven for real ──────────────────────────────────
+    -- goalPicker.lua touches the WoW API only from inside functions, so the
+    -- builder runs headlessly against stubs.
+    local function buildFixture(raw, pvp, clientHas)
+        local G = { ItemScan = Scan, StaticCatalogRaw = raw, PvPItemIDs = pvp or {} }
         local fn = loadfile(P("goalPicker.lua"))
         if not fn then return nil, "goalPicker.lua does not compile" end
-        local okl = pcall(fn, "Daseeki-Armory", A)
-        if not okl then return nil, "goalPicker.lua raised at load" end
-
-        local cache = Scan.NewCache()
-        Scan.Put(cache, 13794, "[PH] Shining Dawn Coif", 3)             -- internal
-        Scan.Put(cache, 18419, "Monster - Axe, 2H Horde Red War Axe", 2)
-        Scan.Put(cache, 19019, "Thunderfury, Blessed Blade of the Windseeker", 5)
-        if scanned then cache.scannedAt = 1785862751 end
-        A.ItemScanCache = function() return cache end
-        -- the seed's disagreeing names for the SAME ids, verbatim from itemDB.lua
-        A.ItemNameDB = {
-            [13794] = "Enchant Cloak - Resistance",
-            [18419] = "Felcloth Pants",
-            [21134] = "Zandalar Freethinker's Breastplate",   -- seed-only, genuine
-            [22737] = "Atiesh, Greatstaff of the Guardian",   -- seed-only, NOT in this client
-        }
-        A.ItemClassMask = {}
-        A.PvPItemIDs = {}
-
+        if not pcall(fn, "Daseeki-Armory", G) then return nil, "goalPicker.lua raised at load" end
+        -- Scan.CatalogEach falls back to the catalog on ITS OWN addon table (the
+        -- one itemScan.lua was loaded with), so point that at the fixture for the
+        -- duration rather than the picker's.
+        local savedRaw = ScanAddon.StaticCatalogRaw
+        ScanAddon.StaticCatalogRaw = raw
         local savedI, savedG = _G.GetItemInfoInstant, _G.GetItemInfo
         _G.GetItemInfoInstant = function(id)
+            if clientHas and not clientHas[id] then return id end   -- no icon: client lacks it
             return id, nil, nil, "INVTYPE_HEAD", "icon" .. tostring(id), 4, 1
         end
-        _G.GetItemInfo = function() return nil end
-        local okb, list = pcall(A.BuildGoalItemDB, A)
+        _G.GetItemInfo = function(id)
+            if pvp and pvp.names and pvp.names[id] then return pvp.names[id], nil, 3 end
+            return nil
+        end
+        local okb, list = pcall(G.BuildGoalItemDB, G)
         _G.GetItemInfoInstant, _G.GetItemInfo = savedI, savedG
+        Addon.StaticCatalogRaw = savedRaw
         if not okb then return nil, "BuildGoalItemDB raised: " .. tostring(list) end
-
-        local byId, byName = {}, {}
-        for _, e in ipairs(list) do byId[e.id] = e; byName[e.display] = true end
-        return { A = A, cache = cache, list = list, byId = byId, byName = byName }
+        local byId = {}
+        for _, e in ipairs(list) do byId[e.id] = e end
+        return { G = G, list = list, byId = byId }
     end
 
-    if type(Scan) == "table" then
-        -- ── AFTER a completed scan: the cache is the WHOLE index ─────────────
-        local post, perr = buildFixture(true)
-        ck(post ~= nil, "the index builds against a completed-scan cache (" .. tostring(perr) .. ")")
-        if post then
-            ck(post.byName["Enchant Cloak - Resistance"] == nil,
-               "THE 1.3.1 DEFECT: the seed cannot re-name an id the scan dropped as internal")
-            ck(post.byId[13794] == nil, "…id 13794 is out of the index entirely")
-            ck(post.byName["Felcloth Pants"] == nil,
-               "…and neither can it re-name a dropped creature-art record")
-            ck(post.byId[19019] ~= nil and post.byId[19019].display
-               == "Thunderfury, Blessed Blade of the Windseeker",
-               "a real scanned item is still in the index, under the CLIENT's name")
-            -- ── SEED RETIREMENT (round two) ──────────────────────────────────
-            ck(post.byId[21134] == nil,
-               "SEED RETIREMENT: a seed-only id the completed scan never found is gone")
-            ck(post.byId[22737] == nil,
-               "…including the fifth Atiesh the bundled snapshot carries and this client does not")
-            ck(post.byName["Zandalar Freethinker's Breastplate"] == nil,
-               "…by name as well as by id")
-            ck(#post.list == 1,
-               "exactly the one scanned survivor, no seed rows at all (got " .. #post.list .. ")")
-            ck(post.A.GoalSeedAllowed(post.cache) == false,
-               "the rule itself says so: a completed scan retires the seed")
-        end
-
-        -- ── BEFORE any scan: the seed is all there is, and it still speaks ───
-        local pre, prerr = buildFixture(false)
-        ck(pre ~= nil, "the index builds against a never-scanned cache (" .. tostring(prerr) .. ")")
-        if pre then
-            ck(pre.A.GoalSeedAllowed(pre.cache) == true,
-               "…and an incomplete scan does NOT retire it")
-            ck(pre.byId[21134] ~= nil,
-               "PRE-SCAN: the same seed-only row IS offered, because nothing better exists yet")
-            ck(pre.byId[22737] ~= nil, "…as is the seed's fifth Atiesh")
-            ck(pre.byId[19019] ~= nil,
-               "…while the partial cache still outranks the seed on ids it does cover")
-            ck(pre.byId[13794] == nil and pre.byName["Enchant Cloak - Resistance"] == nil,
-               "…and precedence is unchanged: a dropped internal row is still not the seed's to name")
-            ck(#pre.list > #post.list,
-               "the pre-scan list is the longer one — retirement is what shortens it")
-        end
-
-        -- ── MUTATION ADEQUACY over the precedence rule itself ────────────────
-        -- Each mutant is the rule written wrong; every one must disagree with the
-        -- real Addon.GoalSeedAllowed on at least one of the four cache shapes.
-        local none   = Scan.NewCache()
-        local part   = Scan.NewCache(); Scan.Put(part, 19019, "Thunderfury", 5)
-        local done   = Scan.NewCache(); Scan.Put(done, 19019, "Thunderfury", 5)
-        done.scannedAt = 1785862751
-        local hollow = Scan.NewCache(); hollow.scannedAt = 1785862751   -- stamped, zero rows
-        local SHAPES = { none, part, done, hollow }
-        local real = (post and post.A.GoalSeedAllowed) or nil
-        ck(type(real) == "function", "the seed rule is published as a pure function")
-        if type(real) == "function" then
-            ck(real(none) == true,   "an empty cache keeps the seed")
-            ck(real(part) == true,   "a cache with rows but no completion stamp keeps it")
-            ck(real(done) == false,  "a completed scan retires it")
-            ck(real(hollow) == true,
-               "a completion stamp over ZERO rows is not a completed scan — the seed stays")
-            local RULE_MUTANTS = {
-                ["P1 the seed is always consulted (the shipped 1.3.0 behaviour)"] =
-                    function() return true end,
-                ["P2 the seed is never consulted, even before the first scan"] =
-                    function() return false end,
-                ["P3 'complete' means only that the stamp is present"] =
-                    function(c) return not c.scannedAt end,
-                ["P4 'complete' means only that the cache has rows"] =
-                    function(c) return (c.count or 0) == 0 end,
-                ["P5 the rule is inverted"] =
-                    function(c) return Scan.IsComplete(c) end,
-            }
-            local rnames = {}
-            for k in pairs(RULE_MUTANTS) do rnames[#rnames + 1] = k end
-            table.sort(rnames)
-            for _, name in ipairs(rnames) do
-                local mut, killed = RULE_MUTANTS[name], false
-                for _, c in ipairs(SHAPES) do
-                    local okm, got = pcall(mut, c)
-                    if not okm or got ~= real(c) then killed = true; break end
-                end
-                ck(killed, "mutation killed: " .. name)
-            end
-        end
+    local FIX = "25 1 Worn Shortsword\n12640 4 Lionheart Helm\n19019 5 Thunderfury, Blessed Blade of the Windseeker"
+    local b, berr = buildFixture(FIX)
+    ck(b ~= nil, "the index builds straight from the catalog (" .. tostring(berr) .. ")")
+    if b then
+        ck(#b.list == 3, "every catalog row becomes an entry (got " .. #b.list .. ")")
+        ck(b.byId[19019] and b.byId[19019].display == "Thunderfury, Blessed Blade of the Windseeker",
+           "…under the catalog's name")
+        ck(b.byId[19019] and b.byId[19019].name == "thunderfury, blessed blade of the windseeker",
+           "…with a folded search key beside it")
+        -- QUALITY COMES FROM THE CATALOG, which is the whole cold-sort fix: it is
+        -- present before the client has sent anything, so the order never collapses
+        -- onto the alphabet and no legendary can be sorted off the end of the cap.
+        ck(b.byId[19019] and b.byId[19019].quality == 5,
+           "QUALITY IS NEVER COLD: it arrives with the catalog row, not from the server")
+        ck(b.byId[12640] and b.byId[12640].quality == 4, "…for every row")
+        ck(b.byId[25] and b.byId[25].equipLoc == "INVTYPE_HEAD",
+           "equipLoc is re-derived from GetItemInfoInstant, not shipped")
+        ck(b.byId[25] and b.byId[25].icon ~= nil, "…as are the icon and the item class")
     end
 
+    -- AN ID THIS CLIENT DOES NOT HAVE IS DROPPED. That is the safety net that lets
+    -- one developer's capture ship to everyone: a catalog built against a different
+    -- build offers less, never phantoms.
+    local nb = buildFixture(FIX, nil, { [25] = true, [12640] = true })
+    ck(nb and #nb.list == 2 and nb.byId[19019] == nil,
+       "an id the running client cannot answer for is silently dropped")
+
+    -- THE PvP SAFETY NET still fires for an id the catalog somehow missed…
+    local pb = buildFixture("25 1 Worn Shortsword",
+                            setmetatable({ 16472 }, nil))
+    ck(pb ~= nil, "the index builds with PvP ids present")
+    local pv = { 16472, names = { [16472] = "Field Marshal's Coronet" } }
+    local pb2 = buildFixture("25 1 Worn Shortsword", pv)
+    ck(pb2 and pb2.byId[16472] ~= nil,
+       "PvP SAFETY NET: an id the catalog missed is still named by the client")
+    ck(pb2 and (pb2.G._goalPvPMissing or 0) == 0, "…and nothing is left outstanding")
+    -- …and is a no-op when the catalog already covers it
+    local pb3 = buildFixture("16472 4 Field Marshal's Coronet", pv)
+    ck(pb3 and pb3.byId[16472] and pb3.byId[16472].display == "Field Marshal's Coronet",
+       "…while a covered id keeps the CATALOG's name, not a second lookup's")
+    ck(pb3 and #pb3.list == 1, "…and is not added twice")
+
+    -- every real PvP id IS covered by the shipped catalog today
+    local V = {}
+    local vfn = loadfile(P("pvpItems.lua"))
+    if vfn then pcall(vfn, "Daseeki-Armory", V) end
+    local pvpMissing = 0
+    for _, id in ipairs(V.PvPItemIDs or {}) do
+        if not shipped[id] then pvpMissing = pvpMissing + 1 end
+    end
+    ck(#(V.PvPItemIDs or {}) > 0, "pvpItems.lua publishes its ids")
+    ck(pvpMissing == 0,
+       "all " .. #(V.PvPItemIDs or {}) .. " PvP rank ids are in the shipped catalog "
+       .. "(" .. pvpMissing .. " missing) — the net is slack on purpose")
+
+    -- ── SOURCE SHAPE, in the source ─────────────────────────────────────────
     local h = io.open(P("goalPicker.lua"), "r")
     ck(h ~= nil, "goalPicker.lua is readable")
-    if not h then return end
-    local src = h:read("*a"); h:close()
+    if h then
+        local src = h:read("*a"); h:close()
+        ck(src:find("Scan%.CatalogEach%(add%)") ~= nil,
+           "the index is built by streaming the catalog")
+        ck(src:find("Addon%.ItemNameDB") == nil, "the bundled seed is not consulted at all")
+        ck(src:find("GoalSeedAllowed") == nil, "…so the seed-retirement rule is gone with it")
+        ck(src:find("cache%.names") == nil, "…and so is the scan cache")
+        ck(src:find("local list, settled = {}, {}") ~= nil,
+           "the duplicate guard survives (one source can still repeat an id)")
+        local catLoop = src:find("Scan%.CatalogEach%(add%)")
+        local pvpLoop = src:find("for _, id in ipairs%(Addon%.PvPItemIDs")
+        ck(catLoop and pvpLoop and catLoop < pvpLoop,
+           "the catalog is read before the PvP net, so the net only fills gaps")
+    end
 
-    ck(src:find("local list, settled = {}, {}") ~= nil,
-       "the index builder tracks every id a source has SETTLED, not just the ones it kept")
-    local mark = src:find("settled%[id%] = true")
-    local drop = src:find("if internal then return end")
-    ck(mark ~= nil and drop ~= nil and mark < drop,
-       "an id is settled BEFORE the internal drop, so the drop cannot hand it to the seed")
-    local guard = src:find("if not id or settled%[id%] then return end")
-    ck(guard ~= nil and guard < mark, "…and a settled id is refused at the door")
-    ck(src:find("if not byId%[id%] then") == nil and src:find("byId%[id%] = e") == nil,
-       "the old keep-only bookkeeping is gone")
-    ck(src:find("if not settled%[id%] then") ~= nil,
-       "the PvP source honours the same ledger")
-
-    -- source order: the scan speaks first, then the seed, then the PvP ids
-    local scanLoop = src:find("for id in pairs%(cache%.names%) do")
-    local seedLoop = src:find("for id, nm in pairs%(Addon%.ItemNameDB%) do")
-    local pvpLoop  = src:find("for _, id in ipairs%(Addon%.PvPItemIDs")
-    ck(scanLoop and seedLoop and pvpLoop and scanLoop < seedLoop and seedLoop < pvpLoop,
-       "the CLIENT scan is consulted before the bundled snapshot, always")
-
-    -- seed retirement is a GATE on that loop, not a filter inside it
-    ck(src:find("function Addon%.GoalSeedAllowed%(cache%)") ~= nil,
-       "the seed-retirement rule is published, pure, and named")
-    ck(src:find("local seedAllowed = Addon%.GoalSeedAllowed%(cache%)") ~= nil,
-       "…and the index builder asks it before opening the seed at all")
-    ck(src:find("if seedAllowed and Addon%.ItemNameDB then") ~= nil,
-       "…gating the whole seed loop rather than each row")
-    ck(src:find("if Addon%.ItemNameDB then\n") == nil,
-       "THE OLD UNGATED SEED LOOP IS GONE")
-
-    -- and the family that exposed it can no longer be named at all
-    if type(Scan) == "table" then
-        ck(Scan.IsInternalName("Enchant Cloak - Resistance") == true,
-           "belt and braces: the seed's own name for 13794 is on the denylist too")
-        ck(Scan.IsInternalName("[PH] Shining Dawn Coif") == true,
-           "…as is what the client actually calls that id")
+    -- ── THE SEED IS NOT SHIPPED ─────────────────────────────────────────────
+    local stray = io.open(P("itemDB.lua"), "r")
+    ck(stray == nil, "itemDB.lua is no longer in the addon root")
+    if stray then stray:close() end
+    local kept = io.open(P("dev/itemDB-seed.lua"), "r")
+    ck(kept ~= nil, "…it survives as dev/itemDB-seed.lua, a generator input")
+    if kept then
+        local ks = kept:read("*a"); kept:close()
+        ck(ks:find("Addon%.ItemClassMask") ~= nil,
+           "…carrying the Tier-3 class masks no other source has, for the next regeneration")
+    end
+    local toc = io.open(P("Daseeki-Armory.toc"), "r")
+    if toc then
+        local ts = toc:read("*a"); toc:close()
+        ck(ts:find("itemDB%.lua") == nil, "…and the TOC does not load it")
+        ck(ts:find("catalog%.lua") ~= nil, "…while catalog.lua takes its place")
     end
 end)
 
@@ -3116,11 +3227,14 @@ suite("static-restrictions-shipped", function(ck)
     ck(type(ScanAddon.StaticUnobtainable) == "table",
        "restrictions.lua publishes the unobtainable-by-history list")
     local un = ScanAddon.StaticUnobtainable
-    -- THE WHOLE LIST, BY ENUMERATION AND BY COUNT. Five ids, owner-reviewed one by
-    -- one on 2026-08-04. The count is pinned alongside the names so that an id
-    -- ADDED without a decision fails here too — enumeration alone only catches
-    -- deletions, and this list hides things from the player, so it earns both.
-    local KEPT_HIDDEN = { 13262, 18582, 18583, 18584, 22736 }
+    -- THE WHOLE LIST, BY ENUMERATION AND BY COUNT. Twelve ids, every one signed
+    -- off by the owner: five reviewed one by one on 2026-08-04, and the seven
+    -- GM/developer records added on 2026-08-05 ("yes hide the gm items"). The
+    -- count is pinned alongside the names so that an id ADDED without a decision
+    -- fails here too — enumeration alone only catches deletions, and this list
+    -- hides things from the player, so it earns both.
+    local KEPT_HIDDEN = { 13262, 18582, 18583, 18584, 22736,
+                          6698, 6707, 6708, 6711, 6724, 6728, 12947 }
     for _, id in ipairs(KEPT_HIDDEN) do
         ck(un[id] == true, "the owner's named unobtainable id " .. id .. " is on the list")
     end
@@ -3259,18 +3373,22 @@ suite("static-restrictions-shipped", function(ck)
                     "andonisus", oneHand, viewer("WARRIOR", nil, true)) == false,
        "…not by name, not under 'Show unusable' — the same treatment as before the correction")
 
-    -- ── 5. THE SCAN → PICKER SEAM (the push that survived the deletion) ─────
+    -- ── 5. THE SCAN → PICKER SEAM IS CUT (1.3.1) ───────────────────────────
+    -- This used to assert the opposite: that FinishItemScan invalidated the
+    -- picker's index and then PUSHED a refresh into an open picker, in that order.
+    -- The index is built from catalog.lua now and owes the scan nothing, so a
+    -- finished scan must NOT reach into the picker at all — the developer capture
+    -- exists to produce a file for the next release, and rewriting the list under
+    -- the person looking at it would be both pointless and startling.
     local sh = io.open(P("itemScan.lua"), "r")
     ck(sh ~= nil, "itemScan.lua is readable")
     if sh then
         local s = sh:read("*a"); sh:close()
-        local finish  = s:find("function Addon:FinishItemScan")
-        local push    = s:find("Addon%.RefreshGoalPicker")
-        local invalid = s:find("Addon%.GoalItemDB, Addon%._goalDBStamp = nil, nil")
-        ck(finish and invalid and invalid > finish, "FinishItemScan invalidates the picker index")
-        ck(push and finish and push > finish, "…and then PUSHES the refresh into an open picker")
-        ck(invalid and push and invalid < push,
-           "…in that order, so the refresh rebuilds rather than re-reading the stale index")
+        ck(s:find("Addon%.RefreshGoalPicker") == nil,
+           "a finished scan does NOT push a refresh into the picker any more")
+        ck(s:find("Addon%.GoalItemDB, Addon%._goalDBStamp = nil, nil") == nil,
+           "…and does not invalidate an index it no longer feeds")
+        ck(s:find("_goalDBStamp") == nil, "…the index stamp is gone with the cache that moved it")
 
         -- ── THE DELETION INVENTORY, asserted so it cannot creep back ────────
         for _, gone in ipairs({
@@ -3302,7 +3420,15 @@ suite("static-restrictions-shipped", function(ck)
            "…nor does an index entry carry a copy of a lock it does not own")
     end
 
-    -- ── 6. /darmory scanstatus: shorter, and the state is QUERYABLE ─────────
+    -- ── 6. /darmory data: A REPORT ON SHIPPED DATA, NOT ON A PROCESS ───────
+    --
+    -- Every earlier version of this report answered questions about a PROCESS —
+    -- is the scan running, how far has it got, when did it last finish, how many
+    -- rows are still unread, why was the last repair refused, which capture stamp
+    -- is current — because the item database was something each user produced for
+    -- themselves and the production could fail. It is shipped now, so the report
+    -- takes no arguments at all: there is no cache to walk and no live status to
+    -- interrogate, and three counts say everything there is to say.
     ck(type(Scan.StatusReport) == "function", "Scan.StatusReport is published")
     local function joined(lines) return table.concat(lines or {}, "\n") end
     local function findLine(lines, prefix)
@@ -3311,56 +3437,47 @@ suite("static-restrictions-shipped", function(ck)
         end
     end
 
-    local empty = Scan.StatusReport(nil, nil)
-    ck(#empty == 2 and empty[1]:find("never run") ~= nil,
-       "with no cache at all it says so — and still reports the shipped locks")
-    ck(findLine(empty, "restrictions: static table") ~= nil,
-       "…because the table is a property of the BUILD, not of the account")
+    -- IT TAKES NO ARGUMENTS. Passing the old ones must not change the answer, or
+    -- some caller is still feeding it state it should not have.
+    local rep  = Scan.StatusReport()
+    local rep2 = Scan.StatusReport(Scan.NewCache(), { phase = "instant", percent = 25 })
+    ck(joined(rep) == joined(rep2),
+       "the report is a pure function of the BUILD: old arguments change nothing")
 
-    local rc = Scan.NewCache()
-    Scan.Put(rc, 22589, "Atiesh, Greatstaff of the Guardian", 5)
-    Scan.Put(rc, 22476, "Bonescythe Breastplate", 4)
-    Scan.Put(rc, 16963, "Nightslayer Chestpiece", 4)
-    Scan.Put(rc, 13789, "[PH] Brilliant Dawn Cap", 1)        -- internal
-    rc.scannedAt = 1785862751
-    rc.build, rc.ranges = "68940", "1-32000"
+    ck(#rep == 4, "the report is FOUR lines (got " .. #rep .. ")")
+    local catLine = findLine(rep, "catalog:")
+    ck(catLine ~= nil, "…led by the catalog line")
+    ck(catLine and catLine:find("9240 items") ~= nil,
+       "…which says how many items this build ships: " .. tostring(catLine))
+    local restrictLine = findLine(rep, "restrictions:")
+    ck(restrictLine ~= nil, "…then the locks")
+    ck(restrictLine and restrictLine:find(tostring(n) .. " class/faction locks") ~= nil,
+       "…counted from the shipped table (" .. n .. ")")
+    local hiddenLine = findLine(rep, "hidden:")
+    ck(hiddenLine ~= nil, "…then what is hidden by history")
+    ck(hiddenLine and hiddenLine:find("12 unobtainable") ~= nil,
+       "…all 12 of them: " .. tostring(hiddenLine))
+    ck(joined(rep):find("Nothing to scan") ~= nil,
+       "…and the report says outright that there is nothing to scan")
 
-    local idle = Scan.StatusReport(rc, nil)
-    -- cache / restrictions / scan state / last scan / stamps
-    ck(#idle == 5, "an idle report is FIVE lines now (got " .. #idle .. ")")
-    local cacheLine = findLine(idle, "cache:")
-    ck(cacheLine ~= nil, "…led by the cache line")
-    ck(cacheLine and cacheLine:find("4 ids") ~= nil, "…which counts every row")
-    ck(cacheLine and cacheLine:find("3 offerable") ~= nil, "…separating what the picker may offer")
-    ck(cacheLine and cacheLine:find("1 internal") ~= nil, "…from what it hides")
-    local restrictLine = findLine(idle, "restrictions: static table")
-    ck(restrictLine ~= nil, "the restriction line names its source: a static table")
-    ck(restrictLine and restrictLine:find(tostring(n) .. " entries") ~= nil,
-       "…and says how many locks this build ships (" .. n .. ")")
-    ck(restrictLine and restrictLine:find("unobtainable%-by%-history") ~= nil,
-       "…and how many items are hidden as unobtainable")
-    ck(findLine(idle, "scan: idle") ~= nil, "an idle scan says idle")
-    ck(joined(idle):find("owed") == nil and joined(idle):find("unread") == nil,
-       "NOTHING IS EVER OWED ANY MORE: no line can say a pass is outstanding")
-    ck(joined(idle):find("repair") == nil, "…and the word 'repair' has left the report")
-    ck(findLine(idle, "last full scan:") ~= nil, "the last completed scan is stamped")
-    ck(joined(idle):find("68940") ~= nil and joined(idle):find("1%-32000") ~= nil,
-       "…with the build and the id range it covered")
-    ck(findLine(idle, "stamps:") ~= nil, "and the remaining stamps are readable")
-    ck(joined(idle):find("denylist " .. Scan.INTERNAL_STAMP) ~= nil, "…the denylist stamp")
-    ck(joined(idle):find("capture") == nil, "…with no capture stamp, because there is no capture")
+    -- THE PROCESS VOCABULARY IS GONE, every word of it.
+    for _, word in ipairs({ "owed", "unread", "repair", "capture", "RUNNING",
+                            "last full scan", "idle", "cache:", "stamps:" }) do
+        ck(joined(rep):find(word, 1, true) == nil,
+           "no line can still say '" .. word .. "' — there is no process to describe")
+    end
 
-    local walking = Scan.StatusReport(rc, { phase = "instant", cursor = 8000, total = 32000,
-                                            percent = 25, found = 3100 })
-    ck(findLine(walking, "scan: RUNNING") ~= nil, "the id walk reports as a running scan")
-    ck(findLine(walking, "scan: RUNNING"):find("3100 equippable") ~= nil,
-       "…counting what it has found so far")
-    local loading = Scan.StatusReport(rc, { phase = "resolve", cursor = 900, total = 9241,
-                                            percent = 9 })
-    ck(findLine(loading, "scan: RUNNING") ~= nil, "so does the item-loading phase")
-    ck(findLine(loading, "scan: RUNNING"):find("900 / 9241") ~= nil, "…with its own x / y")
+    -- A ZERO IS THE ONE FAULT LEFT, and it must be legible rather than inferred
+    -- from an empty picker.
+    local savedCat, savedRes = ScanAddon.StaticCatalogCount, ScanAddon.StaticRestrictions
+    ScanAddon.StaticCatalogCount = nil
+    local broken = Scan.StatusReport()
+    ScanAddon.StaticCatalogCount = savedCat
+    ck(findLine(broken, "catalog:") and findLine(broken, "catalog:"):find("did not load") ~= nil,
+       "a catalog that failed to load says so on its own line")
+    ck(savedRes ~= nil, "fixture check: the restriction table was there to begin with")
 
-    for _, l in ipairs(idle) do
+    for _, l in ipairs(rep) do
         ck(type(l) == "string" and l:find("|c") == nil and l:find("nil") == nil,
            "every status line is plain, complete text: " .. tostring(l))
     end
@@ -3369,10 +3486,45 @@ suite("static-restrictions-shipped", function(ck)
     ck(sl ~= nil, "slash.lua is readable")
     if sl then
         local t = sl:read("*a"); sl:close()
-        ck(t:find('cmd == "scanstatus"') ~= nil, "/darmory scanstatus is a command")
-        ck(t:find("Scan%.StatusReport%(Addon:ItemScanCache%(%), Addon:ItemScanStatus%(%)%)") ~= nil,
-           "…and prints exactly the report, over the live cache and the live scan state")
-        ck(t:find("/darmory scanstatus") ~= nil, "…and is documented in the file's own header")
+        ck(t:find('cmd == "data"') ~= nil, "/darmory data is the command")
+        ck(t:find('cmd == "scanstatus"') ~= nil,
+           "…and scanstatus still answers, because it is in muscle memory and a release note")
+        ck(t:find("Scan%.StatusReport%(%)") ~= nil,
+           "…printing exactly the report, with nothing handed to it")
+        ck(t:find("Addon:ItemScanCache") == nil,
+           "…and the slash surface never binds the retired cache")
+        ck(t:find("/darmory data") ~= nil, "…documented in the file's own header")
+
+        -- THE DEV DOOR: gated, and never advertised.
+        ck(t:find('cmd == "devscan"') ~= nil, "the developer scan has an entry point")
+        ck(t:find("Addon:StartDevScan%(%)") ~= nil, "…which goes through the gated starter")
+        ck(t:find("StartItemScan") == nil,
+           "…and the slash file cannot reach the runner directly")
+        local hdrEnd = t:find("%-%-%]%]")
+        ck(hdrEnd and t:find("devscan", 1, true) > hdrEnd
+           or (t:find("UNDOCUMENTED") ~= nil),
+           "…and the header lists it as undocumented rather than as a command")
+    end
+
+    -- THE GATE ITSELF: a global nobody sets by accident, checked at call time.
+    local sh2 = io.open(P("itemScan.lua"), "r")
+    if sh2 then
+        local s2 = sh2:read("*a"); sh2:close()
+        ck(s2:find('Addon%.DEV_SCAN_FLAG = "DASEEKI_ARMORY_DEV"') ~= nil,
+           "the dev flag is a named global, not a saved setting")
+        ck(s2:find("function Addon:IsDevScanEnabled") ~= nil, "…with a published predicate")
+        ck(s2:find("if not Addon:IsDevScanEnabled%(%) then") ~= nil,
+           "…and StartDevScan refuses before it does anything else")
+        ck(s2:find("function Addon:InitItemScan") == nil,
+           "THE AUTO PATH IS GONE: there is no login hook left to arm it")
+        -- The rest of the auto path — the delay, the one-shot latch, the notice —
+        -- is asserted away construct by construct in item-scan-no-auto-path.
+    end
+    local ch = io.open(P("core.lua"), "r")
+    if ch then
+        local c2 = ch:read("*a"); ch:close()
+        ck(c2:find("if Addon%.InitItemScan then Addon:InitItemScan%(%) end") == nil,
+           "…and the login path does not call it")
     end
 
     -- ── 7. THE TOC LOADS THE DATA BEFORE THE CODE THAT READS IT ─────────────
@@ -3382,8 +3534,18 @@ suite("static-restrictions-shipped", function(ck)
         local toc = th:read("*a"); th:close()
         local r = toc:find("restrictions%.lua")
         local i = toc:find("itemScan%.lua")
+        local c = toc:find("catalog%.lua")
         ck(r ~= nil, "restrictions.lua is shipped")
         ck(r and i and r < i, "…and is loaded BEFORE itemScan.lua, which reads it")
+        ck(c ~= nil, "catalog.lua is shipped")
+        ck(c and i and c < i, "…and is likewise loaded before its reader")
+        -- CONTINUITY: the retired SavedVariable stays DECLARED for a couple of
+        -- releases after its last writer, so a downgrade cannot meet an undeclared
+        -- global and old data on disk stays readable.
+        ck(toc:find("## SavedVariables: DaseekiArmoryScanDB") ~= nil,
+           "the retired scan SavedVariable is still declared (continuity)")
+        ck(toc:find("RETIRED") ~= nil,
+           "…with the reason and the removal release written beside it")
     end
 end)
 
@@ -3419,10 +3581,26 @@ end)
 -- becomes an invariant instead of a per-report fix.
 --
 -- THE INVENTORY IS A CENSUS, NOT A HAND LIST. Every quality>=5 row in the owner's
--- account-1 cache (10 504 ids, Era build 68940): 28 rows, of which 7 are caught by
--- the internal denylist and 5 are on the owner-reviewed unobtainable list, leaving
--- the 16 below. Corrupted Ashbringer is carried alongside them because the owner
--- counts it a legendary even though this client stamps it Epic (quality 4).
+-- account-1 cache (10 504 ids, Era build 68940) is 28 rows, and every one of them
+-- is now accounted for:
+--
+--     7   caught by the internal denylist (Blizzard's own legendary-stamped test
+--         gear) and therefore never written into catalog.lua at all;
+--    12   on the owner-reviewed hidden list — the Ashbringer, the three Azzinoth
+--         records, Andonisus, and the seven GM/developer records the owner ruled
+--         on 2026-08-05 ("yes hide the gm items");
+--     9   genuinely offerable, below.
+--
+-- Corrupted Ashbringer is carried alongside those nine because the owner counts it
+-- a legendary even though this client stamps it Epic (quality 4), which is why the
+-- offerable list is 10 rows and not 9.
+--
+-- THE SEVEN GM RECORDS USED TO BE IN THE OFFERABLE LIST HERE, flagged in their own
+-- verdict text as "CANDIDATE for the unobtainable list, owner decision". That is
+-- how they reached him: the sweep did not hide them, it did not guess, it stated
+-- what it had found and named the decision as his. This is the census working as
+-- intended, and the note is left standing as the reason to keep writing verdicts
+-- rather than booleans.
 ----------------------------------------------------------------------
 suite("legendary-sweep", function(ck)
     if type(Scan) ~= "table" then ck(false, "itemScan.lua did not load"); return end
@@ -3441,13 +3619,6 @@ suite("legendary-sweep", function(ck)
     -- name       the CLIENT's name, lower-cased the way an index entry carries it
     -- verdict    the obtainability reading, stated per item and owner-facing
     local OFFERABLE = {
-        { 6698,  "stone of pierce",   6, "artifact-quality developer record (a Blizzard staff name); no loot table — CANDIDATE for the unobtainable list, owner decision" },
-        { 6707,  "stone of lapidis",  6, "same family as 6698" },
-        { 6708,  "stone of goodman",  6, "same family as 6698" },
-        { 6711,  "stone of kurtz",    6, "same family as 6698" },
-        { 6724,  "stone of backus",   6, "same family as 6698" },
-        { 6728,  "stone of brownell", 6, "same family as 6698" },
-        { 12947, "alex's ring of audacity", 6, "artifact-quality developer record — CANDIDATE, owner decision" },
         { 17142, "shard of the defiler",    5, "legendary-quality quest item the client ships and the scan found; left offerable (fail-open)" },
         { 17182, "sulfuras, hand of ragnaros", 5, "OBTAINABLE — Molten Core; two-handed mace, proficiency is the only gate" },
         { 17782, "talisman of binding shard",    5, "legendary-quality Molten Core quest item; left offerable" },
@@ -3472,10 +3643,29 @@ suite("legendary-sweep", function(ck)
         { 18881, "TEST Ragnaros Hammer" },
         { 19158, "TEST Sulfuras, Hand of Ragnaros" },
     }
-    -- The quality>=5 rows the owner-reviewed policy list removes.
-    local HIDDEN = { 13262, 18582, 18583, 18584, 22736 }
+    -- The quality>=5 rows the owner-reviewed policy list removes, and WHY each is
+    -- on it. The seven GM records joined on the owner's 2026-08-05 decision
+    -- ("yes hide the gm items"); before that they were carried in OFFERABLE above
+    -- as flagged candidates, which is how they came to his attention.
+    local HIDDEN = {
+        { 13262, "ashbringer",                    "never itemised on a live Era realm" },
+        { 18582, "the twin blades of azzinoth",   "a Burning Crusade record this client happens to carry" },
+        { 18583, "warglaive of azzinoth (right)", "as 18582" },
+        { 18584, "warglaive of azzinoth (left)",  "as 18582" },
+        { 22736, "andonisus, reaper of souls",    "obtainable, but a temporary decaying weapon — not a goal you can keep" },
+        { 6698,  "stone of pierce",               "GM/developer record" },
+        { 6707,  "stone of lapidis",              "GM/developer record" },
+        { 6708,  "stone of goodman",              "GM/developer record" },
+        { 6711,  "stone of kurtz",                "GM/developer record" },
+        { 6724,  "stone of backus",               "GM/developer record" },
+        { 6728,  "stone of brownell",             "GM/developer record" },
+        { 12947, "alex's ring of audacity",       "GM/developer record" },
+    }
 
-    ck(#OFFERABLE == 17, "the census carries all 17 offerable rows (16 legendary/artifact + Corrupted Ashbringer)")
+    ck(#OFFERABLE == 10, "the census carries all 10 offerable rows (9 legendary + Corrupted Ashbringer)")
+    ck(#HIDDEN == 12, "…and all 12 hidden-by-policy rows")
+    ck(Scan.UnobtainableCount() == 12,
+       "…which is exactly what the shipped list holds (got " .. Scan.UnobtainableCount() .. ")")
 
     -- ── 2. NOTHING MAY HIDE THEM BY ACCIDENT ────────────────────────────────
     for _, row in ipairs(OFFERABLE) do
@@ -3495,8 +3685,52 @@ suite("legendary-sweep", function(ck)
         ck(Scan.InternalPattern(row[2]:lower()) ~= nil,
            ("Blizzard's own %q is still condemned by a pattern"):format(row[2]))
     end
-    for _, id in ipairs(HIDDEN) do
-        ck(UN[id] == true, ("the owner-reviewed hidden id %d is still hidden"):format(id))
+    for _, row in ipairs(HIDDEN) do
+        local id, nm, why = row[1], row[2], row[3]
+        ck(UN[id] == true,
+           ("the owner-reviewed hidden id %d (%s) is still hidden — %s"):format(id, nm, why))
+        -- HIDDEN MEANS HIDDEN, INCLUDING UNDER "SHOW UNUSABLE". That tick box is
+        -- about gear a DIFFERENT character could wear; there is no character
+        -- anywhere that can obtain one of these, so revealing them would be a lie
+        -- about what the box means. Rule 3 sits ABOVE rule 5 for exactly this.
+        local e = { id = id, equipLoc = "INVTYPE_WEAPON", name = nm,
+                    classID = Scan.ITEM_CLASS_WEAPON, subclassID = 7 }
+        local everShown = false
+        for _, c in ipairs(CLASSES) do
+            if Scan.Matches(e, "", { INVTYPE_WEAPON = true }, viewer(c, true)) then everShown = true end
+        end
+        ck(everShown == false,
+           ("…and 'Show unusable' does not reveal %d to any of the nine classes"):format(id))
+        local shown, rule = Scan.RowVerdict(e, viewer("WARRIOR", true))
+        ck(shown == false and rule == "unobtainable",
+           ("…the rule that decided %d is 'unobtainable', not something further down"):format(id))
+    end
+
+    -- ── 2b. THE ARTIFACT BAND IS FULLY ACCOUNTED FOR ────────────────────────
+    -- Classic Era ships no obtainable artifact, so after the 2026-08-05 decision
+    -- NO quality-6 row may be offerable. The client holds exactly 13 of them: three
+    -- the denylist condemns as test gear, three Warglaives, and the seven GM
+    -- records. This asserts the whole band against the SHIPPED catalog rather than
+    -- against a list somebody remembered to update.
+    local CFG = {}
+    local cfn2 = loadfile(P("catalog.lua"))
+    if cfn2 and pcall(cfn2, "Daseeki-Armory", CFG) then
+        local artifacts, offerableArtifacts, names = 0, 0, {}
+        Scan.CatalogEach(function(id, name, q)
+            if q >= 6 then
+                artifacts = artifacts + 1
+                if not Scan.IsUnobtainable(id) then
+                    offerableArtifacts = offerableArtifacts + 1
+                    names[#names + 1] = id .. " " .. name
+                end
+            end
+        end, CFG.StaticCatalogRaw)
+        ck(artifacts == 10,
+           "the shipped catalog carries 10 artifact-quality rows (3 of the client's 13 "
+           .. "were denylisted at generation time) — got " .. artifacts)
+        ck(offerableArtifacts == 0,
+           "NO artifact-quality row is offerable: Era ships none (leaked: "
+           .. table.concat(names, ", ") .. ")")
     end
 
     -- ── 3. THE RIGHT CLASSES, PER ITEM ──────────────────────────────────────
@@ -3720,231 +3954,139 @@ suite("legendary-sweep", function(ck)
 end)
 
 ----------------------------------------------------------------------
--- AUTO-SCAN ARMING  (release verification N5)
+-- THERE IS NO AUTO PATH  (1.3.1)
 --
--- Addon:InitItemScan is the login hook. It one-shots the first-run item scan behind a
--- 15s delay so the scan never competes with the login burst, and behind a marker
--- (cache.autoScanTried) so it does not nag.
+-- WHAT THIS SUITE USED TO BE: "AUTO-SCAN ARMING (release verification N5)". It
+-- drove Addon:InitItemScan — the login hook that one-shot the first-run item scan
+-- behind a 15-second delay (so the scan never competed with the login burst) and
+-- behind a marker (cache.autoScanTried, so it did not nag) — with a recording
+-- C_Timer, so the 15-second window could be opened and abandoned the way a logout
+-- abandons it.
 --
--- The defect: the marker was stamped at LOGIN, before the timer was even armed. cache is
--- DaseekiArmoryScanDB — SavedVariables — so a logout, /reload or disconnect inside that
--- 15s window persisted "already tried" for a scan that never ran, and the auto path was
--- disarmed on that account for ever (IsComplete false + marker true => early return on
--- every subsequent login, silently).
+-- IT EXISTED BECAUSE OF A REAL DEFECT worth remembering: the marker was stamped at
+-- LOGIN, before the timer was even armed. cache is DaseekiArmoryScanDB —
+-- SavedVariables — so a logout, /reload or disconnect inside that window persisted
+-- "already tried" for a scan that never ran, and the auto path was then disarmed on
+-- that account for ever (IsComplete false + marker true => early return on every
+-- subsequent login, silently). The owner's only way out was to find "Rescan Items"
+-- in the goal picker by himself.
 --
--- These suites drive the real InitItemScan with a recording C_Timer, so the window can be
--- opened and abandoned the way a logout abandons it.
+-- THE FIX IS NOW STRUCTURAL RATHER THAN CAREFUL. That whole defect class — a
+-- one-shot latch, a window it can be lost in, a delay to tune, a first-run notice
+-- to word, and a suite to prove the latch closes in the right place — existed to
+-- make a per-account measurement of a CONSTANT reliable. The constant ships in
+-- catalog.lua. So the correct assertion is no longer "the latch closes at the right
+-- moment"; it is that there is no latch, no timer, no notice and no login hook at
+-- all, and that nothing a player can reach starts a scan or touches the retired
+-- SavedVariable.
+--
+-- The runner itself is deliberately NOT asserted away — it is how the shipped files
+-- get regenerated for a new client build. What is asserted is that the only door to
+-- it is bolted.
 ----------------------------------------------------------------------
-local function newScanEnv()
+suite("item-scan-no-auto-path", function(ck)
     local A = {}
     local fnc, e = loadfile(P("itemScan.lua"))
-    if not fnc then return nil, "compile: " .. tostring(e) end
-    local okl, el = pcall(fnc, "Daseeki-Armory", A)
-    if not okl then return nil, "load: " .. tostring(el) end
+    ck(fnc ~= nil, "itemScan.lua compiles: " .. tostring(e))
+    if not fnc then return end
+    ck(pcall(fnc, "Daseeki-Armory", A), "…and loads with no WoW API present")
 
-    local env = { addon = A, timers = {}, starts = 0, printed = {}, scanning = false }
-    -- The chat/format helpers the notice uses, and the one call we must NOT let through:
-    -- the real StartItemScan wants CreateFrame and GetTime. Its INVOCATION is what this
-    -- suite is about, so a recorder is the faithful stand-in.
-    A.Tag           = function() return "[Armory]" end
-    A.Wrap          = function(_, _, s) return s end
-    A.IsScanning    = function() return env.scanning end
-    A.StartItemScan = function() env.starts = env.starts + 1; return true end
-    return env
-end
+    -- ── 1. THE LOGIN HOOK AND ITS MACHINERY ARE GONE ────────────────────────
+    ck(A.InitItemScan == nil, "Addon:InitItemScan no longer exists")
+    ck(A.AUTO_SCAN_DELAY == nil, "…nor the delay it waited behind")
 
--- One login: bind the SavedVariables table, run the hook, collect whatever timer it armed.
--- Returns the number of timers armed by THIS login.
-local function scanLogin(env, savedVars)
-    local savedTimer, savedPrint, savedDB = _G.C_Timer, _G.print, _G.DaseekiArmoryScanDB
-    local armed = 0
-    _G.DaseekiArmoryScanDB = savedVars
-    _G.C_Timer = { After = function(delay, cb)
-        armed = armed + 1
-        env.timers[#env.timers + 1] = { delay = delay, cb = cb }
-    end }
-    _G.print = function(...)
-        local parts = {}
-        for i = 1, select("#", ...) do parts[i] = tostring((select(i, ...))) end
-        env.printed[#env.printed + 1] = table.concat(parts, " ")
+    local sh = io.open(P("itemScan.lua"), "r")
+    ck(sh ~= nil, "itemScan.lua is readable")
+    local s = sh and sh:read("*a") or ""
+    if sh then sh:close() end
+    -- CODE, NOT WORDS. The long comment where the hook used to be names
+    -- autoScanTried and AUTO_SCAN_DELAY on purpose — a deletion whose reason
+    -- nobody can read gets reinstated by the next person — so these assertions
+    -- look for the constructs, not the vocabulary.
+    for _, gone in ipairs({ "function Addon:InitItemScan",
+                            "Addon%.AUTO_SCAN_DELAY = ",
+                            "c%.autoScanTried = true",
+                            "cache%.autoScanTried = nil",
+                            "print%(Addon:Tag%(%) %.%. \" building the item database" }) do
+        ck(s:find(gone) == nil, "the auto path is GONE from itemScan.lua: " .. gone)
     end
-    local okc, errc = pcall(env.addon.InitItemScan, env.addon)
-    _G.C_Timer, _G.print, _G.DaseekiArmoryScanDB = savedTimer, savedPrint, savedDB
-    env.lastError = (not okc) and errc or nil
-    return armed
-end
+    -- C_Timer is what armed it. Nothing in this file should need a timer any more.
+    ck(s:find("C_Timer%.After") == nil, "…and nothing here arms a timer at all")
 
--- Fire every armed timer (i.e. the player stayed logged in past the delay).
-local function scanFireTimers(env, savedVars)
-    local savedTimer, savedPrint, savedDB = _G.C_Timer, _G.print, _G.DaseekiArmoryScanDB
-    _G.DaseekiArmoryScanDB = savedVars
-    _G.C_Timer = { After = function() end }
-    _G.print = function(...)
-        local parts = {}
-        for i = 1, select("#", ...) do parts[i] = tostring((select(i, ...))) end
-        env.printed[#env.printed + 1] = table.concat(parts, " ")
-    end
-    local pending = env.timers
-    env.timers = {}
-    for _, t in ipairs(pending) do pcall(t.cb) end
-    _G.C_Timer, _G.print, _G.DaseekiArmoryScanDB = savedTimer, savedPrint, savedDB
-end
-
-suite("item-scan-auto-arm", function(ck)
-    if type(Scan) ~= "table" then ck(false, "itemScan.lua did not load"); return end
-
-    -- ── 1. THE DEFECT: an early logout must not disarm the auto path ────────────
-    -- Cache is the SavedVariables table, so the SAME table is carried across the
-    -- simulated logouts below — that is exactly what persists to disk.
-    local sv = Scan.NewCache()
-    local e1 = newScanEnv()
-    ck(e1 ~= nil, "a fresh itemScan environment loads with no WoW API")
-    if not e1 then return end
-
-    local armed1 = scanLogin(e1, sv)
-    ck(e1.lastError == nil, "InitItemScan runs on an empty cache (" .. tostring(e1.lastError) .. ")")
-    ck(armed1 == 1, "an empty cache arms exactly one delayed auto-scan (got " .. armed1 .. ")")
-    ck(e1.timers[1] and e1.timers[1].delay == e1.addon.AUTO_SCAN_DELAY,
-       "…at AUTO_SCAN_DELAY (" .. tostring(e1.addon.AUTO_SCAN_DELAY) .. "s), off the login burst")
-    ck(sv.autoScanTried == nil,
-       "THE FIX: nothing is written to SavedVariables merely by ARMING the timer")
-    ck(e1.starts == 0, "…and no scan has started yet")
-    ck(#e1.printed == 0, "…and the owner has not been told anything yet")
-
-    -- LOGOUT inside the 15s window: the timer dies with the session, unfired.
-    -- Next login gets a whole new addon environment, but the same saved cache.
-    local e2 = newScanEnv()
-    local armed2 = scanLogin(e2, sv)
-    ck(armed2 == 1,
-       "THE REGRESSION: after an early logout the NEXT login re-arms the auto-scan " ..
-       "(got " .. armed2 .. " — 0 means the one-time scan is disarmed for ever)")
-    ck(sv.autoScanTried == nil, "…and still nothing has been persisted")
-
-    -- Three abandoned windows in a row still leave it armed: nothing latches until a
-    -- scan actually runs.
-    local armedN = 0
-    for _ = 1, 3 do armedN = armedN + scanLogin(newScanEnv(), sv) end
-    ck(armedN == 3, "…and it survives repeated early logouts (got " .. armedN .. " of 3)")
-    ck(sv.autoScanTried == nil, "…with the marker still unset")
-
-    -- ── 2. THE LATCH CLOSES WHEN THE SCAN ACTUALLY STARTS ──────────────────────
-    scanFireTimers(e2, sv)
-    ck(e2.starts == 1, "staying logged in past the delay starts the scan (got " .. e2.starts .. ")")
-    ck(sv.autoScanTried == true, "…and THAT is what sets the marker")
-    ck(#e2.printed == 1, "…with one first-run notice printed (got " .. #e2.printed .. ")")
-    ck((e2.printed[1] or ""):find("first time") ~= nil and
-       (e2.printed[1] or ""):find("Rescan Items") ~= nil,
-       "…that says it runs once and names the manual way to redo it")
-
-    -- ── 3. INTERRUPTED SCAN: started, never finished -> does NOT re-arm ─────────
-    -- The marker is on disk and scannedAt is not, so the auto path stays quiet. This is
-    -- deliberate: a scan that wedges the client must not restart itself every login.
-    ck(Scan.IsComplete(sv) == false, "an interrupted scan is NOT a completed scan")
-    local e3 = newScanEnv()
-    local armed3 = scanLogin(e3, sv)
-    ck(armed3 == 0, "a login after an interrupted scan does not auto-retry (got " .. armed3 .. ")")
-    ck(e3.starts == 0, "…and starts nothing")
-
-    -- ── 4. COMPLETION IS THE TERMINAL STATE ────────────────────────────────────
-    -- FinishItemScan is the only writer of scannedAt/count, and it clears the marker so a
-    -- later cache wipe re-arms the auto path. Source-asserted because reaching the real
-    -- FinishItemScan needs a live scan (CreateFrame + GetTime).
-    local fh = io.open(P("itemScan.lua"), "r")
-    ck(fh ~= nil, "itemScan.lua is readable")
-    if fh then
-        local src = fh:read("*a"); fh:close()
-        local finishAt = src:find("function Addon:FinishItemScan")
-        local initAt   = src:find("function Addon:InitItemScan")
-        local clearAt  = src:find("cache%.autoScanTried%s*=%s*nil")
-        ck(finishAt ~= nil and clearAt ~= nil and clearAt > finishAt and clearAt < initAt,
-           "FinishItemScan clears autoScanTried (a completed scan re-arms a future reset)")
-        -- The regression this suite exists for, stated structurally: the marker must not
-        -- be written in InitItemScan's own body before the timer is armed.
-        local timerAt = src:find("C_Timer%.After%(Addon%.AUTO_SCAN_DELAY", initAt or 1)
-        local setAt   = src:find("autoScanTried%s*=%s*true", initAt or 1)
-        ck(timerAt ~= nil and setAt ~= nil and setAt > timerAt,
-           "the marker is set INSIDE the delayed callback, not at login time")
-        local startAt = src:find("Addon:StartItemScan%(%)", setAt or 1)
-        ck(startAt ~= nil, "…immediately before the scan it is recording")
+    local ch = io.open(P("core.lua"), "r")
+    ck(ch ~= nil, "core.lua is readable")
+    if ch then
+        local c = ch:read("*a"); ch:close()
+        -- the surviving mention is the comment explaining the removal; what must
+        -- be gone is the guarded CALL that used to sit in the login sequence.
+        ck(c:find("if Addon%.InitItemScan then Addon:InitItemScan%(%) end") == nil,
+           "the login path does not call the hook")
+        ck(c:find("InitItemScan") ~= nil,
+           "…and says in a comment what used to be there and why it went")
     end
 
-    -- A completed cache never arms, marker or no marker.
-    local done = Scan.NewCache()
-    Scan.Put(done, 23709, "Corehound Belt", 3)
-    done.scannedAt, done.autoScanTried = 1700000000, nil
-    ck(Scan.IsComplete(done) == true, "a scanned, non-empty cache reads as complete")
-    ck(scanLogin(newScanEnv(), done) == 0, "…and never arms the auto-scan again")
+    -- ── 2. THE DEV GATE ─────────────────────────────────────────────────────
+    ck(type(A.IsDevScanEnabled) == "function", "the dev gate is published")
+    ck(type(A.StartDevScan) == "function", "…with a gated starter beside it")
+    ck(A.DEV_SCAN_FLAG == "DASEEKI_ARMORY_DEV", "…keyed on a named global")
 
-    -- …and a wipe of that completed cache re-arms it (the "future reset" path).
-    local wiped = Scan.NewCache()
-    ck(scanLogin(newScanEnv(), wiped) == 1, "a wiped cache arms the auto-scan afresh")
+    -- A GLOBAL, NOT A SAVED SETTING: it evaporates on /reload, so a developer
+    -- cannot leave a machine armed and a stray click cannot persist it.
+    ck(s:find("_G%[Addon%.DEV_SCAN_FLAG%]") ~= nil, "…read from _G at call time")
+    ck(s:find("Addon%.db.-DEV_SCAN") == nil, "…never out of a saved setting")
 
-    -- ── 5. THE TIMER'S OWN GUARDS DO NOT BURN THE ONE-SHOT ─────────────────────
-    -- Firing into a manual scan that is already running must leave the latch open, or a
-    -- rescan the owner kicked off at login would eat the automatic first run.
-    local sv5 = Scan.NewCache()
-    local e5 = newScanEnv()
-    ck(scanLogin(e5, sv5) == 1, "empty cache arms")
-    e5.scanning = true
-    scanFireTimers(e5, sv5)
-    ck(e5.starts == 0, "the callback declines to start a second, overlapping scan")
-    ck(sv5.autoScanTried == nil, "…and does NOT spend the one-shot marker doing so")
-    e5.scanning = false
-    ck(scanLogin(newScanEnv(), sv5) == 1, "…so the next login still arms it")
+    local savedFlag = _G.DASEEKI_ARMORY_DEV
+    _G.DASEEKI_ARMORY_DEV = nil
+    ck(A:IsDevScanEnabled() == false, "with the flag unset the gate is shut")
+    -- The refusal must not reach the runner: StartItemScan needs CreateFrame and
+    -- GetTime, neither of which exists here, so a leak would raise rather than
+    -- return — which is exactly the shape of proof wanted.
+    local ok, started, why = pcall(A.StartDevScan, A)
+    ck(ok == true, "…and refusing does not raise (" .. tostring(started) .. ")")
+    ck(started == false, "…it returns false")
+    ck(type(why) == "string" and why:find("developer tool") ~= nil,
+       "…with an explanation a player can act on: " .. tostring(why))
+    ck(type(why) == "string" and why:find("shipped") ~= nil,
+       "…that says the item database is shipped, so nothing is owed")
+
+    -- ARMED, the gate opens — and the call reaches the real runner, which is what
+    -- the missing WoW API proves by raising. That failure IS the pass: it can only
+    -- happen if the gate let the call through.
+    _G.DASEEKI_ARMORY_DEV = true
+    ck(A:IsDevScanEnabled() == true, "with the flag armed the gate opens")
+    local okArmed, res = pcall(A.StartDevScan, A)
+    ck(okArmed == false or res ~= false,
+       "…and the call reaches the runner rather than being refused again")
+    _G.DASEEKI_ARMORY_DEV = savedFlag
+
+    -- ── 3. NOTHING A PLAYER REACHES TOUCHES THE RETIRED SAVEDVARIABLE ───────
+    -- The picker is the surface a player actually uses; the cache binder is what
+    -- would CREATE DaseekiArmoryScanDB on an account that never had one.
+    local gh = io.open(P("goalPicker.lua"), "r")
+    ck(gh ~= nil, "goalPicker.lua is readable")
+    if gh then
+        local g = gh:read("*a"); gh:close()
+        ck(g:find("ItemScanCache") == nil, "the picker never binds the scan cache")
+        ck(g:find("DaseekiArmoryScanDB") == nil, "…and never names the SavedVariable")
+    end
+    local il = io.open(P("iconData.lua"), "r")
+    if il then
+        local i = il:read("*a"); il:close()
+        ck(i:find("ItemScanCache") == nil, "…nor does the icon search index")
+        ck(i:find("Scan%.CatalogEach") ~= nil, "…which reads the shipped catalog instead")
+        ck(i:find("Addon%.ItemNameDB") == nil, "…and not the retired seed")
+    end
+    -- ItemScanCache still EXISTS — the developer scan needs it — but it is the only
+    -- caller left.
+    ck(s:find("function Addon:ItemScanCache") ~= nil,
+       "the cache binder survives for the developer path")
+    -- Exactly one real call site survives, in StartItemScan. (The other mentions
+    -- are the published-surface list and the note explaining the retirement.)
+    local binderCalls = 0
+    for _ in s:gmatch("local cache = Addon:ItemScanCache%(%)") do binderCalls = binderCalls + 1 end
+    ck(binderCalls == 1,
+       "…with exactly one caller left, the scan starter (" .. binderCalls .. " call sites)")
 end)
-
-----------------------------------------------------------------------
--- THE CAPTURE-STAMP RE-ARM  (1.3.1, the forcing bump)
---
--- THE SITUATION (owner's live /darmory scanstatus, capture stamp 1):
---     restrictions: 833 class-locked, 0 still unread
---     last repair:  11:06 — 0 locked, 0 unreadable
--- The first cut of the repair pass latched its one-shot before the pass had
--- started and burned all three tooltip tries inside a single frame. It therefore
--- SPENT the unread flags — the only record that a re-read was owed — without
--- writing back the locks they stood for. A cache in that state is indistinguishable,
--- A FAILED RE-READ MAY NOT ERASE A LOCK IT DID NOT READ  (1.3.1)
---
--- THE DEFECT (pre-existing, found while reviewing the capture-stamp bump):
--- recordItem wrote Scan.Put(…, classMask, faction, not read) unconditionally, and
--- Scan.ReadRestrictions answers a tooltip that did not build with
--- 0, FACTION_NONE, false. So a row whose RE-READ failed had its previously-good
--- mask overwritten with 0 — correctly flagged unread, but with the evidence gone.
--- AN UNRESTRICTED VERDICT IS ONLY BELIEVABLE FROM A LOADED ITEM  (1.3.1,
--- third and final generation of the restriction fix)
---
--- THE DEFECT, proven by the owner's own pass rather than reasoned about: the
--- stamp-2 repair ran to completion over all 9 240 real rows in his cache and
--- reported "834 locked, 0 unreadable" — one more lock than the 833 it started
--- with, and not a single row it could not read. That is not what a healthy
--- re-read of 9 240 tooltips looks like. It is what a re-read looks like when
--- SetItemByID builds a PARTIAL tooltip over an item whose data the client does
--- not hold: line 1 carries the name (kept from the previous scan's own load) so
--- the "did the tooltip build" test passes, while the block that carries
--- "Classes: …" never renders — and "I saw no class line" was then written down
--- as "this item has no class lock", for essentially every cold row.
---
--- Corroboration in the same cache: the one Bonescythe piece that DID capture
--- mask 8 is the one whose data happened to be warm at read time, and the
--- THE SESSION LATCH  (1.3.1) — "opening the picker does nothing"
---
--- THE OWNER'S BUG, in his words: /darmory scanstatus reads
---
---     restrictions: … 9 240 still unread
---     scan: idle — a repair pass is still owed
---     stamps: … capture 3
---
--- and opening the Choose Goal Item picker triggers NOTHING — no pass, no chat
--- line, no state change.
---
--- Every suspect ahead of it was innocent and this suite says so as it goes: the
--- meta bit layout is one shared constant, so the writer and the reader cannot
--- disagree; the stamp-3 migration flags his rows and UnreadIds finds every one of
--- them; and goalPicker.lua does reach MaybeRepairRestrictions on open. What
--- stopped him is that a pass had ALREADY RUN that session — the degenerate one
--- the data gate describes, where the client returns no item data at all, so it
--- re-read 9 240 rows, captured nothing and reported "0 locked, 9 240 unreadable".
--- Addon._restrictRepairTried was stamped the moment that pass STARTED and was
 ----------------------------------------------------------------------
 -- Every shipped file compiles (loadfile gate)
 ----------------------------------------------------------------------
@@ -3968,18 +4110,56 @@ suite("loadfile-all-files", function(ck)
         ck(c ~= nil, "compiles: " .. f .. (c and "" or (" -> " .. tostring(e))))
     end
 
-    -- The generator is not shipped (it is not in the TOC and never loads in game),
-    -- but a generator that does not compile is a restriction table nobody can
-    -- regenerate, which is the one repair path this design leaves.
-    local g, ge = loadfile(P("dev/gen-restrictions.lua"))
-    ck(g ~= nil, "compiles: dev/gen-restrictions.lua" .. (g and "" or (" -> " .. tostring(ge))))
-    local gh = io.open(P("dev/gen-restrictions.lua"), "r")
-    ck(gh ~= nil, "…and it is committed alongside the table it writes")
-    if gh then
-        local gs = gh:read("*a"); gh:close()
-        ck(gs:find("MEM_CEILING_KB") ~= nil and gs:find("ITER_CEILING") ~= nil,
-           "…under a memory ceiling and an iteration ceiling (headless discipline)")
-        ck(gs:find('io%.open%(path, "w"%)') ~= nil, "…and writes restrictions.lua itself")
+    -- catalog.lua is the largest shipped file by an order of magnitude and it is
+    -- generated, so the loadfile gate matters more for it than for anything else:
+    -- one stray ']' in an item name would close the long-bracket string early and
+    -- the addon would fail at login with a syntax error.
+    local cl, cle = loadfile(P("catalog.lua"))
+    ck(cl ~= nil, "compiles: catalog.lua" .. (cl and "" or (" -> " .. tostring(cle))))
+
+    -- THE GENERATORS are not shipped (they are not in the TOC and never load in
+    -- game), but a generator that does not compile is a shipped table nobody can
+    -- regenerate, which is the one repair path this design leaves. dev/ also holds
+    -- the retired AtlasLoot seed, which is an INPUT to gen-restrictions.lua and
+    -- must therefore still load.
+    for _, rel in ipairs({ "dev/gen-shared.lua", "dev/gen-restrictions.lua",
+                           "dev/gen-catalog.lua", "dev/itemDB-seed.lua" }) do
+        local g, ge = loadfile(P(rel))
+        ck(g ~= nil, "compiles: " .. rel .. (g and "" or (" -> " .. tostring(ge))))
+    end
+
+    -- HEADLESS DISCIPLINE lives in the shared module now, so that is where the
+    -- ceilings are asserted — and each generator must actually route through it,
+    -- or it would have quietly reintroduced an unbounded loop of its own.
+    local sh = io.open(P("dev/gen-shared.lua"), "r")
+    ck(sh ~= nil, "the shared generator core is committed")
+    if sh then
+        local ss = sh:read("*a"); sh:close()
+        ck(ss:find("MEM_CEILING_KB") ~= nil and ss:find("ITER_CEILING") ~= nil,
+           "…carrying a memory ceiling and an iteration ceiling")
+        ck(ss:find("function Shared%.each") ~= nil and ss:find("function Shared%.eachi") ~= nil,
+           "…as bounded pairs() and ipairs() both generators use")
+        ck(ss:find("minRows") ~= nil,
+           "…and it REFUSES a partial cache, so a wiped source cannot generate shipped data")
+    end
+    for _, rel in ipairs({ "dev/gen-restrictions.lua", "dev/gen-catalog.lua" }) do
+        local gh = io.open(P(rel), "r")
+        ck(gh ~= nil, rel .. " is committed alongside the file it writes")
+        if gh then
+            local gs = gh:read("*a"); gh:close()
+            ck(gs:find('loadfile%(HERE') ~= nil or gs:find("gen%-shared%.lua") ~= nil,
+               rel .. " routes through the shared, ceilinged core")
+            ck(gs:find("Shared%.each") ~= nil, "…and walks its inputs through the bounded each()")
+        end
+    end
+    local gc = io.open(P("dev/gen-catalog.lua"), "r")
+    if gc then
+        local cs = gc:read("*a"); gc:close()
+        ck(cs:find('P%("catalog%.lua"%)') ~= nil, "gen-catalog.lua writes catalog.lua itself")
+        ck(cs:find("Scan%.IsInternalName") ~= nil,
+           "…applying the SHIPPED denylist at generation time, so the two cannot drift")
+        ck(cs:find("%[%^\\r\\n%]%+") ~= nil,
+           "…and reads its own output back CRLF-safely, the way the addon will")
     end
 end)
 

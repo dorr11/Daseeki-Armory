@@ -25,14 +25,27 @@
                   knowledge only) — supported, but it drops ~260 real locks, so it
                   is for emergencies, not for a release.
 
+    THE READING CODE IS SHARED (1.3.1). The guards, the legacy cache codec and the
+    three loaders now live in dev/gen-shared.lua, because dev/gen-catalog.lua
+    builds the item catalog from the very same SavedVariables and the two files
+    must not be able to drift about what that file says.
+
     THE THREE SOURCES, in precedence order (higher wins; disagreements are logged):
 
       a) EVIDENCE   the scan cache's captured locks. A tooltip that rendered
                     "Classes: Rogue" is the client telling us the truth about its
                     own item. Highest confidence.
-      b) SEED       Addon.ItemClassMask in the bundled itemDB.lua (AtlasLoot-
-                    derived). Covers the Tier-3 band the owner's client never
-                    loaded, which is the exact hole that started this saga.
+      b) SEED       Addon.ItemClassMask in dev/itemDB-seed.lua (AtlasLoot-derived).
+                    Covers the Tier-3 band the owner's client never loaded, which
+                    is the exact hole that started this saga.
+
+                    THAT FILE IS NO LONGER SHIPPED. It was itemDB.lua in the addon
+                    root, where it seeded the goal picker's names; catalog.lua
+                    superseded it there in 1.3.1 and it moved here. It stays in the
+                    repo — rather than being recoverable from git history — because
+                    it is still the only source for those Tier-3 masks, and a
+                    regeneration path that begins "first go archaeology in the log"
+                    is not a regeneration path.
       c) STATIC     knowledge written down here: the Naxxramas Tier-3 sets
                     (cross-checked against b, see T3_SETS) and the four Atiesh
                     variants, which no source in this repo can distinguish because
@@ -50,43 +63,16 @@
 --]]
 
 ----------------------------------------------------------------------
--- Guards
+-- Guards, paths and the shared readers (see dev/gen-shared.lua)
 ----------------------------------------------------------------------
-local MEM_CEILING_KB = 300 * 1024
-local ITER_CEILING   = 250000
+local HERE_DIR = ((arg[0] or "gen-restrictions.lua"):gsub("\\", "/")):match("^(.*)/[^/]+$") or "."
+local Shared = assert(loadfile(HERE_DIR .. "/gen-shared.lua"))()
 
-local function guard(what)
-    if collectgarbage("count") > MEM_CEILING_KB then
-        io.stderr:write(("ABORT: %s exceeded the 300 MB memory ceiling\n"):format(what))
-        os.exit(3)
-    end
-end
+local guard, each = Shared.guard, Shared.each
+local ITER_CEILING = Shared.ITER_CEILING
 
--- A bounded pairs(): raises rather than spinning if the input is pathological.
-local function each(t, what, fn)
-    local n = 0
-    for k, v in pairs(t or {}) do
-        n = n + 1
-        if n > ITER_CEILING then
-            io.stderr:write(("ABORT: %s exceeded %d iterations\n"):format(what, ITER_CEILING))
-            os.exit(3)
-        end
-        fn(k, v)
-    end
-    guard(what)
-    return n
-end
-
-----------------------------------------------------------------------
--- Paths
-----------------------------------------------------------------------
-local function slash(p) return (tostring(p):gsub("\\", "/")) end
-local HERE = slash(arg[0]):match("^(.*)/[^/]+$") or "."
-local REPO = slash(arg[1] or (HERE .. "/.."))
-local SV   = arg[2] or
-    [[C:\Program Files (x86)\World of Warcraft\_classic_era_\WTF\Account\309992577#1\SavedVariables\Daseeki-Armory.lua]]
-
-local function P(rel) return REPO .. "/" .. rel end
+local _, REPO, P = Shared.Locate(arg)
+local SV = arg[2] or Shared.DEFAULT_SV
 
 ----------------------------------------------------------------------
 -- The model (kept in step with Scan.CLASS_BIT in itemScan.lua)
@@ -131,18 +117,9 @@ local function isNoOpMask(mask)
     return true
 end
 
-----------------------------------------------------------------------
--- The cache codec, as itemScan.lua wrote it (legacy meta layout).
---   quality 4 bits | classMask 12 bits | faction 2 bits | internal | unread
-----------------------------------------------------------------------
-local function unpackMeta(n)
-    n = math.floor(tonumber(n) or 0); if n < 0 then n = 0 end
-    return n % 16,                        -- quality
-           math.floor(n / 16) % 4096,     -- classMask
-           math.floor(n / 65536) % 4,     -- faction
-           math.floor(n / 262144) % 2 == 1,   -- internal
-           math.floor(n / 524288) % 2 == 1    -- unread
-end
+-- The cache codec, as itemScan.lua wrote it (legacy meta layout), now shared with
+-- dev/gen-catalog.lua so the two generators read one word the same way.
+local unpackMeta = Shared.unpackMeta
 
 ----------------------------------------------------------------------
 -- (c) STATIC KNOWLEDGE
@@ -247,6 +224,39 @@ local UNOBTAINABLE = {
     -- is hidden on the decay, not on the history — the one row here that would
     -- survive even if the Anniversary reasoning were applied to it.
     { 22736, "Andonisus, Reaper of Souls" },
+
+    -- ── GM / developer records ───────────────────────────────────────────────
+    -- OWNER DECISION 2026-08-05, verbatim: "yes hide the gm items".
+    --
+    -- Seven items named after Blizzard staff and carried by the client as
+    -- ARTIFACT quality (6). They are the game-master toolkit — never itemised
+    -- into any loot table, on any realm, in any event — so they are unobtainable
+    -- by exactly the same standard as the Warglaives, and "Show unusable" does
+    -- not reveal them for exactly the same reason: there is no character
+    -- anywhere that can get one.
+    --
+    -- EVERY ID WAS CHECKED AGAINST THE EVIDENCE BEFORE IT WAS WRITTEN DOWN, not
+    -- taken on trust. All seven resolve in the owner's account-1 cache under the
+    -- exact name given here, all seven at quality 6, and none of them is already
+    -- caught by the denylist. The near neighbours are what make an id list the
+    -- only safe mechanism: "Relic Stone of Piety" (3789, Common) and "Stone of
+    -- the Earth" (11786, Rare) are real, ordinary gear, so any name-prefix rule
+    -- on "Stone of" would have hidden two items players can actually wear.
+    --
+    -- WHAT THIS COMPLETES. Quality 6 holds exactly 13 records in this client:
+    -- three the denylist already condemns as test gear ("Tigole's Boomstick
+    -- (TEST)", "Deprecated Unholy Avenger", "Ring of Uber Resists (TEST)"),
+    -- the three Warglaives above, and these seven. With this list the artifact
+    -- band is fully accounted for and NO artifact-quality row is offerable —
+    -- which is the correct end state, since Classic Era ships no obtainable
+    -- artifact at all. The harness pins that as a whole-band assertion.
+    { 6698,  "Stone of Pierce",         "GM/developer records, never player-obtainable" },
+    { 6707,  "Stone of Lapidis",        "GM/developer records, never player-obtainable" },
+    { 6708,  "Stone of Goodman",        "GM/developer records, never player-obtainable" },
+    { 6711,  "Stone of Kurtz",          "GM/developer records, never player-obtainable" },
+    { 6724,  "Stone of Backus",         "GM/developer records, never player-obtainable" },
+    { 6728,  "Stone of Brownell",       "GM/developer records, never player-obtainable" },
+    { 12947, "Alex's Ring of Audacity", "GM/developer records, never player-obtainable" },
 }
 
 ----------------------------------------------------------------------
@@ -261,41 +271,15 @@ end
 
 say("gen-restrictions: repo = %s", REPO)
 
--- (b) the bundled seed
-local seedAddon = {}
-do
-    local fn, err = loadfile(P("itemDB.lua"))
-    if not fn then
-        io.stderr:write("ABORT: cannot compile itemDB.lua -> " .. tostring(err) .. "\n")
-        os.exit(2)
-    end
-    fn("Daseeki-Armory", seedAddon)
-end
+-- (b) the AtlasLoot-derived seed, kept in dev/ as a generator input
+local seedAddon = Shared.LoadSeed(P)
 local SEED_MASK = seedAddon.ItemClassMask or {}
 local SEED_NAME = seedAddon.ItemNameDB or {}
 
--- (a) the evidence cache
-local cache
-if SV ~= "-" then
-    local fn, err = loadfile(SV)
-    if not fn then
-        io.stderr:write("ABORT: cannot read the scan SavedVariables -> " .. tostring(err) .. "\n")
-        io.stderr:write("       pass its path as argument 2, or '-' to build without evidence.\n")
-        os.exit(2)
-    end
-    local env = {}
-    setfenv(fn, env)
-    local ok, rerr = pcall(fn)
-    if not ok then
-        io.stderr:write("ABORT: the SavedVariables file raised -> " .. tostring(rerr) .. "\n")
-        os.exit(2)
-    end
-    cache = env.DaseekiArmoryScanDB
-    if type(cache) ~= "table" or type(cache.names) ~= "table" then
-        io.stderr:write("ABORT: that file holds no DaseekiArmoryScanDB with a names table\n")
-        os.exit(2)
-    end
-end
+-- (a) the evidence cache. The floor is the same one gen-catalog.lua enforces: a
+-- cache that has lost most of its rows is a wiped or half-written file, and it
+-- must not be allowed to quietly generate a shipped table with holes in it.
+local cache = Shared.LoadScanCache(SV, 8000)
 
 ----------------------------------------------------------------------
 -- Build
@@ -449,6 +433,39 @@ say("(c) static — Atiesh: %d of 4 ids added (%s)", atieshAdded,
     "id->class is static knowledge; see the note in the generated file")
 
 ----------------------------------------------------------------------
+-- THE POLICY LIST IS CHECKED AGAINST THE EVIDENCE, not taken on trust.
+--
+-- UNOBTAINABLE is hand-written, and a hand-written id is a typo away from hiding
+-- the wrong item — silently, because a hidden row looks exactly like a row that
+-- was never there. So every entry is resolved against the cache and any
+-- disagreement between the name written here and the name the client reports is
+-- FLAGGED rather than guessed at. (An id the cache does not carry is reported and
+-- kept: the list also covers records this particular client may not hold.)
+----------------------------------------------------------------------
+local unobtMismatch, unobtUnknown = {}, {}
+for _, row in ipairs(UNOBTAINABLE) do
+    local id, expect = row[1], row[2]
+    local actual = cache and cache.names and cache.names[id]
+    if not actual then
+        unobtUnknown[#unobtUnknown + 1] = string.format("id %d (%s) — not in this cache", id, expect)
+    elseif actual ~= expect then
+        unobtMismatch[#unobtMismatch + 1] = string.format(
+            "id %d: the list says %q, the client says %q", id, expect, actual)
+    end
+end
+if #unobtMismatch > 0 then
+    io.stderr:write(("ABORT: %d hidden-list entr%s disagree with the client's own name:\n")
+        :format(#unobtMismatch, #unobtMismatch == 1 and "y" or "ies"))
+    for _, m in ipairs(unobtMismatch) do io.stderr:write("    " .. m .. "\n") end
+    io.stderr:write("       Fix the id or the name in UNOBTAINABLE. Do not guess.\n")
+    os.exit(2)
+end
+say("hidden list: %d entries, every id resolved against the client's own name%s",
+    #UNOBTAINABLE,
+    #unobtUnknown > 0 and (", " .. #unobtUnknown .. " not present in this cache") or ".")
+for _, m in ipairs(unobtUnknown) do say("    " .. m) end
+
+----------------------------------------------------------------------
 -- Report the cross-source findings
 ----------------------------------------------------------------------
 if #disagreements > 0 then
@@ -546,10 +563,13 @@ section("(a) EVIDENCE — locks a real client read off its own tooltips", bySrc.
     .. "Highest confidence: the client rendered the line, we recorded what it said.")
 for _, id in ipairs(bySrc.evidence) do w(lineFor(id)) end
 w("")
-section("(b) SEED — Addon.ItemClassMask from the bundled itemDB.lua", bySrc.seed,
+section("(b) SEED — Addon.ItemClassMask from dev/itemDB-seed.lua", bySrc.seed,
     "AtlasLoot-derived, and it speaks only for ids the evidence never captured.\n"
     .. "This is where the whole Naxxramas Tier-3 band comes from: the owner's client\n"
-    .. "never had those items loaded, so no tooltip of his ever named their class.")
+    .. "never had those items loaded, so no tooltip of his ever named their class.\n"
+    .. "That seed is a GENERATOR INPUT now, not a shipped file: catalog.lua replaced\n"
+    .. "it as the picker's name source in 1.3.1, but it is still the only place these\n"
+    .. "masks exist, so it lives on in dev/ for the next regeneration.")
 for _, id in ipairs(bySrc.seed) do w(lineFor(id)) end
 w("")
 section("(c) STATIC — knowledge no local source can supply", bySrc.static,
@@ -572,12 +592,20 @@ w("-- unusable item: \"Show unusable\" is about gear a DIFFERENT character could
 w("-- wear, and there is no such character for these.")
 w("--")
 w("-- THIS IS A POLICY LIST, NOT A DERIVED FACT. Deleting a line puts the item")
-w("-- straight back into the picker — no code change, no rescan, no migration.")
+w("-- straight back into the picker — no code change, no regeneration of the")
+w("-- catalog, no migration. Which is exactly why the catalog does NOT bake these")
+w("-- ids out: they are shipped, and then hidden by policy, so the policy stays")
+w("-- one line away from being reversed.")
+w("--")
+w("-- EVERY ID HERE WAS RESOLVED AGAINST THE CLIENT'S OWN NAME at generation time;")
+w("-- the generator refuses to write this file if any row disagrees.")
 w("-- ═══════════════════════════════════════════════════════════════════════════")
 w("Addon.StaticUnobtainable = {")
 for _, row in ipairs(UNOBTAINABLE) do
+    local tag = row[2]
+    if row[3] then tag = tag .. "  [" .. row[3] .. "]" end
     w(string.format("[%d]=true,%s-- %s", row[1],
-        string.rep(" ", math.max(1, 22 - #string.format("[%d]=true,", row[1]))), row[2]))
+        string.rep(" ", math.max(1, 22 - #string.format("[%d]=true,", row[1]))), tag))
 end
 w("}")
 w("")
