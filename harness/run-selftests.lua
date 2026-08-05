@@ -3122,6 +3122,42 @@ suite("static-restrictions-shipped", function(ck)
                     "", oneHand, viewer("WARRIOR")) == true,
        "…so it is still offered")
 
+    -- ── 4b. THE TWO ASHBRINGERS — one policy line apart ─────────────────────
+    -- OWNER DECISION 2026-08-04: "only corrupted ashbringer stays". 13262 never
+    -- reached a live Era loot table; 22691 is a genuine Naxxramas drop and a
+    -- legitimate goal item. Both are two-handed swords (weapon subclass 8) and
+    -- a warrior is proficient with those, so proficiency separates neither of
+    -- them — the unobtainable list is the ONLY thing that can tell them apart.
+    -- The real names, so the by-name search checks below are not passing on an
+    -- empty string: a name search that never had the word to find proves nothing.
+    -- Lower-cased because that is what an index entry carries (goalPicker builds
+    -- rows with name = name:lower(), against a NormalizeQuery'd query).
+    local ASH_NAME = { [13262] = "ashbringer", [22691] = "corrupted ashbringer" }
+    local function ashRow(id)
+        return { id = id, equipLoc = "INVTYPE_2HWEAPON", name = ASH_NAME[id],
+                 classID = Scan.ITEM_CLASS_WEAPON, subclassID = 8 }
+    end
+    ck(Scan.PROF.WARRIOR.weapon[8] == true and Scan.PROF.PALADIN.weapon[8] == true,
+       "a warrior and a paladin both wield two-handed swords, so proficiency hides neither Ashbringer")
+    ck(un[13262] == true and Scan.IsUnobtainable(13262) == true,
+       "Ashbringer (13262) is on the unobtainable-by-history list")
+    ck(Scan.Matches(ashRow(13262), "", twoHand, viewer("WARRIOR")) == false,
+       "…so it is not offered as a goal to a warrior")
+    ck(Scan.Matches(ashRow(13262), "", twoHand, viewer("PALADIN")) == false,
+       "…nor to a paladin, the class the story attaches it to")
+    ck(Scan.Matches(ashRow(13262), "", twoHand, viewer("WARRIOR", nil, true)) == false,
+       "…and 'Show unusable' does NOT reveal it: no character anywhere can obtain one")
+    ck(Scan.Matches(ashRow(13262), "ashbringer", twoHand, viewer("PALADIN", nil, true)) == false,
+       "…searching for it by name does not bring it back either")
+    ck(un[22691] == nil and Scan.IsUnobtainable(22691) == false,
+       "CORRUPTED ASHBRINGER (22691) IS NOT ON THE LIST — a real Naxxramas drop stays a goal")
+    ck(SR[22691] == nil,
+       "…and it carries no class lock in the shipped table, so nothing else hides it")
+    ck(Scan.Matches(ashRow(22691), "", twoHand, viewer("WARRIOR")) == true,
+       "…it is offered to a warrior")
+    ck(Scan.Matches(ashRow(22691), "ashbringer", twoHand, viewer("PALADIN")) == true,
+       "…and a paladin searching 'ashbringer' is shown the one he can actually chase")
+
     -- ── 5. THE SCAN → PICKER SEAM (the push that survived the deletion) ─────
     local sh = io.open(P("itemScan.lua"), "r")
     ck(sh ~= nil, "itemScan.lua is readable")

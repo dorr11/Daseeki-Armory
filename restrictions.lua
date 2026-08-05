@@ -972,7 +972,7 @@ Addon.StaticRestrictions = {
 }
 
 -- ═══════════════════════════════════════════════════════════════════════════
--- UNOBTAINABLE BY HISTORY  (7 entries)
+-- UNOBTAINABLE BY HISTORY  (8 entries)
 --
 -- Real records in the client for items no player can acquire on a live Era
 -- realm — never itemised into a loot table, or removed before the game froze.
@@ -984,6 +984,7 @@ Addon.StaticRestrictions = {
 -- straight back into the picker — no code change, no rescan, no migration.
 -- ═══════════════════════════════════════════════════════════════════════════
 Addon.StaticUnobtainable = {
+[13262]=true,         -- Ashbringer
 [18582]=true,         -- The Twin Blades of Azzinoth
 [18583]=true,         -- Warglaive of Azzinoth (Right)
 [18584]=true,         -- Warglaive of Azzinoth (Left)
@@ -993,4 +994,4 @@ Addon.StaticUnobtainable = {
 [23054]=true,         -- Gressil, Dawn of Ruin
 }
 
--- Entry count at generation time: 910 restrictions, 7 unobtainable.
+-- Entry count at generation time: 910 restrictions, 8 unobtainable.

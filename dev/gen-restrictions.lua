@@ -198,6 +198,12 @@ local ATIESH = {
 -- HIDING. Deleting a line here puts an item straight back in the picker with no
 -- code change and no rescan, which is why it is data.
 local UNOBTAINABLE = {
+    -- OWNER DECISION 2026-08-04, verbatim: "only corrupted ashbringer stays".
+    -- The original Ashbringer never reached a live Era loot table; the client
+    -- carries the record and nothing else. Its sibling 22691 Corrupted
+    -- Ashbringer is a genuine Naxxramas drop and a legitimate goal, so it is
+    -- DELIBERATELY ABSENT from this list and stays offerable.
+    { 13262, "Ashbringer" },
     { 18582, "The Twin Blades of Azzinoth" },
     { 18583, "Warglaive of Azzinoth (Right)" },
     { 18584, "Warglaive of Azzinoth (Left)" },
