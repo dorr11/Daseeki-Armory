@@ -4,30 +4,45 @@
 
 ### Fixed
 
-- **Opening the Goal picker starts the restriction repair again — and when it will not,
-  it tells you why.** The repair pass is meant to run when you open the picker and there
-  are class locks still unread. It was allowed exactly one attempt per session, and that
-  attempt was counted the moment a pass *started* — never mind whether the pass achieved
-  anything. So on a session where the pass ran and the game returned no item data for any
-  of the rows — it re-read 9,240 items, captured nothing, and reported "0 locked, 9,240
-  unreadable" — the door was then bolted for the rest of that session. Every later picker
-  open did nothing at all: no pass, no message, no change, while `/darmory scanstatus`
-  went on saying *a repair pass is still owed*. Two true statements with nothing joining
-  them, and no way in from either end.
+- **Class and faction locks are now built into Armory, and the machinery that tried to
+  work them out on your machine is gone.** *Classes: Rogue* on Bonescythe is a fact about
+  a game that stopped changing years ago — but Armory was working it out fresh on every
+  account, by asking the game for each item's tooltip while it scanned. That question is
+  answered differently depending on whether your client happens to be holding the item at
+  that moment, so the answer was never dependable, and four rounds of increasingly
+  elaborate scaffolding were built to make it so: retries, then a check on whether the
+  item had really loaded, then a background repair pass, then stamps and per-session
+  locks governing when that pass was allowed to run. They got in each other's way. All
+  eight Tier 3 sets were *still* unlocked in a real cache, so rogue-only Bonescythe sat
+  in a warrior's list, four copies of Atiesh sat there with it, and opening the picker to
+  fix it could answer with nothing at all while `/darmory scanstatus` insisted a repair
+  was owed.
 
-  The attempt is now measured against the **debt** rather than against the attempt. A
-  pass that pays some of it off lets the next picker open run another, so the cache is
-  paid down across opens instead of being abandoned after one try. A pass that pays
-  nothing off does not silently re-run — but it says so, once, in chat, naming the reason
-  and the remedy, and `/darmory scanstatus` grows a **`repair blocked:`** line that is
-  still there three minutes later when you go looking. Every other way the repair can
-  decline now speaks the same way: a scan already running, an account with no completed
-  scan yet, or a cache whose tally of unread rows disagrees with the rows themselves —
-  which is reconciled on the spot rather than left to invite the repair in and turn it
-  away for ever.
+  Armory now **ships** the locks — 910 items' worth, built from a completed scan of a
+  real Era client, the bundled item table, and the Naxxramas sets and Atiesh variants by
+  name. The picker looks the item up and that is the whole mechanism. Nothing is read
+  from a tooltip, nothing is retried, nothing is repaired, nothing is owed, and every
+  account on every character sees exactly the same answer the moment the picker opens.
 
-  A repair that finishes without capturing a single lock now also says so where you can
-  see it, instead of leaving "0 locked" to be read as success.
+  **There is nothing to do and nothing to wait for.** Your existing cache is kept as it
+  is — no rescan, no repair pass, no minute of background traffic, no chat message. The
+  next time you open the Goal picker, Tier 3 and Atiesh are simply not in your warrior's
+  list. `/darmory scanstatus` is shorter by four lines for the same reason: with no
+  capture there is nothing to report about one, and it now just says how many locks this
+  build carries.
+
+  If an item ever turns out to be missing a lock, that is now a gap in a list that ships
+  with the addon — the same gap for everyone, fixed in the next update — rather than
+  something that went wrong on your account and has to heal itself there.
+
+- **Items that can no longer be obtained by anyone are out of the picker.** The Warglaives
+  of Azzinoth, *The Twin Blades of Azzinoth*, *Andonisus, Reaper of Souls*, *Gressil, Dawn
+  of Ruin*, *Iblis, Blade of the Fallen Seraph* and *Neretzek, The Blood Drinker* are real
+  records in your client, which is why the previous release deliberately left them in —
+  but no character on a live realm can get one, so they are not goals. They are hidden the
+  same way Blizzard's own placeholders are: **Show unusable** does not bring them back,
+  because there is no character anywhere for whom they are merely unusable. This is a
+  plain list inside the addon, so it can be changed or emptied without a rescan.
 
 - **The Goal picker no longer offers items from other expansions.** Armory ships a
   bundled name list so the picker works before your first scan finishes. That list came
@@ -47,29 +62,14 @@
   Atiesh and the rest of Naxxramas are in your client, so they are in your scan, so they
   stay.
 
-  One thing this deliberately does **not** do: items that exist in your client but can no
-  longer be obtained — the Warglaives of Azzinoth, *Andonisus*, *Gressil* — are still
-  listed. They are real entries in this client's data, and Armory does not keep a
-  hand-written list of what Blizzard has retired.
-
-- **A class lock that has just been repaired now reaches the picker you have open.**
-  Armory re-reads missing class restrictions in the background the first time you open
-  the picker (see below). When that pass finished, it updated the cache correctly — and
-  then nothing told the list on your screen. So four copies of Atiesh, and every Tier 3
-  set, stayed in a warrior's list until the picker was closed and reopened. The repair
-  now refreshes an open picker the moment it finishes, in place, without losing your
-  place in the list.
-
-  Two smaller faults in the same path went with it: the repair could burn its
-  once-per-session attempt (and announce itself in chat) on a pass that had not actually
-  started, and an item whose tooltip refused to build had all three of its retries used
-  up inside a single frame — so it was written off as unreadable without ever being given
-  time to load. Retries now wait for a later moment and ask the game for the item first.
+  One thing this rule cannot reach: items that exist in your client but can no longer be
+  obtained by anyone. Your client genuinely has them, so a census of your client keeps
+  them. They are removed by the retired-items list above instead.
 
 - **Scrolling the Goal picker no longer jumps back to the top.** Any background refresh —
-  item names arriving from the server, the restriction repair finishing — rebuilt the
-  list and sent you back to row one. During the repair pass those refreshes arrive
-  continuously, which made the list effectively unscrollable. Your position is now kept
+  item names arriving from the server, a scan finishing — rebuilt the list and sent you
+  back to row one. Those refreshes arrive continuously while names are streaming in,
+  which made the list effectively unscrollable. Your position is now kept
   across every refresh you did not ask for, and adjusts if the list gets shorter under
   you. Typing in the search box, toggling **Show unusable**, or opening the picker still
   starts at the top, as they should.
@@ -82,61 +82,6 @@
   What you saw was a single uncoloured line that changed as you scrolled, with the items
   really there but never drawn. The list now fills all twelve rows, every row is tinted
   by rarity (grey through orange), and the count line updates again.
-
-- **Rogue-only Tier 3 no longer offers itself to your warrior.** The picker hides gear
-  your class can never wear, and it reads that restriction off each item's tooltip while
-  it scans. When a tooltip did not build in time, 1.3.0 recorded "this item has no class
-  restriction" — the same thing it records for an item that genuinely has none. In a real
-  cache that silently erased the class lock from all eight Tier 3 armour sets, so
-  Bonescythe (rogue leather) sat in a warrior's list. Armory now knows the difference
-  between *read nothing* and *nothing to read*: it retries the item during the scan, and
-  marks anything still unreadable so it can come back to it.
-
-  **This repairs itself without a rescan.** The first time you open the Goal picker after
-  updating, Armory re-reads the class and faction locks for the affected items in the
-  background — names, rarities and everything else in your cache are left alone, and you
-  can keep using the picker while it runs. It happens once.
-
-- **…and that repair re-arms itself for the caches an earlier build skipped in silence.**
-  A first cut of the repair pass could tick every item off its own to-do list without
-  writing back the class locks it was supposed to read, leaving a cache that reports
-  nothing owed and would never be repaired again. Updating re-queues those caches once,
-  so the pass runs on the fixed code; a scan that completed on this version is left alone.
-
-- **…and a failed re-read can no longer take a class lock down with it.** If an item's
-  tooltip refused to build while that pass was re-reading it, Armory wrote the empty
-  result over the lock it already held — so a moment's bad luck during a repair undid a
-  restriction it had read correctly the first time. A read that came back with nothing
-  now keeps whatever the item already had and simply asks to look again later.
-
-- **…and, finally, the repair now waits for the item before deciding it is unrestricted.**
-  This is the root of the whole family of faults above, and it took the repair's own
-  report to expose it. That pass re-read all 9,240 items in a real cache and came back
-  with *one* more class lock than it started with, and not a single item it could not
-  read — which is not what re-reading nine thousand tooltips looks like. What was
-  happening: when Armory asks the game for an item it does not currently hold, the game
-  hands back a **partial** tooltip. The item's name is there, because Armory itself
-  asked for it earlier — but the "Classes: Rogue" line is not, because the data behind it
-  has not arrived. Armory checked that a tooltip had appeared, saw no class line on it,
-  and wrote down "this item has no class restriction". For nearly every item that was
-  not already loaded.
-
-  That is why the fix has taken three goes: each round repaired the machinery around a
-  read that was itself unreliable. Armory now asks the game a second question — *is this
-  item actually loaded?* — and only believes "no restrictions" when the answer is yes. A
-  restriction it *does* find is believed either way, because that line could not have
-  been drawn out of nothing. Anything not yet loaded is requested and revisited later in
-  the same pass, up to ten times spread across it, so a busy realm has minutes rather
-  than milliseconds to answer; anything still unanswered keeps whatever it already knew
-  and is left for a later session.
-
-  **Your cache re-arms once more and repairs itself, without a rescan.** The next time
-  you open the Goal picker after updating, the pass runs again under the new rule. Expect
-  it to take **about a minute or two** — it asks the server no faster than it did before —
-  and expect the class-locked count in `/darmory scanstatus` to rise by roughly a
-  hundred: the Tier 3 sets, the four Atieshes, the class relics and the rest of what was
-  read while cold. Nothing you can already see is lost while it runs.
-
 - **The picker no longer shows an item under the wrong name.** Armory merges your
   client's own scan with a bundled name list, the client always winning. Dropping an
   entry as a Blizzard placeholder used to release its id back to the bundled list, which
@@ -180,13 +125,11 @@
 ### New
 
 - **`/darmory scanstatus` tells you what the item scan knows, whenever you ask.** The
-  scan and the restriction repair each say their piece in chat once and then scroll away,
-  which is no help an hour later. This prints the state instead of asking you to have
-  witnessed it: how many items are cached and how many of those are hidden internal
-  records, how many carry a class or faction lock, how many still need re-reading,
-  whether a scan or repair is running right now and how far through it is, when the last
-  full scan and the last repair ran, and what the last repair achieved — how many items
-  it locked and how many it still could not read.
+  scan says its piece in chat once and then scrolls away, which is no help an hour later.
+  This prints the state instead of asking you to have witnessed it: how many items are
+  cached and how many of those are hidden internal records, how many class and faction
+  locks this build ships and how many items it hides as no-longer-obtainable, whether a
+  scan is running right now and how far through it is, and when the last full scan ran.
 
 ### Unchanged, and deliberately so
 

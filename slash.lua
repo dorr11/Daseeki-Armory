@@ -10,11 +10,11 @@
     `stats` exists so the attach setting stays reachable when Daseeki-Core is absent
     (the options hub needs Core; this command does not).
 
-    `scanstatus` exists because the scan and the restriction-repair pass announce
-    themselves in chat exactly once and then scroll away. "Is it still running?",
-    "did the repair read anything?" and "how many rows are still unread?" are
-    questions with real answers sitting in the cache, so they are queryable rather
-    than something the owner has to have witnessed. The lines come from
+    `scanstatus` exists because the scan announces itself in chat exactly once and
+    then scrolls away. "Is it still running?", "how many items did it find?" and
+    "how many class locks does this build ship?" are questions with real answers
+    sitting in the cache and in restrictions.lua, so they are queryable rather than
+    something the owner has to have witnessed. The lines come from
     Scan.StatusReport, which is pure and harness-gated.
 --]]
 

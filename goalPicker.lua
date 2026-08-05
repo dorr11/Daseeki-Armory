@@ -1,14 +1,13 @@
 --[[
     Daseeki Armory — goal item picker (search any item by name).
 
-    A themed search list of items that fit a given slot. Three sources are merged,
-    highest-confidence first:
+    A themed search list of items that fit a given slot. Three NAME sources are
+    merged, highest-confidence first:
 
-      1. the SCANNED cache (itemScan.lua / DaseekiArmoryScanDB) — real client names,
-         real qualities, and the class/faction locks read off each item's tooltip;
+      1. the SCANNED cache (itemScan.lua / DaseekiArmoryScanDB) — real client names
+         and real qualities;
       2. the bundled AtlasLoot-derived name table (itemDB.lua) as the seed/fallback
-         ONLY WHILE NO SCAN HAS COMPLETED, with itemDB's ItemClassMask as its lock
-         source (see SEED RETIREMENT below);
+         ONLY WHILE NO SCAN HAS COMPLETED (see SEED RETIREMENT below);
       3. the vanilla PvP rank-set ids (pvpItems.lua), whose names only exist at runtime.
 
     Icons and equip locations always come from GetItemInfoInstant (synchronous,
@@ -19,15 +18,23 @@
     for an item the client has not loaded, so unresolved rows request a load and are
     re-tinted when it arrives.
 
+    CLASS AND FACTION LOCKS ARE NOT A SOURCE HERE ANY MORE (1.3.1). They come from
+    restrictions.lua — shipped data, identical on every account — and the row
+    predicate looks them up by item id (Scan.RowVerdict). No entry in this index
+    carries a copy of a lock, so no entry can hold a stale one, and there is nothing
+    to repair, re-read or refresh when the picker opens.
+
     Rows the viewing character can NEVER equip — wrong class lock, wrong faction, wrong
     armor/weapon proficiency — are hidden by default; "Show unusable" in the footer
     turns the filter off for edge cases.
 
     Rows that are not ITEMS at all — Blizzard's placeholders, creature-equipment art,
     designer test gear, retired duplicates, enchantment-effect names — never enter the
-    index (Scan.IsInternalName / the cached internal flag). "Show unusable" does NOT
-    bring them back: they are not unusable, they are not real, and no character
-    anywhere can obtain one.
+    index (Scan.IsInternalName / the cached internal flag). Items that ARE real but
+    that no player can obtain on a live realm (Addon.StaticUnobtainable) are dropped
+    by the row predicate. "Show unusable" does NOT bring either kind back: they are
+    not unusable, they are unobtainable by everyone, and no character anywhere can
+    get one.
 
     SOURCE PRECEDENCE IS ABSOLUTE (1.3.1). Any id the SCAN covered is settled by the
     scan, whatever it decided — kept, dropped as internal, or rejected for its equip
@@ -51,19 +58,14 @@
 
     NOTE what seed retirement does NOT do: ids 18582-18584 (The Twin Blades of
     Azzinoth, both Warglaives), 22736 (Andonisus) and 23054 (Gressil) ARE in this
-    client's item space and the scan finds them, so they stay. They are unobtainable
-    by history, not by client data, and this addon does not keep a hand-written list
-    of what Blizzard has retired.
-
-    The class/faction locks the scan could not read are re-read lazily the first time
-    the picker opens in a session (Addon:MaybeRepairRestrictions) — a throttled pass
-    over only the flagged rows, no rescan, no id walk. When that pass finishes it
-    calls Addon:RefreshGoalPicker, so a repaired class lock reaches an OPEN picker
-    immediately instead of waiting for the next time it is opened.
+    client's item space and the scan finds them. Those are unobtainable by HISTORY,
+    not by client data, so seed retirement cannot see them — they are removed by
+    Addon.StaticUnobtainable in restrictions.lua instead, which IS the hand-written
+    list of what Blizzard retired, kept as data a person can edit in one line.
 
     SCROLL POSITION SURVIVES A REFRESH (1.3.1). A background refresh — item names
-    streaming in, the repair pass finishing — re-filters the list under the reader.
-    It must not throw them back to the top; Rows.NextOffset keeps the current offset,
+    streaming in, a scan finishing — re-filters the list under the reader. It must
+    not throw them back to the top; Rows.NextOffset keeps the current offset,
     clamped to the new list. A refresh the READER asked for (a new query, toggling
     "Show unusable", opening the picker) does go back to the top, because row 400 of
     the previous list means nothing in the new one.
@@ -134,10 +136,10 @@ end
 --
 -- RefreshList used to be reached only through Requery, and Requery always wrote
 -- `self._offset = 0`. Every background refresh therefore yanked the reader back
--- to row 1 — and during the restriction-repair pass those refreshes arrive in a
--- stream (each visible row asks the client to load its item so it can be tinted,
--- every reply raises GET_ITEM_INFO_RECEIVED, and the debounced handler re-queried),
--- so the list was unscrollable for as long as the repair ran.
+-- to row 1 — and those refreshes arrive in a stream (each visible row asks the
+-- client to load its item so it can be tinted, every reply raises
+-- GET_ITEM_INFO_RECEIVED, and the debounced handler re-queried), so the list was
+-- unscrollable for as long as items were streaming in.
 --
 --   preserve = true   a refresh nobody asked for: keep the reader where they are,
 --                     clamped, because the list may have got shorter under them
@@ -182,12 +184,6 @@ function Addon:ItemUsableByClass(e, ctx)
     return Scan.Usable(e, ctx or Addon:ScanContext(false))
 end
 
--- Bundled class mask for a seed entry (0 = no bundled restriction known).
-local function seedClassMask(id)
-    local m = Addon.ItemClassMask and Addon.ItemClassMask[id]
-    return tonumber(m) or 0
-end
-
 -- ── SEED RETIREMENT ───────────────────────────────────────────────────────────
 -- May the bundled AtlasLoot table speak at all? Only before a scan has completed.
 --
@@ -206,16 +202,21 @@ end
 
 -- ── The merged item index ─────────────────────────────────────────────────────
 -- Entry: { id, name(lower), display, icon, equipLoc, classID, subclassID,
---          quality, classMask, faction, scanned }
+--          quality, internal, scanned }
+--
+-- NO CLASS MASK AND NO FACTION LIVE ON AN ENTRY (1.3.1). They are shipped facts
+-- keyed by item id, and the row predicate looks them up. An index that copied them
+-- would be a second place for a lock to live, which is a second place for it to be
+-- wrong — the exact failure mode the repair pass existed to paper over.
+--
 -- Rebuilt whenever the scan cache changes (stamp = completion time + item count).
 function Addon:BuildGoalItemDB()
     local cache = Addon:ItemScanCache()
     -- the denylist stamp is part of the key: growing INTERNAL_PATTERNS must rebuild
-    -- the index, not wait for the next scan. So is the restriction repair, which
-    -- changes class locks without changing a single name.
+    -- the index, not wait for the next scan. The restriction table needs no stamp:
+    -- it is shipped with the addon and cannot change while the client is running.
     local stamp = tostring(cache.scannedAt or 0) .. "/" .. tostring(cache.count or 0)
                   .. "/" .. tostring(cache.internalStamp or 0)
-                  .. "/" .. tostring(cache.restrictRepairedAt or 0)
     if Addon.GoalItemDB and Addon._goalDBStamp == stamp then return Addon.GoalItemDB end
 
     local list, settled = {}, {}
@@ -234,7 +235,7 @@ function Addon:BuildGoalItemDB()
     --
     -- itemDB.lua is an AtlasLoot-derived SNAPSHOT; where it and the client
     -- disagree about what an id is, the client wins, always.
-    local function add(id, name, quality, classMask, faction, scanned, internal)
+    local function add(id, name, quality, scanned, internal)
         if not id or settled[id] then return end
         settled[id] = true
         if type(name) ~= "string" or name == "" then return end
@@ -245,23 +246,25 @@ function Addon:BuildGoalItemDB()
         list[#list + 1] = {
             id = id, name = name:lower(), display = name, icon = icon,
             equipLoc = equipLoc, classID = classID, subclassID = subclassID,
-            quality = quality, classMask = classMask or 0,
-            faction = faction or Scan.FACTION_NONE, scanned = scanned or false,
+            quality = quality, internal = false, scanned = scanned or false,
         }
     end
 
     -- 1 — the scan (authoritative)
     for id in pairs(cache.names) do
-        local nm, q, m, f, internal = Scan.Get(cache, id)
-        add(id, nm, q, m, f, true, internal)
+        local nm, q, internal = Scan.Get(cache, id)
+        add(id, nm, q, true, internal)
     end
 
     -- 2 — the bundled seed, ONLY while the scan has not yet spoken for this client.
     -- Once it has, the cache is the whole index: see SEED RETIREMENT at the top.
+    -- It supplies NAMES only; its ItemClassMask has been folded into the shipped
+    -- restrictions.lua by dev/gen-restrictions.lua, so it is not consulted for a
+    -- lock at runtime any more.
     local seedAllowed = Addon.GoalSeedAllowed(cache)
     if seedAllowed and Addon.ItemNameDB then
         for id, nm in pairs(Addon.ItemNameDB) do
-            add(id, nm, nil, seedClassMask(id), Scan.FACTION_NONE, false)
+            add(id, nm, nil, false)
         end
     end
 
@@ -273,7 +276,7 @@ function Addon:BuildGoalItemDB()
     for _, id in ipairs(Addon.PvPItemIDs or {}) do
         if not settled[id] then
             local nm, _, q = GetItemInfo(id)
-            if nm then add(id, nm, q, seedClassMask(id), Scan.FACTION_NONE, false)
+            if nm then add(id, nm, q, false)
             else missing = missing + 1 end
         end
     end
@@ -519,9 +522,7 @@ local function ensure()
     -- progress if the owner opens the picker while it is running.
     function f:SyncScanUI()
         local scanning = Addon:IsScanning()
-        local label = (not scanning and "Rescan Items")
-                   or (Addon.IsRepairing and Addon:IsRepairing() and "Repairing…")
-                   or "Scanning…"
+        local label = scanning and "Scanning…" or "Rescan Items"
         if self.rescan.SetText then self.rescan:SetText(label) end
         if self.rescan._label then self.rescan._label:SetText(label) end
         if scanning then self.rescan:Disable() else self.rescan:Enable() end
@@ -547,9 +548,6 @@ local function ensure()
         if st.phase == "instant" then
             self.countText:SetText(string.format("Scanning item ids… %d%%  (%d equippable found)",
                 st.percent or 0, st.found or 0))
-        elseif st.phase == "repair" then
-            self.countText:SetText(string.format("Re-reading class restrictions… %d / %d  (%d%%)",
-                st.cursor or 0, st.total or 0, st.percent or 0))
         else
             self.countText:SetText(string.format("Loading items… %d / %d  (%d%%)",
                 st.cursor or 0, st.total or 0, st.percent or 0))
@@ -603,17 +601,15 @@ local function ensure()
     return f
 end
 
--- ── THE REPAIR → RE-FILTER SEAM (1.3.1) ──────────────────────────────────────
--- Called by itemScan.lua the moment a scan or a restriction-repair finishes.
+-- ── THE SCAN → RE-FILTER SEAM ────────────────────────────────────────────────
+-- Called by itemScan.lua the moment a scan finishes.
 --
--- Before this existed, the ONLY thing that re-filtered an open picker after a
--- repair was the picker's own 0.25s poll (f:SyncScanUI -> f:ScanFinished), and
--- that poll is armed only when SyncScanUI happens to be called while a scan is
--- already running. So the repair could land every class lock it read and the open
--- list would keep showing the rows it had at open time — Atiesh on a warrior, all
--- eight Tier-3 sets on everybody — until the picker was closed and reopened. The
--- fix is a push, not a poll: FinishItemScan invalidates the index and then calls
--- this, so a completed repair is visible in the frame that is already on screen.
+-- Without it the ONLY thing that re-filters an open picker is the picker's own
+-- 0.25s poll (f:SyncScanUI -> f:ScanFinished), and that poll is armed only when
+-- SyncScanUI happens to be called while a scan is already running. So a scan could
+-- finish and the open list would keep showing the rows it had at open time until
+-- the picker was closed and reopened. The fix is a push, not a poll:
+-- FinishItemScan invalidates the index and then calls this.
 --
 -- Scroll position is preserved: this refresh is not one the reader asked for.
 function Addon:RefreshGoalPicker(preserveScroll)
@@ -636,12 +632,11 @@ end
 function Addon:ShowGoalPicker(slotId, onPick)
     local f = ensure()
     Addon:WarmGoalItems()
-    -- LAZY RESTRICTION REPAIR: a cache written by the pre-1.3.1 capture cannot
-    -- say which of its rows had a readable tooltip, so the class locks it is
-    -- missing (every Tier-3 piece in the owner's cache) are re-read here, once,
-    -- for exactly the flagged rows. No wipe, no id walk, and the picker stays
-    -- usable while it runs.
-    if Addon.MaybeRepairRestrictions then Addon:MaybeRepairRestrictions() end
+    -- NOTHING HAPPENS HERE ANY MORE, and that is the release (1.3.1). Opening the
+    -- picker used to kick off a lazy restriction-repair pass — throttled server
+    -- traffic, a chat line, a session latch, a refusal reason to explain when the
+    -- latch said no. The locks are shipped data now, so opening the picker opens
+    -- the picker.
     f._onPick   = onPick
     f._slotId   = slotId
     f._validLoc = Addon.SLOT_INVTYPES[slotId] or {}

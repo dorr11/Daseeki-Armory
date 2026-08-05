@@ -1388,10 +1388,19 @@ end)
 --
 -- Like trinkets.lua and borders.lua, itemScan.lua is loaded with NO WoW API
 -- present at all, which is the property the first suite asserts.
+--
+-- restrictions.lua is loaded FIRST, into the SAME Addon table, exactly as the TOC
+-- orders it. That is deliberate: the filter reads Addon.StaticRestrictions, so a
+-- harness that stubbed the table would be testing a different program. ScanAddon
+-- is that Addon table, published so the suites can read the shipped data itself.
 ----------------------------------------------------------------------
-local Scan
+local Scan, ScanAddon
 do
     local A = {}
+    ScanAddon = A
+    local rf, rerr = loadfile(P("restrictions.lua"))
+    if rf then pcall(rf, "Daseeki-Armory", A) end
+    ScanAddon._restrictionsLoadError = (not rf) and tostring(rerr) or nil
     local fn = loadfile(P("itemScan.lua"))
     if fn then
         local ok = pcall(fn, "Daseeki-Armory", A)
@@ -1494,7 +1503,9 @@ suite("item-scan-batching", function(ck)
     ck(Scan.MAX_INFLIGHT > 0, "there is a ceiling on outstanding requests")
     ck(Scan.MAX_INFLIGHT >= Scan.REQUEST_PER_TICK,
        "the in-flight window is wider than one tick's dispatch, or the scan self-stalls")
-    ck(Scan.TOOLTIP_BUDGET > 0, "per-tick tooltip work is budgeted")
+    ck(Scan.RECORD_BUDGET > 0, "per-tick record writing is budgeted")
+    ck(Scan.TOOLTIP_BUDGET == nil and Scan.TOOLTIP_TRIES == nil and Scan.DATA_TRIES == nil,
+       "the tooltip / data-gate ceilings are gone with the machinery that needed them")
     ck(Scan.PeakRecordsPerSecond() >= Scan.PeakRequestsPerSecond(),
        "the record budget keeps up with the request rate (the queue cannot back up)")
     ck(Scan.REQUEST_TIMEOUT > 0 and Scan.MAX_TRIES >= 1,
@@ -1515,101 +1526,106 @@ suite("item-scan-batching", function(ck)
 end)
 
 ----------------------------------------------------------------------
--- Tooltip restriction parsing: the ONLY place Era exposes class and faction
--- locks. Pure over already-extracted tooltip lines.
+-- THE LOCK LOOKUP  (1.3.1)
+--
+-- Era does not return class or faction locks from GetItemInfo, which is why
+-- 1.3.0 read them off a hidden tooltip and why four generations of machinery grew
+-- around making that read trustworthy. They are shipped data now, and the whole
+-- runtime mechanism is this: pack, unpack, one table lookup.
 ----------------------------------------------------------------------
-suite("item-scan-restrictions", function(ck)
+suite("static-restrictions-codec", function(ck)
     if type(Scan) ~= "table" then ck(false, "itemScan.lua did not load"); return end
-
-    local LOC = {
-        classPrefix = "Classes: ",
-        racesPrefix = "Races: ",
-        classByName = { Warrior = "WARRIOR", Paladin = "PALADIN", Hunter = "HUNTER",
-                        Rogue = "ROGUE", Priest = "PRIEST", Shaman = "SHAMAN",
-                        Mage = "MAGE", Warlock = "WARLOCK", Druid = "DRUID" },
-        raceFaction = { Human = 1, Dwarf = 1, ["Night Elf"] = 1, Gnome = 1,
-                        Orc = 2, Undead = 2, Tauren = 2, Troll = 2 },
-        allianceLines = { Alliance = true, ["Alliance Only"] = true },
-        hordeLines    = { Horde = true, ["Horde Only"] = true },
-    }
     local B = Scan.CLASS_BIT
 
-    local function parse(...) return Scan.ParseRestrictions({ ... }, LOC) end
+    ck(ScanAddon._restrictionsLoadError == nil,
+       "restrictions.lua compiles: " .. tostring(ScanAddon._restrictionsLoadError))
+    ck(type(ScanAddon.StaticRestrictions) == "table", "…and publishes Addon.StaticRestrictions")
+    ck(type(ScanAddon.StaticUnobtainable) == "table", "…and Addon.StaticUnobtainable")
 
-    -- ── no restriction ──────────────────────────────────────────────────────
-    local m, f = parse("Binds when picked up", "Cloth", "Head", "+10 Stamina")
-    ck(m == 0, "an ordinary item has no class mask")
-    ck(f == Scan.FACTION_NONE, "...and no faction lock")
-    ck(select(1, Scan.ParseRestrictions({}, LOC)) == 0, "no lines -> unrestricted")
-    ck(select(1, Scan.ParseRestrictions(nil, LOC)) == 0, "nil lines -> unrestricted")
-    ck(select(1, Scan.ParseRestrictions({ "Classes: Mage" }, nil)) == 0,
-       "no locale context -> unrestricted (fails open, never hides)")
+    -- ── pack / unpack ───────────────────────────────────────────────────────
+    local function trip(m, f)
+        local a, b = Scan.UnpackStatic(Scan.PackStatic(m, f))
+        return a == m and b == f
+    end
+    ck(trip(0, 0), "the empty lock round-trips")
+    ck(trip(B.MAGE, Scan.FACTION_NONE), "a single-class lock round-trips")
+    ck(trip(B.DRUID + B.MAGE + B.PRIEST + B.WARLOCK, 0), "a multi-class lock round-trips")
+    ck(trip(0, Scan.FACTION_HORDE), "a bare faction lock round-trips")
+    ck(trip(B.WARRIOR, Scan.FACTION_ALLIANCE), "both axes at once round-trip")
+    ck(trip(4095, 3), "the top of every field round-trips")
+    local allOK = true
+    for _, m in ipairs({ 0, 1, 2, 4, 8, 16, 64, 128, 256, 1024, 1503, 4095 }) do
+        for f = 0, 3 do if not trip(m, f) then allOK = false end end
+    end
+    ck(allOK, "every (mask x faction) combination in play round-trips exactly")
+    ck(Scan.PackStatic(nil, nil) == 0, "nil fields pack as zero")
+    ck(select(1, Scan.UnpackStatic(nil)) == 0, "unpacking nil yields zeros")
+    ck(Scan.PackStatic(99999, 9) == Scan.PackStatic(4095, 3), "out-of-range fields clamp")
+    ck(Scan.PackStatic(-1, -1) == 0, "negative fields clamp to zero")
+    ck(Scan.STATIC_SHIFT == 4096, "the faction field starts above the 12-bit class mask")
 
-    -- ── class locks (the Atiesh case) ───────────────────────────────────────
-    m, f = parse("Binds when picked up", "Two-Hand", "Staff", "Classes: Mage")
-    ck(m == B.MAGE, "a single-class lock yields exactly that class bit")
-    ck(f == Scan.FACTION_NONE, "a class lock is not a faction lock")
-    m = parse("Classes: Druid, Mage, Priest, Warlock")
-    ck(m == B.DRUID + B.MAGE + B.PRIEST + B.WARLOCK, "a multi-class lock ORs the bits")
-    ck(Scan.HasBit(m, B.MAGE) and not Scan.HasBit(m, B.WARRIOR),
-       "...and reads back per class")
-    m = parse("Classes:Rogue")           -- no space after the colon
-    ck(m == 0, "a line that does not carry the localized prefix is ignored, not guessed")
-    m = parse("Classes: Mage, Mage")
-    ck(m == B.MAGE, "a duplicated class is counted once")
-    m = parse("Classes:  Mage ,  Priest ")
-    ck(m == B.MAGE + B.PRIEST, "surrounding whitespace on each entry is trimmed")
-    ck(m < Scan.CLASS_UNKNOWN, "a fully parsed list never sets the unknown bit")
-
-    -- ── unparseable class names fail OPEN ───────────────────────────────────
-    m = parse("Classes: Necromancer")
-    ck(Scan.HasBit(m, Scan.CLASS_UNKNOWN), "an unresolvable class name raises the unknown bit")
-    m = parse("Classes: Mage, Necromancer")
-    ck(Scan.HasBit(m, B.MAGE), "...the resolvable part is still recorded")
-    ck(Scan.HasBit(m, Scan.CLASS_UNKNOWN), "...alongside the unknown bit")
-
-    -- ── faction locks ───────────────────────────────────────────────────────
-    m, f = parse("Binds when picked up", "Alliance Only")
-    ck(f == Scan.FACTION_ALLIANCE, "an 'Alliance Only' line is an Alliance lock")
-    m, f = parse("Horde Only")
-    ck(f == Scan.FACTION_HORDE, "a 'Horde Only' line is a Horde lock")
-    m, f = parse("Horde")
-    ck(f == Scan.FACTION_HORDE, "the bare faction name also counts (FACTION_HORDE)")
-
-    -- vanilla mostly expresses faction as a full-faction RACE mask
-    m, f = parse("Races: Orc, Undead, Tauren, Troll")
-    ck(f == Scan.FACTION_HORDE, "a whole-Horde race list collapses to a Horde lock")
-    m, f = parse("Races: Human, Dwarf, Night Elf, Gnome")
-    ck(f == Scan.FACTION_ALLIANCE, "a whole-Alliance race list collapses to an Alliance lock")
-    m, f = parse("Races: Human, Orc")
-    ck(f == Scan.FACTION_NONE, "a CROSS-faction race list is not a faction lock")
-    m, f = parse("Races: Gnome")
-    ck(f == Scan.FACTION_ALLIANCE, "a single-race list still identifies its faction")
-    m, f = parse("Races: Dryad")
-    ck(f == Scan.FACTION_NONE, "an unrecognised race leaves the item unrestricted (fails open)")
-    m, f = parse("Races: ")
-    ck(f == Scan.FACTION_NONE, "an empty race list is not a lock")
-
-    -- ── both axes on one tooltip ────────────────────────────────────────────
-    m, f = parse("Binds when picked up", "Classes: Warrior", "Horde Only", "Requires level 60")
-    ck(m == B.WARRIOR and f == Scan.FACTION_HORDE, "class and faction locks coexist")
-
-    -- ── deliberately NOT filtered (coverage limit, asserted so it stays a choice) ─
-    m, f = parse("Requires Blacksmithing (300)", "Requires Argent Dawn - Exalted", "Requires Level 60")
+    -- ── the lookup, including the fail-open gap ─────────────────────────────
+    local m, f = Scan.StaticFor(22476)                    -- Bonescythe Breastplate
+    ck(m == B.ROGUE and f == Scan.FACTION_NONE, "a shipped id answers with its lock")
+    m, f = Scan.StaticFor(99999999)
     ck(m == 0 and f == Scan.FACTION_NONE,
-       "profession / reputation / level requirements are NOT restrictions — a goal can be earned")
+       "AN ABSENT ID IS UNRESTRICTED — the fail-open rule, unchanged")
+    m = Scan.StaticFor(nil)
+    ck(m == 0, "a nil id is unrestricted rather than an error")
+    m = Scan.StaticFor("22476")
+    ck(m == B.ROGUE, "a numeric-string id is coerced (SavedVariables keys are strings)")
+    ck(Scan.IsUnobtainable(nil) == false, "a nil id is not unobtainable")
+    ck(Scan.IsUnobtainable(99999999) == false, "…nor is an id nobody listed")
 
-    ck(Scan.IsRestricted({ classMask = B.MAGE }) == true, "IsRestricted sees a class lock")
-    ck(Scan.IsRestricted({ faction = Scan.FACTION_HORDE }) == true, "IsRestricted sees a faction lock")
-    ck(Scan.IsRestricted({ classMask = 0, faction = 0 }) == false, "an open item is not restricted")
-    ck(Scan.IsRestricted(nil) == false, "nil is not restricted")
+    -- ── the gap is a DATA gap, and it is silent ─────────────────────────────
+    -- The point of the release: a missing lock is now the same missing lock for
+    -- everyone, fixable by regenerating one file. Nothing about it is per-account,
+    -- and nothing anywhere reports a debt, because there is no debt to report.
+    ck(Scan.UnreadIds == nil and Scan.UnreadCount == nil,
+       "there is no 'rows still owed' surface left to consult")
+    ck(Scan.RepairGate == nil and Scan.TrustRead == nil,
+       "…and no gate deciding whether a re-read may run")
+    ck(Scan.ParseRestrictions == nil and Scan.ReadRestrictions == nil,
+       "…and no tooltip parser at all")
+    ck(Scan.CLASS_UNKNOWN == nil,
+       "…and no unknown-class bit: a table cannot fail to recognise its own tokens")
+
+    -- ── PROFICIENCY IS STILL A MECHANISM, NOT DATA ──────────────────────────
+    -- Librams / Idols / Totems are armour subclasses 7 / 8 / 9. They are not in
+    -- the shipped table, and they must not be: exactly one class is proficient
+    -- with each, numerically and locale-free.
+    local relics = { [7] = "PALADIN", [8] = "DRUID", [9] = "SHAMAN" }
+    for sub, owner in pairs(relics) do
+        local n = 0
+        for class, prof in pairs(Scan.PROF) do
+            if prof.armor[sub] then
+                n = n + 1
+                ck(class == owner,
+                   "armour subclass " .. sub .. " is " .. owner .. "'s alone (saw " .. class .. ")")
+            end
+        end
+        ck(n == 1, "…and exactly one class has it")
+    end
 end)
 
 ----------------------------------------------------------------------
--- THE FILTER PREDICATE MATRIX, plus a mutation-adequacy gate.
+-- THE FILTER RULE TABLE, one case PER RULE, plus a mutation-adequacy gate.
 --
--- The whole point of the round: "hide items the CURRENT character can never
--- equip". Every row below is a (item, viewer) pair with a stated verdict.
+-- The predicate is now an ordered rule table (Scan.RULES / Scan.RowVerdict) and
+-- the ORDER is the contract: the two "not a real item" rules sit ABOVE "Show
+-- unusable", the three restriction rules sit below it. RowVerdict returns the
+-- name of the rule that decided, so every rule is asserted by name and by verdict
+-- rather than by a verdict that could have come from anywhere.
+--
+-- EVERY LOCK HERE COMES OUT OF THE SHIPPED TABLE. The rows carry ids, not masks —
+-- that is the architecture — so these are real ids with their real, shipped locks:
+--
+--   22476  Bonescythe Breastplate   rogue-locked leather (the headline symptom)
+--   22589  Atiesh                   a caster-locked staff
+--   22416  Dreadnaught Breastplate  warrior-locked plate
+--    4964  Goblin Smasher           the one FACTION lock in the owner's evidence
+--   19019  Thunderfury              a real, obtainable, unrestricted legendary
+--   18583  Warglaive of Azzinoth    real, and unobtainable by history
 ----------------------------------------------------------------------
 suite("item-scan-filter-matrix", function(ck)
     if type(Scan) ~= "table" then ck(false, "itemScan.lua did not load"); return end
@@ -1620,161 +1636,220 @@ suite("item-scan-filter-matrix", function(ck)
         return { class = class, classBit = B[class] or 0, faction = faction or 0,
                  showUnusable = showUnusable and true or false }
     end
-    local hordeWarrior  = viewer("WARRIOR", Scan.FACTION_HORDE)
-    local allyWarrior   = viewer("WARRIOR", Scan.FACTION_ALLIANCE)
-    local hordeMage     = viewer("MAGE",    Scan.FACTION_HORDE)
-    local hordeRogue    = viewer("ROGUE",   Scan.FACTION_HORDE)
+    local hordeWarrior = viewer("WARRIOR", Scan.FACTION_HORDE)
+    local allyWarrior  = viewer("WARRIOR", Scan.FACTION_ALLIANCE)
+    local hordeMage    = viewer("MAGE",    Scan.FACTION_HORDE)
+    local hordeRogue   = viewer("ROGUE",   Scan.FACTION_HORDE)
+    local shown        = viewer("WARRIOR", Scan.FACTION_HORDE, true)
 
-    -- ── items ───────────────────────────────────────────────────────────────
-    local plainCloak  = { classID = ARMOR,  subclassID = 0, classMask = 0, faction = 0 }
-    local plateChest  = { classID = ARMOR,  subclassID = 4, classMask = 0, faction = 0 }
-    local clothRobe   = { classID = ARMOR,  subclassID = 1, classMask = 0, faction = 0 }
-    local atiesh      = { classID = WEAPON, subclassID = 10, classMask = B.MAGE, faction = 0 }
-    local warrSet     = { classID = ARMOR,  subclassID = 4, classMask = B.WARRIOR, faction = 0 }
-    local allyRank    = { classID = ARMOR,  subclassID = 4, classMask = 0, faction = Scan.FACTION_ALLIANCE }
-    local hordeRank   = { classID = ARMOR,  subclassID = 4, classMask = 0, faction = Scan.FACTION_HORDE }
-    local allyWarrSet = { classID = ARMOR,  subclassID = 4, classMask = B.WARRIOR, faction = Scan.FACTION_ALLIANCE }
-    local wand        = { classID = WEAPON, subclassID = 19, classMask = 0, faction = 0 }
-    local fuzzyClass  = { classID = ARMOR,  subclassID = 1, classMask = B.MAGE + Scan.CLASS_UNKNOWN, faction = 0 }
-    local onlyUnknown = { classID = ARMOR,  subclassID = 1, classMask = Scan.CLASS_UNKNOWN, faction = 0 }
+    -- ── rows: an id, an item class and a subclass. No masks. ────────────────
+    local function row(id, classID, subclassID, internal)
+        return { id = id, classID = classID, subclassID = subclassID, internal = internal }
+    end
+    local plainCloak  = row(19019, ARMOR,  0)      -- unrestricted, universal subclass
+    local plateChest  = row(12640, ARMOR,  4)      -- Lionheart Helm: plate, unrestricted
+    local clothRobe   = row(18486, ARMOR,  1)      -- Mooncloth Robe: cloth, unrestricted
+    local wand        = row(11287, WEAPON, 19)     -- Lesser Magic Wand: unrestricted
+    local bonescythe  = row(22476, ARMOR,  2)      -- ROGUE, leather
+    local dreadnaught = row(22416, ARMOR,  4)      -- WARRIOR, plate
+    local atieshRow   = row(22589, WEAPON, 10)     -- a caster class, staff
+    local factionRow  = row(4964,  WEAPON, 5)      -- Goblin Smasher: HORDE
+    local glaive      = row(18583, WEAPON, 7)      -- unobtainable by history
+    local placeholder = row(13794, ARMOR,  1, true)  -- "[PH] Shining Dawn Coif"
 
-    local U = Scan.Usable
+    -- the fixtures must actually carry the locks this suite is about, or every
+    -- verdict below would be vacuously true
+    ck(select(1, Scan.StaticFor(22476)) == B.ROGUE, "fixture check: 22476 is rogue-locked")
+    ck(select(1, Scan.StaticFor(22416)) == B.WARRIOR, "fixture check: 22416 is warrior-locked")
+    ck(select(2, Scan.StaticFor(4964)) == Scan.FACTION_HORDE, "fixture check: 4964 is Horde-locked")
+    ck(select(1, Scan.StaticFor(19019)) == 0, "fixture check: Thunderfury carries no lock")
+    ck(Scan.IsUnobtainable(18583) == true, "fixture check: 18583 is unobtainable by history")
 
-    -- unrestricted
+    local U, V = Scan.Usable, Scan.RowVerdict
+
+    -- ── ONE CASE PER RULE, asserted by the rule that fired ──────────────────
+    local known = {}
+    for _, r in ipairs(Scan.RULES or {}) do known[r] = true end
+    ck(#Scan.RULES == 9, "the rule table is published and has nine rules")
+
+    local ok1, r1 = V("not a row", hordeWarrior)
+    ck(ok1 == false and r1 == "no-row", "RULE no-row: a non-table is hidden")
+    ck(known[r1], "…and names a rule that is in the published table")
+
+    local ok2, r2 = V(placeholder, hordeMage)
+    ck(ok2 == false and r2 == "not-an-item",
+       "RULE not-an-item: Blizzard's own placeholder is hidden")
+    local ok2b, r2b = V(placeholder, shown)
+    ck(ok2b == false and r2b == "not-an-item",
+       "ADVERSARIAL: …and 'Show unusable' cannot reveal it — the rule sits ABOVE that one")
+
+    local ok3, r3 = V(glaive, hordeWarrior)
+    ck(ok3 == false and r3 == "unobtainable",
+       "RULE unobtainable: a Warglaive is a real item nobody can get, so it is hidden")
+    local ok3b, r3b = V(glaive, shown)
+    ck(ok3b == false and r3b == "unobtainable",
+       "ADVERSARIAL: …and 'Show unusable' cannot reveal it either")
+
+    local ok4, r4 = V(plainCloak, nil)
+    ck(ok4 == true and r4 == "no-context", "RULE no-context: with no viewer, nothing is filtered")
+
+    local ok5, r5 = V(bonescythe, shown)
+    ck(ok5 == true and r5 == "show-unusable",
+       "ADVERSARIAL: id IS in the table + 'Show unusable' -> shown, and that is the rule that decided")
+
+    local ok6, r6 = V(bonescythe, hordeWarrior)
+    ck(ok6 == false and r6 == "class",
+       "RULE class: THE HEADLINE SYMPTOM — rogue-only Bonescythe is hidden from a warrior")
+
+    local ok7, r7 = V(factionRow, allyWarrior)
+    ck(ok7 == false and r7 == "faction",
+       "RULE faction: a Horde-locked weapon is hidden from an Alliance character")
+
+    local ok8, r8 = V(wand, hordeWarrior)
+    ck(ok8 == false and r8 == "proficiency",
+       "RULE proficiency: a warrior cannot use a wand, and no table entry says so")
+
+    local ok9, r9 = V(plainCloak, hordeWarrior)
+    ck(ok9 == true and r9 == "usable", "RULE usable: nothing objected")
+
+    local okA, rA = V(row(999999999, ARMOR, 0), hordeWarrior)
+    ck(okA == true and rA == "usable",
+       "ADVERSARIAL: an id the table has never heard of is SHOWN (fail-open, unchanged)")
+
+    -- ── the verdicts themselves, as a matrix ────────────────────────────────
     ck(U(plainCloak, hordeWarrior) == true, "an unrestricted cloak shows for everyone")
     ck(U(plainCloak, hordeMage)    == true, "...including a cloth wearer")
+    ck(U(plainCloak, hordeRogue)   == true, "armor subclass 0 (cloaks/rings/necks/trinkets) is universal")
 
-    -- class lock, right vs wrong class  (THE reported defect: Atiesh on a warrior)
-    ck(U(atiesh, hordeMage)    == true,  "Atiesh (Classes: Mage) SHOWS for a mage")
-    ck(U(atiesh, hordeWarrior) == false, "Atiesh is HIDDEN from a warrior")
-    ck(U(warrSet, hordeWarrior) == true, "a warrior set piece shows for a warrior")
-    ck(U(warrSet, hordeMage)    == false, "...and is hidden from a mage")
+    ck(U(atieshRow, hordeWarrior) == false, "Atiesh is HIDDEN from a warrior")
+    ck(U(bonescythe, hordeRogue)  == true,  "a rogue set piece shows for a rogue")
+    ck(U(bonescythe, hordeWarrior) == false, "...and is hidden from a warrior")
+    ck(U(dreadnaught, hordeWarrior) == true, "a warrior set piece shows for a warrior")
+    ck(U(dreadnaught, hordeMage)    == false, "...and is hidden from a mage")
 
-    -- faction lock, right vs wrong faction (Alliance rank gear on Horde)
-    ck(U(allyRank, allyWarrior)  == true,  "an Alliance rank piece shows for Alliance")
-    ck(U(allyRank, hordeWarrior) == false, "...and is HIDDEN from Horde")
-    ck(U(hordeRank, hordeWarrior) == true,  "a Horde rank piece shows for Horde")
-    ck(U(hordeRank, allyWarrior)  == false, "...and is hidden from Alliance")
+    ck(U(factionRow, hordeWarrior) == true,  "a Horde-locked item shows for Horde")
+    ck(U(factionRow, allyWarrior)  == false, "...and is hidden from Alliance")
 
-    -- the two axes are independent
-    ck(U(allyWarrSet, allyWarrior)  == true,  "right class + right faction shows")
-    ck(U(allyWarrSet, hordeWarrior) == false, "right class + WRONG faction hides")
-    ck(U(allyWarrSet, viewer("MAGE", Scan.FACTION_ALLIANCE)) == false,
-       "wrong class + right faction hides")
-
-    -- proficiency
     ck(U(plateChest, hordeWarrior) == true,  "a warrior can wear plate")
     ck(U(plateChest, hordeMage)    == false, "a mage cannot")
     ck(U(clothRobe,  hordeMage)    == true,  "a mage can wear cloth")
     ck(U(clothRobe,  hordeWarrior) == true,  "a warrior can also wear cloth (no downgrade lock)")
-    ck(U(wand, hordeMage)     == true,  "a mage can use a wand")
-    ck(U(wand, hordeWarrior)  == false, "a warrior cannot")
-    ck(U(wand, hordeRogue)    == false, "nor can a rogue")
-    ck(U(plainCloak, hordeRogue) == true, "armor subclass 0 (cloaks/rings/necks/trinkets) is universal")
+    ck(U(wand, hordeMage)    == true,  "a mage can use a wand")
+    ck(U(wand, hordeRogue)   == false, "nor can a rogue")
 
-    -- the unknown-class bit fails OPEN
-    ck(U(fuzzyClass, hordeWarrior) == true,
-       "a partly-unparseable class list is SHOWN to a non-listed class (fails open)")
-    ck(U(fuzzyClass, hordeMage) == true, "...and of course to the listed class")
-    ck(U(onlyUnknown, hordeWarrior) == true, "a wholly unparseable class list is shown")
+    ck(U(atieshRow, shown)  == true, "'show unusable' reveals class-locked items")
+    ck(U(factionRow, viewer("WARRIOR", Scan.FACTION_ALLIANCE, true)) == true,
+       "...and opposite-faction items")
+    ck(U(wand, shown) == true, "...and items the class has no proficiency for")
 
-    -- the escape hatch
-    local shown = viewer("WARRIOR", Scan.FACTION_HORDE, true)
-    ck(U(atiesh,   shown) == true, "'show unusable' reveals class-locked items")
-    ck(U(allyRank, shown) == true, "...and opposite-faction items")
-    ck(U(wand,     shown) == true, "...and items the class has no proficiency for")
-
-    -- degenerate inputs
     ck(U(nil, hordeWarrior) == false, "a nil record is never usable")
     ck(U(plainCloak, nil)   == true,  "with no viewer context nothing is filtered")
-    ck(U(atiesh, viewer("NOTACLASS", 0)) == true,
+    ck(U(bonescythe, viewer("NOTACLASS", 0)) == true,
        "an unknown viewer class filters nothing rather than hiding everything")
-    ck(U({ classID = ARMOR, subclassID = 99, classMask = 0, faction = 0 }, hordeWarrior) == false,
+    ck(U(row(19019, ARMOR, 99), hordeWarrior) == false,
        "an armor subclass no class knows is treated as unusable")
-    ck(U({ classID = 15, subclassID = 99, classMask = 0, faction = 0 }, hordeWarrior) == true,
+    ck(U(row(19019, 15, 99), hordeWarrior) == true,
        "a non-armor / non-weapon item class is not proficiency-gated")
 
     -- ── MUTATION ADEQUACY ───────────────────────────────────────────────────
-    -- Each mutant is a plausible WRONG implementation of the predicate. The
-    -- fixture set above must distinguish every one of them, or a regression of
-    -- that exact shape would ship green.
+    -- Each mutant is a plausible WRONG implementation of the rule table — a rule
+    -- dropped, a rule inverted, or two rules swapped in precedence. The fixture
+    -- set above must distinguish every one of them, or a regression of that exact
+    -- shape would ship green.
     local fixtures = {
         { plainCloak, hordeWarrior }, { plainCloak, hordeMage },
-        { atiesh, hordeMage },        { atiesh, hordeWarrior },
-        { warrSet, hordeWarrior },    { warrSet, hordeMage },
-        { allyRank, allyWarrior },    { allyRank, hordeWarrior },
-        { hordeRank, hordeWarrior },  { hordeRank, allyWarrior },
-        { allyWarrSet, allyWarrior }, { allyWarrSet, hordeWarrior },
+        { atieshRow, hordeMage },     { atieshRow, hordeWarrior },
+        { bonescythe, hordeRogue },   { bonescythe, hordeWarrior },
+        { dreadnaught, hordeWarrior },{ dreadnaught, hordeMage },
+        { factionRow, hordeWarrior }, { factionRow, allyWarrior },
         { plateChest, hordeWarrior }, { plateChest, hordeMage },
         { wand, hordeMage },          { wand, hordeWarrior },
-        { fuzzyClass, hordeWarrior }, { onlyUnknown, hordeWarrior },
-        { atiesh, shown },            { allyRank, shown }, { wand, shown },
+        { glaive, hordeWarrior },     { glaive, shown },
+        { placeholder, hordeMage },   { placeholder, shown },
+        { atieshRow, shown },         { bonescythe, shown },   { wand, shown },
+        { row(999999999, ARMOR, 0), hordeWarrior },
     }
     local hasBit = Scan.HasBit
+    local function profOK(rec, ctx)
+        local prof = ctx.class and Scan.PROF[ctx.class]
+        if not (prof and rec.classID) then return true end
+        if rec.classID == ARMOR  and not prof.armor[rec.subclassID]  then return false end
+        if rec.classID == WEAPON and not prof.weapon[rec.subclassID] then return false end
+        return true
+    end
     local MUTANTS = {
-        ["M1 class lock ignored"] = function(rec, ctx)
+        ["R1 class lock ignored"] = function(rec, ctx)
+            if rec.internal or Scan.IsUnobtainable(rec.id) then return false end
             if ctx.showUnusable then return true end
-            local fa = rec.faction or 0
-            if fa ~= 0 and (ctx.faction or 0) ~= 0 and fa ~= ctx.faction then return false end
-            local prof = Scan.PROF[ctx.class]
-            if prof and rec.classID == 4 and not prof.armor[rec.subclassID] then return false end
-            if prof and rec.classID == 2 and not prof.weapon[rec.subclassID] then return false end
+            local _, f = Scan.StaticFor(rec.id)
+            if f ~= 0 and (ctx.faction or 0) ~= 0 and f ~= ctx.faction then return false end
+            return profOK(rec, ctx)
+        end,
+        ["R2 class test inverted"] = function(rec, ctx)
+            if rec.internal or Scan.IsUnobtainable(rec.id) then return false end
+            if ctx.showUnusable then return true end
+            local m = Scan.StaticFor(rec.id)
+            if m > 0 and hasBit(m, ctx.classBit) then return false end
             return true
         end,
-        ["M2 class test inverted"] = function(rec, ctx)
+        ["R3 faction lock ignored"] = function(rec, ctx)
+            if rec.internal or Scan.IsUnobtainable(rec.id) then return false end
             if ctx.showUnusable then return true end
-            local cm = rec.classMask or 0
-            if cm > 0 and not hasBit(cm, Scan.CLASS_UNKNOWN) then
-                if hasBit(cm % Scan.CLASS_UNKNOWN, ctx.classBit) then return false end
-            end
+            local m = Scan.StaticFor(rec.id)
+            if m > 0 and (ctx.classBit or 0) > 0 and not hasBit(m, ctx.classBit) then return false end
+            return profOK(rec, ctx)
+        end,
+        ["R4 faction test inverted"] = function(rec, ctx)
+            if rec.internal or Scan.IsUnobtainable(rec.id) then return false end
+            if ctx.showUnusable then return true end
+            local _, f = Scan.StaticFor(rec.id)
+            if f ~= 0 and f == (ctx.faction or 0) then return false end
             return true
         end,
-        ["M3 faction lock ignored"] = function(rec, ctx)
+        ["R5 an absent id is treated as LOCKED (fail-closed)"] = function(rec, ctx)
+            if rec.internal or Scan.IsUnobtainable(rec.id) then return false end
             if ctx.showUnusable then return true end
-            local cm = rec.classMask or 0
-            if cm > 0 and not hasBit(cm, Scan.CLASS_UNKNOWN)
-               and (cm % Scan.CLASS_UNKNOWN) > 0 and not hasBit(cm, ctx.classBit) then return false end
-            local prof = Scan.PROF[ctx.class]
-            if prof and rec.classID == 4 and not prof.armor[rec.subclassID] then return false end
-            if prof and rec.classID == 2 and not prof.weapon[rec.subclassID] then return false end
-            return true
+            local m = Scan.StaticFor(rec.id)
+            if not hasBit(m, ctx.classBit) then return false end
+            return profOK(rec, ctx)
         end,
-        ["M4 faction test inverted"] = function(rec, ctx)
-            if ctx.showUnusable then return true end
-            local fa = rec.faction or 0
-            if fa ~= 0 and fa == (ctx.faction or 0) then return false end
-            return true
-        end,
-        ["M5 unrestricted treated as locked"] = function(rec, ctx)
-            if ctx.showUnusable then return true end
-            if not hasBit(rec.classMask or 0, ctx.classBit) then return false end
-            return true
-        end,
-        ["M6 show-unusable inverted"] = function(rec, ctx)
+        ["R6 show-unusable inverted"] = function(rec, ctx)
             local c2 = {}
             for k, v in pairs(ctx) do c2[k] = v end
             c2.showUnusable = not ctx.showUnusable
             return Scan.Usable(rec, c2)
         end,
-        ["M7 proficiency ignored"] = function(rec, ctx)
+        ["R7 proficiency ignored"] = function(rec, ctx)
+            if rec.internal or Scan.IsUnobtainable(rec.id) then return false end
             if ctx.showUnusable then return true end
-            local cm = rec.classMask or 0
-            if cm > 0 and not hasBit(cm, Scan.CLASS_UNKNOWN)
-               and (cm % Scan.CLASS_UNKNOWN) > 0 and not hasBit(cm, ctx.classBit) then return false end
-            local fa = rec.faction or 0
-            if fa ~= 0 and (ctx.faction or 0) ~= 0 and fa ~= ctx.faction then return false end
+            local m, f = Scan.StaticFor(rec.id)
+            if m > 0 and (ctx.classBit or 0) > 0 and not hasBit(m, ctx.classBit) then return false end
+            if f ~= 0 and (ctx.faction or 0) ~= 0 and f ~= ctx.faction then return false end
             return true
         end,
-        ["M8 unknown class bit fails CLOSED"] = function(rec, ctx)
+        ["R8 unobtainable rule dropped"] = function(rec, ctx)
+            if rec.internal then return false end
             if ctx.showUnusable then return true end
-            local cm = rec.classMask or 0
-            if cm > 0 and not hasBit(cm, ctx.classBit) then return false end
-            local fa = rec.faction or 0
-            if fa ~= 0 and (ctx.faction or 0) ~= 0 and fa ~= ctx.faction then return false end
-            local prof = Scan.PROF[ctx.class]
-            if prof and rec.classID == 4 and not prof.armor[rec.subclassID] then return false end
-            if prof and rec.classID == 2 and not prof.weapon[rec.subclassID] then return false end
-            return true
+            local m, f = Scan.StaticFor(rec.id)
+            if m > 0 and (ctx.classBit or 0) > 0 and not hasBit(m, ctx.classBit) then return false end
+            if f ~= 0 and (ctx.faction or 0) ~= 0 and f ~= ctx.faction then return false end
+            return profOK(rec, ctx)
+        end,
+        ["R9 internal rule dropped"] = function(rec, ctx)
+            if Scan.IsUnobtainable(rec.id) then return false end
+            if ctx.showUnusable then return true end
+            local m, f = Scan.StaticFor(rec.id)
+            if m > 0 and (ctx.classBit or 0) > 0 and not hasBit(m, ctx.classBit) then return false end
+            if f ~= 0 and (ctx.faction or 0) ~= 0 and f ~= ctx.faction then return false end
+            return profOK(rec, ctx)
+        end,
+        ["R10 PRECEDENCE: show-unusable placed above the not-real rules"] = function(rec, ctx)
+            if ctx.showUnusable then return true end
+            if rec.internal or Scan.IsUnobtainable(rec.id) then return false end
+            local m, f = Scan.StaticFor(rec.id)
+            if m > 0 and (ctx.classBit or 0) > 0 and not hasBit(m, ctx.classBit) then return false end
+            if f ~= 0 and (ctx.faction or 0) ~= 0 and f ~= ctx.faction then return false end
+            return profOK(rec, ctx)
         end,
     }
     local names = {}
@@ -1784,8 +1859,8 @@ suite("item-scan-filter-matrix", function(ck)
         local mut, killed = MUTANTS[name], false
         for _, fx in ipairs(fixtures) do
             local real = Scan.Usable(fx[1], fx[2])
-            local ok, got = pcall(mut, fx[1], fx[2])
-            if not ok or (got and true or false) ~= real then killed = true; break end
+            local okm, got = pcall(mut, fx[1], fx[2])
+            if not okm or (got and true or false) ~= real then killed = true; break end
         end
         ck(killed, "mutation killed: " .. name)
     end
@@ -1794,43 +1869,62 @@ end)
 ----------------------------------------------------------------------
 -- CACHE ROUND-TRIP: pack/unpack, Put/Get, and a real SavedVariables
 -- serialize -> reload cycle (the cache's whole job is to survive a logout).
+--
+-- THE CACHE GOT SMALLER (1.3.1). It used to carry a classMask, a faction and a
+-- restrictions-UNREAD flag per row, plus a capture stamp and a repair tally on the
+-- cache itself. The locks are shipped now, so a row is a name, a quality and the
+-- denylist verdict — and the layout change is handled by LEAVING THE HOLE where
+-- the restriction bits were, so a cache written by any earlier 1.3.x build reads
+-- back with its quality and its internal flag intact and needs no migration.
 ----------------------------------------------------------------------
 suite("item-scan-cache-roundtrip", function(ck)
     if type(Scan) ~= "table" then ck(false, "itemScan.lua did not load"); return end
-    local B = Scan.CLASS_BIT
 
     -- ── the packed meta field ───────────────────────────────────────────────
-    local function trip(q, m, f)
-        local a, b, c = Scan.UnpackMeta(Scan.PackMeta(q, m, f))
-        return a == q and b == m and c == f
+    local function trip(q, i)
+        local a, b = Scan.UnpackMeta(Scan.PackMeta(q, i))
+        return a == q and b == i
     end
-    ck(trip(0, 0, 0), "the all-zero record round-trips")
-    ck(trip(4, B.MAGE, Scan.FACTION_HORDE), "epic / mage-locked / Horde round-trips")
-    ck(trip(5, B.DRUID + B.MAGE + B.PRIEST + B.WARLOCK, 0), "a multi-class legendary round-trips")
-    ck(trip(1, Scan.CLASS_UNKNOWN, Scan.FACTION_ALLIANCE), "the unknown bit survives the round trip")
-    ck(trip(7, 4095, 3), "the top of every field round-trips")
+    ck(trip(0, false), "the all-zero record round-trips")
+    ck(trip(4, false), "an epic round-trips")
+    ck(trip(5, true),  "a legendary flagged internal round-trips")
+    ck(trip(15, true), "the top of the quality field round-trips")
     local allOK = true
-    for q = 0, 7 do
-        for _, m in ipairs({ 0, 1, 2, 4, 8, 16, 64, 128, 256, 1024, 2048, 1503, 4095 }) do
-            for f = 0, 2 do if not trip(q, m, f) then allOK = false end end
-        end
+    for q = 0, 15 do
+        for _, i in ipairs({ true, false }) do if not trip(q, i) then allOK = false end end
     end
-    ck(allOK, "every (quality x mask x faction) combination in play round-trips exactly")
-    ck(Scan.PackMeta(nil, nil, nil) == 0, "nil fields pack as zero")
+    ck(allOK, "every (quality x internal) combination round-trips exactly")
+    ck(Scan.PackMeta(nil, nil) == 0, "nil fields pack as zero")
     ck(select(1, Scan.UnpackMeta(nil)) == 0, "unpacking nil yields zeros")
-    ck(Scan.PackMeta(99, 99999, 9) == Scan.PackMeta(15, 4095, 3), "out-of-range fields clamp")
-    ck(Scan.PackMeta(-4, -1, -1) == 0, "negative fields clamp to zero")
-    ck(Scan.PackMeta(4, 0, 0) < 2^24, "a packed record stays a small integer")
+    ck(Scan.PackMeta(99, false) == Scan.PackMeta(15, false), "an out-of-range quality clamps")
+    ck(Scan.PackMeta(-4, false) == 0, "a negative quality clamps to zero")
+    ck(Scan.PackMeta(4, false) < 2^24, "a packed record stays a small integer")
+
+    -- ── LAYOUT COMPATIBILITY: a legacy word still decodes ───────────────────
+    -- This is a real 1.3.1 meta word: quality 4, classMask ROGUE(8), faction 0,
+    -- internal set. The restriction bits in the middle must be SKIPPED, not
+    -- misread as part of the quality or the flag.
+    local legacy = 4 + 8 * 16 + 1 * 65536 + 262144        -- q4 | mask 8 | faction 1 | internal
+    local lq, li = Scan.UnpackMeta(legacy)
+    ck(lq == 4, "a legacy meta word still yields its quality")
+    ck(li == true, "…and its internal flag, from the same bit it always used")
+    local legacyNoFlag = 4 + 8 * 16 + 1 * 65536
+    ck(select(2, Scan.UnpackMeta(legacyNoFlag)) == false,
+       "…and a legacy word without the flag does not acquire one from the dead bits")
+    ck(select(1, Scan.UnpackMeta(524288 + 4)) == 4,
+       "…nor does the retired UNREAD bit disturb the quality")
 
     -- ── Put / Get ───────────────────────────────────────────────────────────
     local c = Scan.NewCache()
     ck(c.version == Scan.CACHE_VERSION and c.count == 0, "a fresh cache is empty and versioned")
+    ck(c.unreadCount == nil and c.restrictStamp == nil,
+       "a fresh cache carries no restriction bookkeeping at all")
     ck(Scan.IsComplete(c) == false, "a fresh cache is not a completed scan")
-    ck(Scan.Put(c, 23709, "Corehound Belt", 3, 0, 0) == true, "Put accepts a record")
+    ck(Scan.Put(c, 23709, "Corehound Belt", 3) == true, "Put accepts a record")
     ck(c.count == 1, "count tracks the insert")
-    ck(Scan.Put(c, 22589, "Atiesh, Greatstaff of the Guardian", 5, B.MAGE, 0) == true, "second record")
+    ck(Scan.Put(c, 22589, "Atiesh, Greatstaff of the Guardian", 5) == true, "second record")
     ck(c.count == 2, "count tracks the second insert")
-    ck(Scan.Put(c, 23709, "Corehound Belt", 3, 0, 0) == true, "re-Put of a known id succeeds")
+    ck(Scan.Put(c, 23709, "Corehound Belt", 3) == true, "re-Put of a known id succeeds")
     ck(c.count == 2, "...without double counting")
     ck(Scan.Put(c, nil, "x") == false, "Put rejects a nil id")
     ck(Scan.Put(c, 5, nil) == false, "Put rejects a nil name")
@@ -1838,17 +1932,19 @@ suite("item-scan-cache-roundtrip", function(ck)
     ck(Scan.Put(nil, 5, "x") == false, "Put rejects a nil cache")
     ck(c.count == 2, "rejected Puts do not move the count")
 
-    local nm, q, m, f = Scan.Get(c, 22589)
+    local nm, q, internal = Scan.Get(c, 22589)
     ck(nm == "Atiesh, Greatstaff of the Guardian", "Get returns the name")
     ck(q == 5, "...the quality")
-    ck(m == B.MAGE, "...the class mask")
-    ck(f == 0, "...and the faction")
+    ck(internal == false, "...and the denylist verdict, which is all a row holds now")
     ck(Scan.Get(c, 999999) == nil, "an unscanned id reads back nil")
     ck(Scan.Get(nil, 1) == nil, "a nil cache reads back nil")
     ck(Scan.Get(c, "22589") ~= nil, "a numeric-string id is coerced (SavedVariables keys)")
+    -- the flag is DERIVED, so a caller cannot disagree with the denylist
+    Scan.Put(c, 13789, "[PH] Brilliant Dawn Cap", 1)
+    ck(select(3, Scan.Get(c, 13789)) == true, "an internal name is flagged by Put itself")
 
     -- ── SavedVariables serialize -> reload ──────────────────────────────────
-    Scan.Put(c, 16542, "Warlord's Iron-Breastplate", 4, B.WARRIOR, Scan.FACTION_HORDE)
+    Scan.Put(c, 16542, "Warlord's Iron-Breastplate", 4)
     c.scannedAt, c.build, c.ranges = 1754200000, "1.15.9.68808", "1-32000"
     local function ser(v, out)
         local t = type(v)
@@ -1874,21 +1970,51 @@ suite("item-scan-cache-roundtrip", function(ck)
     local reloaded = chunk and Scan.Normalize(chunk())
     ck(reloaded ~= nil, "…and normalizes on the way back in")
     if reloaded then
-        ck(reloaded.count == 3, "the reloaded cache recounts its entries")
+        ck(reloaded.count == 4, "the reloaded cache recounts its entries")
         ck(Scan.IsComplete(reloaded) == true, "a reloaded completed scan reads as complete")
-        local n2, q2, m2, f2 = Scan.Get(reloaded, 16542)
+        local n2, q2, i2 = Scan.Get(reloaded, 16542)
         ck(n2 == "Warlord's Iron-Breastplate", "the apostrophe survives the round trip")
-        ck(q2 == 4 and m2 == B.WARRIOR and f2 == Scan.FACTION_HORDE,
-           "quality, class lock and faction lock all survive a logout")
+        ck(q2 == 4 and i2 == false, "quality and the denylist verdict survive a logout")
         ck(reloaded.scannedAt == 1754200000 and reloaded.build == "1.15.9.68808",
            "the scan stamp survives")
-        -- and the predicate still answers correctly off the reloaded record
-        local rec = { classID = 4, subclassID = 4, classMask = m2, faction = f2 }
-        ck(Scan.Usable(rec, { class = "WARRIOR", classBit = B.WARRIOR, faction = Scan.FACTION_HORDE }) == true,
-           "reloaded Horde warrior piece is usable by a Horde warrior")
-        ck(Scan.Usable(rec, { class = "WARRIOR", classBit = B.WARRIOR, faction = Scan.FACTION_ALLIANCE }) == false,
-           "…and hidden from an Alliance warrior")
+        ck(reloaded.internalCount == 1, "…and the internal tally is rebuilt from the rows")
+        -- and the predicate still answers correctly off the reloaded record, taking
+        -- the lock from the SHIPPED table rather than from the row
+        local rec = { id = 22589, classID = Scan.ITEM_CLASS_WEAPON, subclassID = 10 }
+        ck(Scan.Usable(rec, { class = "WARRIOR", classBit = Scan.CLASS_BIT.WARRIOR }) == false,
+           "a reloaded Atiesh row is still hidden from a warrior — the lock never lived in the cache")
     end
+
+    -- ── A REAL PRE-1.3.1 CACHE MIGRATES WITHOUT CEREMONY ────────────────────
+    -- Shaped exactly as the owner's SavedVariables were left: restriction bits in
+    -- the meta words, a capture stamp, an unread tally, a repair timestamp.
+    local old = {
+        version = Scan.CACHE_VERSION,
+        names = { [22476] = "Bonescythe Breastplate", [13789] = "[PH] Brilliant Dawn Cap" },
+        meta  = { [22476] = 4 + 8 * 16, [13789] = 1 + 262144 },
+        count = 2, internalCount = 1, internalStamp = Scan.INTERNAL_STAMP,
+        unreadCount = 9240, restrictStamp = 3,
+        restrictRepairedAt = 1785872625, restrictLocked = 834, restrictUnreadable = 0,
+        repairBlocked = "this session's repair pass already ran",
+        scannedAt = 1785862751,
+    }
+    local mig = Scan.Normalize(old)
+    ck(mig.count == 2, "an old cache is kept, not discarded — its names are still good")
+    ck(select(2, Scan.Get(mig, 22476)) == 4, "…its qualities read back")
+    ck(select(3, Scan.Get(mig, 13789)) == true, "…and its internal flags read back")
+    ck(mig.unreadCount == nil and mig.restrictStamp == nil,
+       "…while the restriction bookkeeping is dropped from the cache")
+    ck(mig.restrictRepairedAt == nil and mig.restrictLocked == nil
+       and mig.restrictUnreadable == nil and mig.repairBlocked == nil,
+       "…all of it, so nothing on disk can claim a pass is owed")
+    ck(mig.meta[22476] == 4 + 8 * 16,
+       "…and the dead restriction bits are left INERT rather than rewritten: "
+       .. "nothing reads them, so erasing them would be a pointless full-table write")
+    -- the row is still filtered correctly, because the lock comes from elsewhere
+    ck(Scan.Usable({ id = 22476, classID = Scan.ITEM_CLASS_ARMOR, subclassID = 2 },
+                   { class = "WARRIOR", classBit = Scan.CLASS_BIT.WARRIOR }) == false,
+       "THE MIGRATION IS A NO-OP THAT FIXES THE BUG: Bonescythe is hidden from a warrior "
+       .. "on the owner's existing cache, with no rescan and no repair")
 
     -- ── Normalize guards ────────────────────────────────────────────────────
     local n = Scan.Normalize(nil)
@@ -2064,21 +2190,23 @@ suite("item-scan-internal-filter", function(ck)
     ck(Scan.IsInternalName("TEST SWORD") == true, "…and its uppercase sibling (matching is case-insensitive)")
 
     -- ── the flag is CACHED, packed, and survives a logout ───────────────────
-    local q, m, f, i = Scan.UnpackMeta(Scan.PackMeta(4, Scan.CLASS_BIT.MAGE, 1, true))
-    ck(q == 4 and m == Scan.CLASS_BIT.MAGE and f == 1 and i == true,
-       "the internal bit round-trips alongside quality / mask / faction")
-    ck(select(4, Scan.UnpackMeta(Scan.PackMeta(4, 4095, 3, false))) == false,
+    local q, i = Scan.UnpackMeta(Scan.PackMeta(4, true))
+    ck(q == 4 and i == true, "the internal bit round-trips alongside the quality")
+    ck(select(2, Scan.UnpackMeta(Scan.PackMeta(15, false))) == false,
        "…and a full record with the bit clear reads back clear")
-    ck(Scan.PackMeta(15, 4095, 3, true) < 2 ^ 24, "a packed record is still a small integer")
-    ck(select(4, Scan.UnpackMeta(Scan.PackMeta(4, 0, 0))) == false,
-       "1.3.0's three-argument PackMeta still means 'not internal'")
+    ck(Scan.PackMeta(15, true) < 2 ^ 24, "a packed record is still a small integer")
+    ck(select(2, Scan.UnpackMeta(Scan.PackMeta(4))) == false,
+       "an omitted flag means 'not internal'")
+    -- and a LEGACY word, restriction bits and all, still lands on the same answer
+    ck(select(2, Scan.UnpackMeta(1 + Scan.CLASS_BIT.MAGE * 16 + 1 * 65536 + 262144)) == true,
+       "a pre-1.3.1 meta word keeps its flag: the dead restriction bits are skipped, not shifted")
 
     local c = Scan.NewCache()
     ck(c.internalStamp == Scan.INTERNAL_STAMP, "a fresh cache carries the current denylist stamp")
-    Scan.Put(c, 19162, "Corehound Belt", 3, 0, 0)
-    Scan.Put(c, 13789, "[PH] Brilliant Dawn Cap", 1, 0, 0)
-    ck(select(5, Scan.Get(c, 13789)) == true, "Put DERIVES the internal flag from the name")
-    ck(select(5, Scan.Get(c, 19162)) == false, "…and leaves a real item unflagged")
+    Scan.Put(c, 19162, "Corehound Belt", 3)
+    Scan.Put(c, 13789, "[PH] Brilliant Dawn Cap", 1)
+    ck(select(3, Scan.Get(c, 13789)) == true, "Put DERIVES the internal flag from the name")
+    ck(select(3, Scan.Get(c, 19162)) == false, "…and leaves a real item unflagged")
     ck(c.count == 2, "internal rows stay IN the cache (a rescan must not re-fight them)")
 
     -- ── a 1.3.0 cache is UPGRADED IN PLACE, never discarded ─────────────────
@@ -2088,8 +2216,7 @@ suite("item-scan-internal-filter", function(ck)
         version = Scan.CACHE_VERSION,
         names = { [13789] = "[PH] Brilliant Dawn Cap", [19162] = "Corehound Belt",
                   [9425] = "Pendulum of Doom", [11342] = "Monster - Axe, 2H Pendulum of Doom" },
-        meta  = { [13789] = Scan.PackMeta(1, 0, 0), [19162] = Scan.PackMeta(3, 0, 0),
-                  [9425] = Scan.PackMeta(4, 0, 0), [11342] = Scan.PackMeta(1, 0, 0) },
+        meta  = { [13789] = 1, [19162] = 3, [9425] = 4, [11342] = 1 },
         count = 4, scannedAt = 1754200000,
     }
     ck(old.internalStamp == nil, "…the 1.3.0 cache has no denylist stamp")
@@ -2097,20 +2224,20 @@ suite("item-scan-internal-filter", function(ck)
     ck(up.count == 4, "the upgrade keeps every row (no rescan is demanded)")
     ck(up.internalStamp == Scan.INTERNAL_STAMP, "…and stamps the denylist it was derived with")
     ck(up.internalCount == 2, "…having flagged exactly the two internal rows")
-    ck(select(5, Scan.Get(up, 13789)) == true and select(5, Scan.Get(up, 11342)) == true,
+    ck(select(3, Scan.Get(up, 13789)) == true and select(3, Scan.Get(up, 11342)) == true,
        "the placeholder and the creature record are flagged on the way in")
-    ck(select(5, Scan.Get(up, 19162)) == false and select(5, Scan.Get(up, 9425)) == false,
+    ck(select(3, Scan.Get(up, 19162)) == false and select(3, Scan.Get(up, 9425)) == false,
        "…and the real items are not")
     ck(select(2, Scan.Get(up, 9425)) == 4, "the re-derive preserves quality")
 
     -- an already-stamped cache is left alone (the pass is idempotent and one-shot)
-    up.meta[19162] = Scan.PackMeta(3, 0, 0, true)     -- a lie, deliberately planted
+    up.meta[19162] = Scan.PackMeta(3, true)     -- a lie, deliberately planted
     local again = Scan.Normalize(up)
-    ck(select(5, Scan.Get(again, 19162)) == true,
+    ck(select(3, Scan.Get(again, 19162)) == true,
        "a cache already on the current stamp is NOT re-derived (the pass runs once)")
     again.internalStamp = "some-older-stamp"
     again = Scan.Normalize(again)
-    ck(select(5, Scan.Get(again, 19162)) == false,
+    ck(select(3, Scan.Get(again, 19162)) == false,
        "…and a stamp change re-derives every flag, so a denylist fix reaches an old cache")
 
     -- ── MUTATION ADEQUACY: each mutant is a plausible WRONG denylist. The
@@ -2191,15 +2318,19 @@ suite("goal-picker-empty-query", function(ck)
     local HEAD = { INVTYPE_HEAD = true }
     local warrior = { class = "WARRIOR", classBit = Scan.CLASS_BIT.WARRIOR,
                       faction = Scan.FACTION_HORDE, showUnusable = false }
-    local function row(name, loc, subclass, mask)
-        return { id = 1, name = name:lower(), display = name, equipLoc = loc or "INVTYPE_HEAD",
-                 classID = Scan.ITEM_CLASS_ARMOR, subclassID = subclass or 4,
-                 classMask = mask or 0, faction = Scan.FACTION_NONE }
+    -- Real ids, so the usability half of the predicate reads the SHIPPED locks
+    -- rather than a mask this fixture made up. 999999 is deliberately an id the
+    -- shipped table has never heard of.
+    local function row(id, name, loc, subclass)
+        return { id = id, name = name:lower(), display = name, equipLoc = loc or "INVTYPE_HEAD",
+                 classID = Scan.ITEM_CLASS_ARMOR, subclassID = subclass or 4 }
     end
-    local helm  = row("Lionheart Helm")
-    local coif  = row("Helm of Wrath")
-    local robe  = row("Robe of Volatile Power", "INVTYPE_ROBE", 1)
-    local mageOnly = row("Arcanist Crown", "INVTYPE_HEAD", 1, Scan.CLASS_BIT.MAGE)
+    local helm  = row(12640, "Lionheart Helm")               -- unrestricted plate
+    local coif  = row(16963, "Helm of Wrath")                -- warrior-locked plate
+    local robe  = row(19145, "Robe of Volatile Power", "INVTYPE_ROBE", 1)
+    local mageOnly = row(16795, "Arcanist Crown", "INVTYPE_HEAD", 1)   -- MAGE in the table
+    ck(select(1, Scan.StaticFor(16795)) == Scan.CLASS_BIT.MAGE,
+       "fixture check: the Arcanist Crown really is mage-locked in the shipped table")
 
     -- ── the empty box ───────────────────────────────────────────────────────
     ck(Scan.NormalizeQuery("") == "", "an empty box normalises to the empty query")
@@ -2226,7 +2357,7 @@ suite("goal-picker-empty-query", function(ck)
        "the query is a plain substring of THIS row's name, not a fuzzy match")
 
     -- the search is a literal substring, so a Lua pattern character is not magic
-    local plus = row("Test Defense Ring +120")
+    local plus = row(999999, "Test Defense Ring +120")
     ck(Scan.Matches(plus, "+120", HEAD, warrior) == true,
        "'+' in the query is literal text, not a Lua pattern quantifier")
 
@@ -2627,174 +2758,6 @@ suite("goal-picker-row-pool", function(ck)
 end)
 
 ----------------------------------------------------------------------
--- RESTRICTION CAPTURE: "read nothing" is not "nothing to read"  (1.3.1)
---
--- THE DEFECT (owner screenshot): Bonescythe — rogue-only Tier-3 leather — was
--- offered to a WARRIOR. Not a fail-open on an unknown class token: the owner's
--- cache carries classMask = 0 for it, i.e. "no restriction at all", which the
--- filter is right to honour.
---
--- THE CAUSE: the scan read locks off a hidden tooltip and, when that tooltip did
--- not build, fell through to classMask = 0 — the same value it writes for an item
--- it read successfully and found unrestricted. Evidence from the owner's real
--- 10 504-item cache: all eight Tier-3 armour sets (ids 22416-22511, nine classes)
--- have classMask 0, inside one contiguous 224-row band of ids 22314-22821 that
--- contains no restricted row at all, while Tier 1 and Tier 2 either side of it
--- are captured 8-for-8 (Bloodfang, Nightslayer, Judgement, Lawbringer …). The
--- CLASS_UNKNOWN bit is set on 0 of 10 504 rows, so the fail-open path was never
--- the one in play — the reads simply never happened and were written down as
--- facts.
-----------------------------------------------------------------------
-suite("item-scan-restriction-capture", function(ck)
-    if type(Scan) ~= "table" then ck(false, "itemScan.lua did not load"); return end
-    ck(type(Scan.ReadRestrictions) == "function", "Scan.ReadRestrictions is published")
-
-    local loc = {
-        classPrefix = "Classes: ", racesPrefix = "Races: ",
-        classByName = { Rogue = "ROGUE", Warrior = "WARRIOR", Mage = "MAGE" },
-        raceFaction = { Orc = Scan.FACTION_HORDE, Human = Scan.FACTION_ALLIANCE },
-        allianceLines = { Alliance = true }, hordeLines = { Horde = true },
-    }
-
-    -- ── the three outcomes are now THREE, not two ───────────────────────────
-    local m, f, read = Scan.ReadRestrictions(
-        { "Binds when picked up", "Chest", "Leather", "Classes: Rogue" }, loc)
-    ck(read == true and m == Scan.CLASS_BIT.ROGUE and f == Scan.FACTION_NONE,
-       "a tooltip that built and named a class yields that class, read=true")
-    m, f, read = Scan.ReadRestrictions({ "Binds when equipped", "Chest", "Plate" }, loc)
-    ck(read == true and m == 0,
-       "a tooltip that built and named NO class is evidence of an unrestricted item")
-    m, f, read = Scan.ReadRestrictions(nil, loc)
-    ck(read == false and m == 0,
-       "THE FIX: a tooltip that did not build is evidence of NOTHING (read=false)")
-    m, f, read = Scan.ReadRestrictions({}, loc)
-    ck(read == false, "…and so is an empty line list")
-    ck(select(3, Scan.ReadRestrictions("not a table", loc)) == false,
-       "…and a non-table")
-
-    -- the Bonescythe line itself, as the client writes it
-    ck(select(1, Scan.ReadRestrictions({ "Classes: Rogue" }, loc)) == Scan.CLASS_BIT.ROGUE,
-       "'Classes: Rogue' is the lock that hides Bonescythe from a warrior")
-    local warrior = { class = "WARRIOR", classBit = Scan.CLASS_BIT.WARRIOR,
-                      faction = Scan.FACTION_NONE, showUnusable = false }
-    local bone = { classID = Scan.ITEM_CLASS_ARMOR, subclassID = 2,
-                   classMask = Scan.CLASS_BIT.ROGUE, faction = Scan.FACTION_NONE }
-    ck(Scan.Usable(bone, warrior) == false, "with the lock captured, a warrior does not see it")
-    local boneBare = { classID = Scan.ITEM_CLASS_ARMOR, subclassID = 2,
-                       classMask = 0, faction = Scan.FACTION_NONE }
-    ck(Scan.Usable(boneBare, warrior) == true,
-       "…and with classMask 0 he does — the filter is right, the capture was wrong")
-    -- fail-open on a genuinely unknown token is UNCHANGED policy
-    local unk = { classID = Scan.ITEM_CLASS_ARMOR, subclassID = 2,
-                  classMask = Scan.CLASS_UNKNOWN + Scan.CLASS_BIT.ROGUE,
-                  faction = Scan.FACTION_NONE }
-    ck(Scan.Usable(unk, warrior) == true,
-       "a TRUE unknown still fails open: hiding an item he can use is the worse defect")
-
-    -- ── the unread flag round-trips and is persisted ────────────────────────
-    local q, cm, fa, i, u = Scan.UnpackMeta(Scan.PackMeta(4, Scan.CLASS_BIT.ROGUE, 0, false, true))
-    ck(q == 4 and cm == Scan.CLASS_BIT.ROGUE and i == false and u == true,
-       "the unread bit round-trips alongside quality / mask / faction / internal")
-    ck(select(5, Scan.UnpackMeta(Scan.PackMeta(4, 0, 0, false, false))) == false,
-       "…and reads back clear when it was not set")
-    ck(select(5, Scan.UnpackMeta(Scan.PackMeta(4, 0, 0, true))) == false,
-       "1.3.0's argument list still means 'read' (an old meta value is stale, not corrupt)")
-    ck(Scan.PackMeta(15, 4095, 3, true, true) < 2 ^ 24,
-       "a fully-flagged record is still a small integer")
-
-    local c = Scan.NewCache()
-    ck(c.restrictStamp == Scan.RESTRICT_STAMP, "a fresh cache carries the capture stamp")
-    ck(Scan.UnreadCount(c) == 0, "…and nothing to re-read")
-    Scan.Put(c, 22476, "Bonescythe Breastplate", 4, 0, 0, true)   -- tooltip refused
-    Scan.Put(c, 16905, "Bloodfang Chestpiece",   4, Scan.CLASS_BIT.ROGUE, 0, false)
-    ck(select(6, Scan.Get(c, 22476)) == true, "a row whose tooltip refused is flagged unread")
-    ck(select(6, Scan.Get(c, 16905)) == false, "…and a row that was read is not")
-    ck(select(3, Scan.Get(c, 16905)) == Scan.CLASS_BIT.ROGUE, "…keeping the lock it read")
-    Scan.Put(c, 13789, "[PH] Brilliant Dawn Cap", 1, 0, 0, true)
-    ck(select(6, Scan.Get(c, 13789)) == false,
-       "an INTERNAL row is never 'unread': nothing ever asks it for a class lock")
-
-    local ids = Scan.UnreadIds(c)
-    ck(#ids == 1 and ids[1] == 22476, "UnreadIds lists exactly the rows to re-read")
-
-    -- ── a pre-1.3.1 cache is migrated, not discarded ────────────────────────
-    -- It cannot say which rows had a tooltip, so every real row is re-queued.
-    local old = {
-        version = Scan.CACHE_VERSION, scannedAt = 1785862751, count = 4,
-        internalStamp = Scan.INTERNAL_STAMP,
-        names = { [22476] = "Bonescythe Breastplate", [16905] = "Bloodfang Chestpiece",
-                  [9425]  = "Pendulum of Doom",       [13789] = "[PH] Brilliant Dawn Cap" },
-        meta  = { [22476] = Scan.PackMeta(4, 0, 0),
-                  [16905] = Scan.PackMeta(4, Scan.CLASS_BIT.ROGUE, 0),
-                  [9425]  = Scan.PackMeta(4, 0, 0),
-                  [13789] = Scan.PackMeta(1, 0, 0, true) },
-    }
-    ck(old.restrictStamp == nil, "the pre-1.3.1 cache has no capture stamp")
-    local up = Scan.Normalize(old)
-    ck(up.count == 4, "the migration keeps every row (no rescan is demanded)")
-    ck(up.restrictStamp == Scan.RESTRICT_STAMP, "…and stamps the capture it now trusts")
-    ck(up.unreadCount == 3, "…having queued every REAL row for a re-read")
-    ck(select(6, Scan.Get(up, 13789)) == false, "…and left the internal row out of it")
-    ck(select(2, Scan.Get(up, 16905)) == 4, "the migration preserves quality")
-    ck(select(3, Scan.Get(up, 16905)) == Scan.CLASS_BIT.ROGUE,
-       "…and the locks it DID capture (a re-read can only improve on them)")
-    local queue = Scan.UnreadIds(up)
-    ck(#queue == 3 and queue[1] == 9425 and queue[3] == 22476,
-       "the repair queue is in id order, exactly as the scan walked them")
-
-    -- idempotent: a stamped cache is not re-flagged on the next login
-    up.meta[9425] = Scan.PackMeta(4, 0, 0, false, false)   -- pretend it was repaired
-    local again = Scan.Normalize(up)
-    ck(select(6, Scan.Get(again, 9425)) == false,
-       "a cache already on the current capture stamp is NOT re-flagged (the pass runs once)")
-    ck(again.unreadCount == 2, "…and the remaining count falls as rows are repaired")
-    again.restrictStamp = 0
-    again = Scan.Normalize(again)
-    ck(again.unreadCount == 3,
-       "…while a capture-stamp bump re-queues everything, so a future capture fix lands too")
-
-    -- a cache with NOTHING left to re-read asks for no repair at all
-    for id in pairs(again.names) do
-        local nm, qq, mm, ff = Scan.Get(again, id)
-        Scan.Put(again, id, nm, qq, mm, ff, false)
-    end
-    again.unreadCount = nil                     -- force the recount path
-    ck(Scan.UnreadCount(again) == 0, "a fully-read cache has no repair queue")
-
-    -- ── source contract ─────────────────────────────────────────────────────
-    local fh = io.open(P("itemScan.lua"), "r")
-    ck(fh ~= nil, "itemScan.lua is readable")
-    if fh then
-        local s = fh:read("*a"); fh:close()
-        ck(s:find("Scan%.ReadRestrictions%(tooltipLines%(id%), ST%.loc%)") ~= nil,
-           "the recorder asks whether the tooltip was READ, not just what it said")
-        ck(s:find("if lines then classMask, faction") == nil,
-           "THE DEFECT IS GONE: an unbuilt tooltip is no longer silently 'unrestricted'")
-        ck(s:find("Scan%.TOOLTIP_TRIES") ~= nil,
-           "an unreadable tooltip is retried inside the scan before it is written off")
-        ck(s:find("scanTip:SetOwner%(UIParent, \"ANCHOR_NONE\"%)") ~= nil,
-           "the scanning tooltip re-owns itself on every use (an unowned tooltip builds nothing)")
-        local created = s:find("CreateFrame%(\"GameTooltip\", \"DaseekiArmoryItemScanTip\"")
-        local owned   = s:find("scanTip:SetOwner")
-        ck(created ~= nil and owned ~= nil and owned > created,
-           "…and does so AFTER creation, on the call path, not once at construction")
-        ck(s:find("function Addon:MaybeRepairRestrictions") ~= nil,
-           "the lazy repair pass is published")
-        ck(s:find("opts%.repair") ~= nil, "…and rides the existing throttled scan runner")
-        ck(s:find("Scan%.TOOLTIP_TRIES") < s:find("function Addon:MaybeRepairRestrictions"),
-           "…with the in-scan retry as the first line of defence")
-    end
-    local gp = io.open(P("goalPicker.lua"), "r")
-    if gp then
-        local g = gp:read("*a"); gp:close()
-        ck(g:find("Addon:MaybeRepairRestrictions") ~= nil,
-           "the picker triggers the repair when it opens (lazily, once per session)")
-        ck(g:find("Re%-reading class restrictions") ~= nil,
-           "…and says so in the count line while it runs")
-    end
-end)
-
-----------------------------------------------------------------------
 -- THE SEED MAY NOT OVERRIDE THE CLIENT  (1.3.1)
 --
 -- THE DEFECT (owner screenshot): the picker offered "Enchant Cloak -
@@ -2826,9 +2789,9 @@ suite("goal-picker-source-precedence", function(ck)
         if not okl then return nil, "goalPicker.lua raised at load" end
 
         local cache = Scan.NewCache()
-        Scan.Put(cache, 13794, "[PH] Shining Dawn Coif", 3, 0, 0)      -- internal
-        Scan.Put(cache, 18419, "Monster - Axe, 2H Horde Red War Axe", 2, 0, 0)
-        Scan.Put(cache, 19019, "Thunderfury, Blessed Blade of the Windseeker", 5, 0, 0)
+        Scan.Put(cache, 13794, "[PH] Shining Dawn Coif", 3)             -- internal
+        Scan.Put(cache, 18419, "Monster - Axe, 2H Horde Red War Axe", 2)
+        Scan.Put(cache, 19019, "Thunderfury, Blessed Blade of the Windseeker", 5)
         if scanned then cache.scannedAt = 1785862751 end
         A.ItemScanCache = function() return cache end
         -- the seed's disagreeing names for the SAME ids, verbatim from itemDB.lua
@@ -2902,8 +2865,8 @@ suite("goal-picker-source-precedence", function(ck)
         -- Each mutant is the rule written wrong; every one must disagree with the
         -- real Addon.GoalSeedAllowed on at least one of the four cache shapes.
         local none   = Scan.NewCache()
-        local part   = Scan.NewCache(); Scan.Put(part, 19019, "Thunderfury", 5, 0, 0)
-        local done   = Scan.NewCache(); Scan.Put(done, 19019, "Thunderfury", 5, 0, 0)
+        local part   = Scan.NewCache(); Scan.Put(part, 19019, "Thunderfury", 5)
+        local done   = Scan.NewCache(); Scan.Put(done, 19019, "Thunderfury", 5)
         done.scannedAt = 1785862751
         local hollow = Scan.NewCache(); hollow.scannedAt = 1785862751   -- stamped, zero rows
         local SHAPES = { none, part, done, hollow }
@@ -2986,154 +2949,203 @@ suite("goal-picker-source-precedence", function(ck)
 end)
 
 ----------------------------------------------------------------------
--- THE REPAIR REACHES THE OPEN PICKER  (1.3.1, round two)
+-- THE SHIPPED LOCKS REACH THE PICKER  (1.3.1, the architectural replacement)
 --
--- THE DEFECT (owner, on a warrior): four copies of Atiesh — the Naxxramas
--- legendary staff, locked to mage/priest/warlock/druid — and all eight Tier-3
--- sets were still in the list. Their class locks are the ones the pre-1.3.1
--- capture never read (classMask 0 across the whole 22314-22821 band, 0 of 224
--- rows restricted, verified in the owner's real cache), so the repair pass is
--- what fixes them.
+-- THE DEFECT, four times over: four copies of Atiesh — the Naxxramas legendary
+-- staff, locked to mage/priest/warlock/druid — and all nine Tier-3 sets were in a
+-- warrior's list. Their class locks are the ones the runtime capture never read
+-- (classMask 0 across the whole 22314-22821 band, 0 of 224 rows restricted,
+-- verified in the owner's real cache), and four generations of retry/repair
+-- machinery failed to get them.
 --
--- THE WIRING GAP: the repair wrote the masks and cleared the index, and then
--- nothing told the picker. The ONLY re-filter was f:ScanFinished, reached from a
--- 0.25s poll that f:SyncScanUI arms — and only when SyncScanUI happens to run
--- while a scan is already going. A repair that finished with the picker open but
--- the poll unarmed, or with the picker hidden and then re-shown from a cached
--- frame, left the pre-repair rows on screen. FinishItemScan now PUSHES the
--- refresh (Addon:RefreshGoalPicker) instead of waiting to be polled.
---
--- The second gap was the one-shot: MaybeRepairRestrictions stamped
--- Addon._restrictRepairTried and printed its notice BEFORE asking whether the
--- pass had actually started, so a session could burn its only attempt (and say so
--- in chat) on a repair that never ran.
+-- THE REPLACEMENT: they are shipped in restrictions.lua and looked up by id.
+-- This suite drives the real filter over the real shipped table — no fixture
+-- masks, no invented ids — so what it pins is the state the owner actually opens
+-- his picker into.
 ----------------------------------------------------------------------
-suite("goal-picker-repair-refilter", function(ck)
+suite("static-restrictions-shipped", function(ck)
     if type(Scan) ~= "table" then ck(false, "itemScan.lua did not load"); return end
+    if type(ScanAddon.StaticRestrictions) ~= "table" then
+        ck(false, "restrictions.lua did not publish Addon.StaticRestrictions"); return
+    end
+    local B = Scan.CLASS_BIT
+    local SR = ScanAddon.StaticRestrictions
 
-    -- ── 1. ATIESH, end to end, from tooltip text to picker row ──────────────
-    -- The fixture is the client's own tooltip for id 22589, in the order the
-    -- lines come off it. Nothing here is hand-waved: the same ParseRestrictions
-    -- the scan uses turns it into a mask, the same Scan.Put persists it, the same
-    -- Scan.Matches decides the row.
-    local loc = {
-        classPrefix = "Classes: ", racesPrefix = "Races: ",
-        classByName = { Warrior = "WARRIOR", Paladin = "PALADIN", Hunter = "HUNTER",
-                        Rogue = "ROGUE", Priest = "PRIEST", Shaman = "SHAMAN",
-                        Mage = "MAGE", Warlock = "WARLOCK", Druid = "DRUID" },
-        raceFaction = { Orc = Scan.FACTION_HORDE, Human = Scan.FACTION_ALLIANCE },
-        allianceLines = { Alliance = true }, hordeLines = { Horde = true },
-    }
-    local ATIESH_TIP = {
-        "Binds when picked up",
-        "Unique",
-        "Two-Hand", "Staff",
-        "146 - 271 Damage", "Speed 3.00",
-        "(69.5 damage per second)",
-        "+30 Stamina",
-        "+30 Intellect",
-        "Classes: Mage, Priest, Warlock, Druid",
-        "Requires Level 60",
-        "Equip: Increases damage and healing done by magical spells and effects by up to 95.",
-        "Equip: Restores 8 mana per 5 sec.",
-        "Increases the spell damage of all party members within 30 yards by up to 33.",
-    }
-    local mask, fac, read = Scan.ReadRestrictions(ATIESH_TIP, loc)
-    ck(read == true, "Atiesh's tooltip is a tooltip that BUILT (read = true)")
-    local expect = Scan.CLASS_BIT.MAGE + Scan.CLASS_BIT.PRIEST
-                 + Scan.CLASS_BIT.WARLOCK + Scan.CLASS_BIT.DRUID
-    ck(mask == expect,
-       "…and its 'Classes:' line is read as mage+priest+warlock+druid (got " .. mask .. ")")
-    ck(fac == Scan.FACTION_NONE, "…with no faction lock (both sides can hold it)")
-    ck(Scan.HasBit(mask, Scan.CLASS_BIT.WARRIOR) == false, "…and no warrior bit in it")
-    ck(Scan.HasBit(mask, Scan.CLASS_UNKNOWN) == false,
-       "…and no CLASS_UNKNOWN, so the filter does NOT fail open on it")
+    -- ── 1. THE TABLE ITSELF ─────────────────────────────────────────────────
+    local n = 0
+    for _ in pairs(SR) do n = n + 1 end
+    ck(n >= 850, "the shipped table carries the whole census, not a sample (" .. n .. " ids)")
+    ck(Scan.StaticCount() == n, "Scan.StaticCount agrees with the table it counts")
 
-    local warrior = { class = "WARRIOR", classBit = Scan.CLASS_BIT.WARRIOR,
-                      faction = Scan.FACTION_ALLIANCE, showUnusable = false }
-    local mage    = { class = "MAGE", classBit = Scan.CLASS_BIT.MAGE,
-                      faction = Scan.FACTION_ALLIANCE, showUnusable = false }
-    -- a staff is weapon subclass 10; a warrior IS proficient with staves, so the
-    -- class lock is the only thing that can hide it — exactly the owner's case
+    local badKey, badVal, tooWide, allNine = 0, 0, 0, 0
+    local NINE = B.WARRIOR + B.PALADIN + B.HUNTER + B.ROGUE + B.PRIEST
+               + B.SHAMAN + B.MAGE + B.WARLOCK + B.DRUID
+    for id, packed in pairs(SR) do
+        if type(id) ~= "number" or id <= 0 or id ~= math.floor(id) then badKey = badKey + 1 end
+        if type(packed) ~= "number" or packed <= 0 then badVal = badVal + 1 end
+        local m, f = Scan.UnpackStatic(packed)
+        if m >= Scan.STATIC_SHIFT or f > 2 then tooWide = tooWide + 1 end
+        if m > 0 and (m % (NINE + 1)) == NINE then allNine = allNine + 1 end
+        if m == 0 and f == Scan.FACTION_NONE then badVal = badVal + 1 end
+    end
+    ck(badKey == 0, "every key is a positive integer item id")
+    ck(badVal == 0, "every value is a positive packed lock — an unrestricted id is ABSENT, not 0")
+    ck(tooWide == 0, "no mask or faction overflows its field")
+    ck(allNine == 0,
+       "no entry names all nine classes: a mask that hides nothing is a row that lies")
+
+    -- pack/unpack is exact over the whole shipped table
+    local tripped = true
+    for id, packed in pairs(SR) do
+        local m, f = Scan.UnpackStatic(packed)
+        if Scan.PackStatic(m, f) ~= packed then tripped = false; break end
+    end
+    ck(tripped, "every shipped value survives UnpackStatic -> PackStatic unchanged")
+
+    -- ── 2. ATIESH: the owner's row, through the real predicate ──────────────
+    -- Every Atiesh variant is a staff (weapon subclass 10) and a warrior IS
+    -- proficient with staves, so nothing but the class lock can hide it. That is
+    -- exactly why it was the visible symptom.
     ck(Scan.PROF.WARRIOR.weapon[10] == true,
        "a warrior can wield a staff, so proficiency alone would never hide Atiesh")
-    local atiesh = { id = 22589, name = "atiesh, greatstaff of the guardian",
-                     display = "Atiesh, Greatstaff of the Guardian",
-                     equipLoc = "INVTYPE_2HWEAPON",
-                     classID = Scan.ITEM_CLASS_WEAPON, subclassID = 10,
-                     classMask = mask, faction = fac }
+    local ATIESH = { 22589, 22630, 22631, 22632 }
+    local CASTERS = { MAGE = true, WARLOCK = true, PRIEST = true, DRUID = true }
+    local seen, single, casterOnly = {}, 0, 0
+    for _, id in ipairs(ATIESH) do
+        local m, f = Scan.StaticFor(id)
+        ck(m > 0, "Atiesh " .. id .. " carries a class lock in the shipped table")
+        ck(f == Scan.FACTION_NONE, "…and no faction lock (both sides could hold one)")
+        local named, tok = 0, nil
+        for class, bit in pairs(B) do
+            if Scan.HasBit(m, bit) then named = named + 1; tok = class end
+        end
+        if named == 1 then single = single + 1 end
+        if tok and CASTERS[tok] then casterOnly = casterOnly + 1; seen[tok] = (seen[tok] or 0) + 1 end
+    end
+    ck(single == 4, "each of the four Atiesh ids names exactly one class")
+    ck(casterOnly == 4, "…and every one of them is a caster class")
+    local perm = 0
+    for c in pairs(CASTERS) do if seen[c] == 1 then perm = perm + 1 end end
+    ck(perm == 4,
+       "the four ids are a PERMUTATION of mage/warlock/priest/druid — one copy each, "
+       .. "which is the part that is checkable without the client")
+
+    -- and the load-bearing property, which holds however that permutation falls
+    local function row(id, subclass)
+        return { id = id, equipLoc = "INVTYPE_2HWEAPON", name = "",
+                 classID = Scan.ITEM_CLASS_WEAPON, subclassID = subclass or 10 }
+    end
+    local function viewer(class, faction, showUnusable)
+        return { class = class, classBit = B[class] or 0,
+                 faction = faction or Scan.FACTION_NONE,
+                 showUnusable = showUnusable and true or false }
+    end
     local twoHand = { INVTYPE_2HWEAPON = true }
-    ck(Scan.Matches(atiesh, "", twoHand, warrior) == false,
-       "THE OWNER'S ROW: with the lock captured, a warrior's empty-query list drops Atiesh")
-    ck(Scan.Matches(atiesh, "atiesh", twoHand, warrior) == false,
-       "…and searching for it by name does not bring it back either")
-    ck(Scan.Matches(atiesh, "", twoHand, mage) == true, "…while a mage still sees it")
-    ck(Scan.Matches(atiesh, "", twoHand,
-       { class = "WARRIOR", classBit = Scan.CLASS_BIT.WARRIOR, showUnusable = true }) == true,
-       "…and 'Show unusable' still reveals it, because it IS a real item")
-    -- the pre-repair state is the bug, and it must still reproduce
-    local unrepaired = { id = 22589, name = "atiesh", display = "Atiesh",
-                         equipLoc = "INVTYPE_2HWEAPON",
-                         classID = Scan.ITEM_CLASS_WEAPON, subclassID = 10,
-                         classMask = 0, faction = Scan.FACTION_NONE }
-    ck(Scan.Matches(unrepaired, "", twoHand, warrior) == true,
-       "…and with classMask 0 the warrior DOES see it — the repair is the fix, not the filter")
-
-    -- the mask survives the cache round trip the repair writes it through
-    local c = Scan.NewCache()
-    Scan.Put(c, 22589, "Atiesh, Greatstaff of the Guardian", 5, 0, 0, true)   -- as 1.3.0 left it
-    ck(select(6, Scan.Get(c, 22589)) == true, "before the repair, Atiesh is flagged unread")
-    ck(Scan.UnreadIds(c)[1] == 22589, "…so the repair queue picks it up")
-    Scan.Put(c, 22589, "Atiesh, Greatstaff of the Guardian", 5, mask, fac, false)
-    local _, q2, m2, f2, i2, u2 = Scan.Get(c, 22589)
-    ck(m2 == expect and q2 == 5 and f2 == Scan.FACTION_NONE,
-       "after it, the cache holds the class lock the tooltip named")
-    ck(u2 == false and i2 == false, "…flagged read, and never internal")
-    ck(Scan.UnreadCount(c) == 0, "…and the repair queue is empty")
-    -- and all four copies repair independently
-    for _, id in ipairs({ 22589, 22630, 22631, 22632 }) do
-        Scan.Put(c, id, "Atiesh, Greatstaff of the Guardian", 5, mask, fac, false)
+    local hiddenFromAll = 0
+    for _, id in ipairs(ATIESH) do
+        local ok = true
+        for _, c in ipairs({ "WARRIOR", "PALADIN", "HUNTER", "ROGUE", "SHAMAN" }) do
+            if Scan.Matches(row(id), "", twoHand, viewer(c)) then ok = false end
+        end
+        if ok then hiddenFromAll = hiddenFromAll + 1 end
     end
-    local locked = 0
-    for _, id in ipairs({ 22589, 22630, 22631, 22632 }) do
-        if select(3, Scan.Get(c, id)) == expect then locked = locked + 1 end
+    ck(hiddenFromAll == 4,
+       "THE OWNER'S ROW: no Atiesh is offered to a warrior, paladin, hunter, rogue or shaman")
+    local shownToSomeCaster = 0
+    for _, id in ipairs(ATIESH) do
+        for _, c in ipairs({ "MAGE", "WARLOCK", "PRIEST", "DRUID" }) do
+            if Scan.Matches(row(id), "", twoHand, viewer(c)) then
+                shownToSomeCaster = shownToSomeCaster + 1; break
+            end
+        end
     end
-    ck(locked == 4, "all FOUR Atiesh ids in the owner's cache carry the lock (got " .. locked .. ")")
+    ck(shownToSomeCaster == 4, "…and each copy is still offered to the caster who can hold it")
+    ck(Scan.Matches(row(22589), "atiesh", twoHand, viewer("WARRIOR")) == false,
+       "searching for it by name does not bring it back for a warrior either")
+    ck(Scan.Matches(row(22589), "", twoHand, viewer("WARRIOR", nil, true)) == true,
+       "…while 'Show unusable' still reveals it, because it IS a real item")
 
-    -- ── 2. THE WIRING: a finished repair pushes the refresh ─────────────────
+    -- ── 3. TIER 3: nine sets, eight pieces each, all in the shipped table ───
+    -- The band the runtime capture lost in its entirety.
+    local T3 = {
+        { 22416, 22423, "WARRIOR", "Dreadnaught"  },
+        { 22424, 22431, "PALADIN", "Redemption"   },
+        { 22436, 22443, "HUNTER",  "Cryptstalker" },
+        { 22464, 22471, "SHAMAN",  "Earthshatter" },
+        { 22476, 22483, "ROGUE",   "Bonescythe"   },
+        { 22488, 22495, "DRUID",   "Dreamwalker"  },
+        { 22496, 22503, "MAGE",    "Frostfire"    },
+        { 22504, 22511, "WARLOCK", "Plagueheart"  },
+        { 22512, 22519, "PRIEST",  "Vestments of Faith" },
+    }
+    local pieces, wrong = 0, 0
+    for _, set in ipairs(T3) do
+        local want = B[set[3]]
+        for id = set[1], set[2] do
+            pieces = pieces + 1
+            local m, f = Scan.StaticFor(id)
+            if m ~= want or f ~= Scan.FACTION_NONE then wrong = wrong + 1 end
+        end
+    end
+    ck(pieces == 72, "the fixture covers all nine Tier-3 sets, eight pieces each")
+    ck(wrong == 0, "every Tier-3 piece carries its own set's class and nothing else")
+
+    -- Bonescythe on a warrior — the headline symptom — through the real predicate
+    local plate = { INVTYPE_CHEST = true }
+    local bone = { id = 22476, equipLoc = "INVTYPE_CHEST", name = "",
+                   classID = Scan.ITEM_CLASS_ARMOR, subclassID = 2 }
+    ck(Scan.Matches(bone, "", plate, viewer("ROGUE")) == true,
+       "Bonescythe Breastplate is offered to a rogue")
+    ck(Scan.Matches(bone, "", plate, viewer("WARRIOR")) == false,
+       "…and is NOT offered to a warrior (leather proficiency would not have saved him)")
+    ck(Scan.PROF.WARRIOR.armor[2] == true,
+       "…confirmed: a warrior IS proficient with leather, so the class lock is the only thing hiding it")
+
+    -- ── 4. UNOBTAINABLE BY HISTORY ──────────────────────────────────────────
+    ck(type(ScanAddon.StaticUnobtainable) == "table",
+       "restrictions.lua publishes the unobtainable-by-history list")
+    local un = ScanAddon.StaticUnobtainable
+    for _, id in ipairs({ 18582, 18583, 18584, 22736, 23054 }) do
+        ck(un[id] == true, "the owner's named unobtainable id " .. id .. " is on the list")
+    end
+    local oneHand = { INVTYPE_WEAPON = true }
+    local glaive = { id = 18583, equipLoc = "INVTYPE_WEAPON", name = "",
+                     classID = Scan.ITEM_CLASS_WEAPON, subclassID = 7 }
+    ck(Scan.Matches(glaive, "", oneHand, viewer("WARRIOR")) == false,
+       "a Warglaive is not offered as a goal")
+    ck(Scan.Matches(glaive, "", oneHand, viewer("WARRIOR", nil, true)) == false,
+       "…and 'Show unusable' does NOT reveal it: no character anywhere can obtain one")
+    ck(Scan.IsUnobtainable(18583) == true and Scan.IsUnobtainable(19019) == false,
+       "Thunderfury, which IS obtainable, is not on the list")
+    ck(Scan.Matches({ id = 19019, equipLoc = "INVTYPE_WEAPON", name = "",
+                      classID = Scan.ITEM_CLASS_WEAPON, subclassID = 7 },
+                    "", oneHand, viewer("WARRIOR")) == true,
+       "…so it is still offered")
+
+    -- ── 5. THE SCAN → PICKER SEAM (the push that survived the deletion) ─────
     local sh = io.open(P("itemScan.lua"), "r")
     ck(sh ~= nil, "itemScan.lua is readable")
     if sh then
         local s = sh:read("*a"); sh:close()
-        local finish = s:find("function Addon:FinishItemScan")
-        local push   = s:find("Addon%.RefreshGoalPicker")
-        local invalid= s:find("Addon%.GoalItemDB, Addon%._goalDBStamp = nil, nil")
-        ck(finish and invalid and invalid > finish,
-           "FinishItemScan invalidates the picker index")
-        ck(push and finish and push > finish,
-           "THE FIX: …and then PUSHES the refresh into an open picker")
+        local finish  = s:find("function Addon:FinishItemScan")
+        local push    = s:find("Addon%.RefreshGoalPicker")
+        local invalid = s:find("Addon%.GoalItemDB, Addon%._goalDBStamp = nil, nil")
+        ck(finish and invalid and invalid > finish, "FinishItemScan invalidates the picker index")
+        ck(push and finish and push > finish, "…and then PUSHES the refresh into an open picker")
         ck(invalid and push and invalid < push,
            "…in that order, so the refresh rebuilds rather than re-reading the stale index")
-        ck(s:find("cache%.restrictLocked%s*=%s*restricted") ~= nil,
-           "the repair result is PERSISTED, not only printed")
-        ck(s:find("cache%.restrictUnreadable%s*=%s*unread") ~= nil,
-           "…both halves of it")
-        -- the latch closes on a pass that started
-        local start = s:find("local started, sreason = Addon:StartItemScan%({ repair = true }%)")
-        local latch = s:find("Addon%._restrictRepairTried = true")
-        ck(start ~= nil, "MaybeRepairRestrictions asks whether the pass actually started")
-        ck(start and latch and latch > start,
-           "THE FIX: …before burning the session's attempt on it")
-        local notice = s:find("re%-reading class restrictions for %%d cached items")
-        ck(start and notice and notice > start,
-           "…and before announcing a repair in chat")
-        -- the tooltip retry is deferred, not spun
-        ck(s:find("ST%.retry%[#ST%.retry %+ 1%] = id") ~= nil,
-           "an unreadable tooltip is deferred to a later tick, not re-queued into this one")
-        ck(s:find("ST%.queue%[#ST%.queue %+ 1%] = id\n%s*return true") == nil,
-           "THE SPIN IS GONE: three tries no longer burn inside one frame")
-        ck(s:find("and #ST%.retry == 0 then") ~= nil,
-           "…and a deferred row keeps the pass from declaring itself finished")
+
+        -- ── THE DELETION INVENTORY, asserted so it cannot creep back ────────
+        for _, gone in ipairs({
+            "ParseRestrictions", "ReadRestrictions", "TrustRead", "RepairGate",
+            "UnreadIds", "UnreadCount", "MaybeRepairRestrictions", "BlockRepair",
+            "IsRepairing", "RESTRICT_STAMP", "TOOLTIP_TRIES", "DATA_TRIES",
+            "SetItemByID", "IsItemDataCachedByID", "ITEM_CLASSES_ALLOWED",
+        }) do
+            ck(s:find(gone, 1, true) == nil,
+               "the runtime restriction machinery is GONE from itemScan.lua: " .. gone)
+        end
+        ck(s:find("Scan%.StaticFor") ~= nil, "…and the shipped-table lookup is what replaced it")
     end
     local gh = io.open(P("goalPicker.lua"), "r")
     ck(gh ~= nil, "goalPicker.lua is readable")
@@ -3145,11 +3157,15 @@ suite("goal-picker-repair-refilter", function(ck)
            "…which is a no-op when nothing is on screen")
         ck(g:find("picker:Requery%(preserveScroll ~= false%)") ~= nil,
            "…and re-filters, keeping the reader's scroll position by default")
-        ck(g:find("Addon:MaybeRepairRestrictions") ~= nil,
-           "the picker still triggers the repair when it opens")
+        ck(g:find("MaybeRepairRestrictions") == nil,
+           "OPENING THE PICKER NO LONGER STARTS ANYTHING")
+        ck(g:find("seedClassMask") == nil,
+           "…and the seed is no longer a runtime lock source")
+        ck(g:find("classMask = ") == nil and g:find("faction = faction") == nil,
+           "…nor does an index entry carry a copy of a lock it does not own")
     end
 
-    -- ── 3. /darmory scanstatus: the state is QUERYABLE ──────────────────────
+    -- ── 6. /darmory scanstatus: shorter, and the state is QUERYABLE ─────────
     ck(type(Scan.StatusReport) == "function", "Scan.StatusReport is published")
     local function joined(lines) return table.concat(lines or {}, "\n") end
     local function findLine(lines, prefix)
@@ -3159,57 +3175,47 @@ suite("goal-picker-repair-refilter", function(ck)
     end
 
     local empty = Scan.StatusReport(nil, nil)
-    ck(#empty == 1 and empty[1]:find("never run") ~= nil,
-       "with no cache at all it says so in one line")
-    ck(#Scan.StatusReport({}, nil) == 1, "…as it does for a table that is not a cache")
+    ck(#empty == 2 and empty[1]:find("never run") ~= nil,
+       "with no cache at all it says so — and still reports the shipped locks")
+    ck(findLine(empty, "restrictions: static table") ~= nil,
+       "…because the table is a property of the BUILD, not of the account")
 
-    -- a cache shaped like the owner's, mid-repair
     local rc = Scan.NewCache()
-    Scan.Put(rc, 22589, "Atiesh, Greatstaff of the Guardian", 5, expect, 0, false)
-    Scan.Put(rc, 22476, "Bonescythe Breastplate", 4, 0, 0, true)          -- still unread
-    Scan.Put(rc, 22477, "Bonescythe Gauntlets",   4, 0, 0, true)          -- still unread
-    Scan.Put(rc, 16963, "Nightslayer Chestpiece", 4, Scan.CLASS_BIT.ROGUE, 0, false)
-    Scan.Put(rc, 13789, "[PH] Brilliant Dawn Cap", 1, 0, 0, false)        -- internal
-    Scan.Put(rc, 12592, "Blackblade of Shahram",  4, 0, Scan.FACTION_HORDE, false)
+    Scan.Put(rc, 22589, "Atiesh, Greatstaff of the Guardian", 5)
+    Scan.Put(rc, 22476, "Bonescythe Breastplate", 4)
+    Scan.Put(rc, 16963, "Nightslayer Chestpiece", 4)
+    Scan.Put(rc, 13789, "[PH] Brilliant Dawn Cap", 1)        -- internal
     rc.scannedAt = 1785862751
     rc.build, rc.ranges = "68940", "1-32000"
 
     local idle = Scan.StatusReport(rc, nil)
-    -- cache / restrictions / scan state / last scan / last repair / stamps
-    ck(#idle == 6, "an idle report is six lines (got " .. #idle .. ")")
+    -- cache / restrictions / scan state / last scan / stamps
+    ck(#idle == 5, "an idle report is FIVE lines now (got " .. #idle .. ")")
     local cacheLine = findLine(idle, "cache:")
     ck(cacheLine ~= nil, "…led by the cache line")
-    ck(cacheLine and cacheLine:find("6 ids") ~= nil, "…which counts every row")
-    ck(cacheLine and cacheLine:find("5 offerable") ~= nil, "…separating what the picker may offer")
+    ck(cacheLine and cacheLine:find("4 ids") ~= nil, "…which counts every row")
+    ck(cacheLine and cacheLine:find("3 offerable") ~= nil, "…separating what the picker may offer")
     ck(cacheLine and cacheLine:find("1 internal") ~= nil, "…from what it hides")
-    local restrictLine = findLine(idle, "restrictions:")
-    ck(restrictLine and restrictLine:find("2 class%-locked") ~= nil,
-       "the restriction line counts the class locks that ARE captured")
-    ck(restrictLine and restrictLine:find("1 faction%-locked") ~= nil, "…and the faction locks")
-    ck(restrictLine and restrictLine:find("2 still unread") ~= nil,
-       "…and, crucially, how many rows the repair still owes")
+    local restrictLine = findLine(idle, "restrictions: static table")
+    ck(restrictLine ~= nil, "the restriction line names its source: a static table")
+    ck(restrictLine and restrictLine:find(tostring(n) .. " entries") ~= nil,
+       "…and says how many locks this build ships (" .. n .. ")")
+    ck(restrictLine and restrictLine:find("unobtainable%-by%-history") ~= nil,
+       "…and how many items are hidden as unobtainable")
     ck(findLine(idle, "scan: idle") ~= nil, "an idle scan says idle")
-    ck(findLine(idle, "scan: idle"):find("repair pass is still owed") ~= nil,
-       "…and says outright that a repair is outstanding, since 2 rows are unread")
+    ck(joined(idle):find("owed") == nil and joined(idle):find("unread") == nil,
+       "NOTHING IS EVER OWED ANY MORE: no line can say a pass is outstanding")
+    ck(joined(idle):find("repair") == nil, "…and the word 'repair' has left the report")
     ck(findLine(idle, "last full scan:") ~= nil, "the last completed scan is stamped")
     ck(joined(idle):find("68940") ~= nil and joined(idle):find("1%-32000") ~= nil,
        "…with the build and the id range it covered")
-    ck(findLine(idle, "last repair: never") ~= nil, "a cache never repaired says never")
-    ck(findLine(idle, "stamps:") ~= nil, "and the three stamps are readable")
+    ck(findLine(idle, "stamps:") ~= nil, "and the remaining stamps are readable")
     ck(joined(idle):find("denylist " .. Scan.INTERNAL_STAMP) ~= nil, "…the denylist stamp")
-    ck(joined(idle):find("capture " .. Scan.RESTRICT_STAMP) ~= nil, "…and the capture stamp")
+    ck(joined(idle):find("capture") == nil, "…with no capture stamp, because there is no capture")
 
-    -- the same cache with a repair RUNNING over it
-    local live = Scan.StatusReport(rc, { phase = "repair", cursor = 4120, total = 9241,
-                                         percent = 44, found = 9241 })
-    ck(findLine(live, "repair: RUNNING") ~= nil, "a running repair says RUNNING")
-    ck(findLine(live, "repair: RUNNING"):find("4120 / 9241") ~= nil,
-       "…with x / y, which is the question the chat line could not answer later")
-    ck(findLine(live, "repair: RUNNING"):find("44%%") ~= nil, "…and a percentage")
-    ck(findLine(live, "scan: idle") == nil, "…and does not also claim to be idle")
     local walking = Scan.StatusReport(rc, { phase = "instant", cursor = 8000, total = 32000,
                                             percent = 25, found = 3100 })
-    ck(findLine(walking, "scan: RUNNING") ~= nil, "the id walk reports as a scan, not a repair")
+    ck(findLine(walking, "scan: RUNNING") ~= nil, "the id walk reports as a running scan")
     ck(findLine(walking, "scan: RUNNING"):find("3100 equippable") ~= nil,
        "…counting what it has found so far")
     local loading = Scan.StatusReport(rc, { phase = "resolve", cursor = 900, total = 9241,
@@ -3217,28 +3223,11 @@ suite("goal-picker-repair-refilter", function(ck)
     ck(findLine(loading, "scan: RUNNING") ~= nil, "so does the item-loading phase")
     ck(findLine(loading, "scan: RUNNING"):find("900 / 9241") ~= nil, "…with its own x / y")
 
-    -- a repaired cache reports the result the chat line used to carry away
-    local done = Scan.NewCache()
-    Scan.Put(done, 22589, "Atiesh, Greatstaff of the Guardian", 5, expect, 0, false)
-    done.scannedAt = 1785862751
-    done.restrictRepairedAt = 1785949151
-    done.restrictLocked, done.restrictUnreadable = 1102, 37
-    local drep = Scan.StatusReport(done, nil)
-    local lastRepair = findLine(drep, "last repair:")
-    ck(lastRepair ~= nil and lastRepair:find("never") == nil, "a repaired cache reports its repair")
-    ck(lastRepair and lastRepair:find("1102 locked") ~= nil, "…how many rows it locked")
-    ck(lastRepair and lastRepair:find("37 unreadable") ~= nil, "…and how many it could not read")
-    ck(findLine(drep, "scan: idle") ~= nil and
-       findLine(drep, "scan: idle"):find("still owed") == nil,
-       "…and a fully-read cache does not claim a repair is outstanding")
-
-    -- purity: no line carries a colour code or a nil
     for _, l in ipairs(idle) do
         ck(type(l) == "string" and l:find("|c") == nil and l:find("nil") == nil,
            "every status line is plain, complete text: " .. tostring(l))
     end
 
-    -- the slash command really routes to it
     local sl = io.open(P("slash.lua"), "r")
     ck(sl ~= nil, "slash.lua is readable")
     if sl then
@@ -3247,6 +3236,17 @@ suite("goal-picker-repair-refilter", function(ck)
         ck(t:find("Scan%.StatusReport%(Addon:ItemScanCache%(%), Addon:ItemScanStatus%(%)%)") ~= nil,
            "…and prints exactly the report, over the live cache and the live scan state")
         ck(t:find("/darmory scanstatus") ~= nil, "…and is documented in the file's own header")
+    end
+
+    -- ── 7. THE TOC LOADS THE DATA BEFORE THE CODE THAT READS IT ─────────────
+    local th = io.open(P("Daseeki-Armory.toc"), "r")
+    ck(th ~= nil, "the TOC is readable")
+    if th then
+        local toc = th:read("*a"); th:close()
+        local r = toc:find("restrictions%.lua")
+        local i = toc:find("itemScan%.lua")
+        ck(r ~= nil, "restrictions.lua is shipped")
+        ck(r and i and r < i, "…and is loaded BEFORE itemScan.lua, which reads it")
     end
 end)
 
@@ -3401,7 +3401,7 @@ suite("item-scan-auto-arm", function(ck)
 
     -- A completed cache never arms, marker or no marker.
     local done = Scan.NewCache()
-    Scan.Put(done, 23709, "Corehound Belt", 3, 0, 0)
+    Scan.Put(done, 23709, "Corehound Belt", 3)
     done.scannedAt, done.autoScanTried = 1700000000, nil
     ck(Scan.IsComplete(done) == true, "a scanned, non-empty cache reads as complete")
     ck(scanLogin(newScanEnv(), done) == 0, "…and never arms the auto-scan again")
@@ -3434,283 +3434,6 @@ end)
 -- started and burned all three tooltip tries inside a single frame. It therefore
 -- SPENT the unread flags — the only record that a re-read was owed — without
 -- writing back the locks they stood for. A cache in that state is indistinguishable,
--- to the fixed pipeline, from a cache that has nothing left to do: UnreadCount is
--- 0, so MaybeRepairRestrictions declines, silently, on every future login.
---
--- The flags cannot re-arm themselves. Scan.RESTRICT_STAMP is the one thing left
--- that can: Normalize re-flags every real row on a stamp mismatch, which is the
--- exact mechanism the 1.3.0 -> 1.3.1 migration used, so bumping the constant runs
--- round one again on machinery that now works.
---
--- This suite pins the re-arm on the three cache states an upgrader can be in.
-----------------------------------------------------------------------
-suite("item-scan-capture-restamp", function(ck)
-    if type(Scan) ~= "table" then ck(false, "itemScan.lua did not load"); return end
-
-    ck(Scan.RESTRICT_STAMP == 3,
-       "the capture stamp has MOVED (got " .. tostring(Scan.RESTRICT_STAMP)
-       .. ") — nothing below can re-arm a consumed cache without it")
-
-    local ROGUE = Scan.CLASS_BIT.ROGUE
-    local MAGE  = Scan.CLASS_BIT.MAGE + Scan.CLASS_BIT.PRIEST
-                + Scan.CLASS_BIT.WARLOCK + Scan.CLASS_BIT.DRUID
-
-    -- The owner's cache in miniature, written through the real codec: one row
-    -- whose lock WAS read, one Atiesh whose lock was lost, one unrestricted row,
-    -- one internal row. `stamp` is what the cache carries off disk; `atieshMask`
-    -- is 0 for the consumed state and the true lock for the healthy one. Every
-    -- row is flagged READ — that is the poisoning.
-    local function ownerCache(stamp, atieshMask)
-        local c = Scan.NewCache()
-        Scan.Put(c, 16905, "Bloodfang Chestpiece",              4, ROGUE, 0, false)
-        Scan.Put(c, 22589, "Atiesh, Greatstaff of the Guardian", 5, atieshMask or 0, 0, false)
-        Scan.Put(c, 9425,  "Pendulum of Doom",                   4, 0, 0, false)
-        Scan.Put(c, 13789, "[PH] Brilliant Dawn Cap",            1, 0, 0, false)   -- internal
-        c.scannedAt          = 1785862751
-        c.restrictStamp      = stamp
-        c.restrictRepairedAt = 1785899160          -- the 11:06 line on his report
-        c.restrictLocked, c.restrictUnreadable = 0, 0
-        return c
-    end
-
-    -- ── THE POISONED STATE, stated exactly ──────────────────────────────────
-    -- On the CURRENT stamp a consumed cache is dead to the repair. This is not a
-    -- defect in Normalize or in MaybeRepairRestrictions — both are behaving —
-    -- it is why the constant had to move.
-    local dead = ownerCache(Scan.RESTRICT_STAMP, 0)
-    ck(Scan.UnreadCount(dead) == 0, "a consumed cache believes nothing is owed")
-    local deadN = Scan.Normalize(dead)
-    ck(deadN.unreadCount == 0,
-       "…and a login on the SAME stamp re-flags nothing — the debt is unrecoverable from the flags")
-    ck(#Scan.UnreadIds(deadN) == 0, "…so the repair queue is empty and no pass can start")
-    ck(select(3, Scan.Get(deadN, 22589)) == 0,
-       "…while Atiesh still carries no class lock: the picker keeps offering it to a warrior")
-
-    -- ── (a) THE POISONED CACHE, re-armed by the bump ────────────────────────
-    local poisoned = ownerCache(1, 0)                      -- off disk on the OLD stamp
-    ck(poisoned.restrictStamp ~= Scan.RESTRICT_STAMP, "(a) the poisoned cache is on the old capture stamp")
-    local a = Scan.Normalize(poisoned)
-    ck(a.restrictStamp == Scan.RESTRICT_STAMP, "(a) the login migration re-stamps it to the current capture")
-    ck(a.unreadCount == 3,
-       "…having re-flagged every REAL row unread (got " .. tostring(a.unreadCount) .. " of 3)")
-    ck(select(6, Scan.Get(a, 13789)) == false,
-       "…and left the internal row out of it: nothing ever asks it for a class lock")
-    ck(a.count == 4, "…keeping every row (no rescan is demanded of him)")
-    ck(select(3, Scan.Get(a, 16905)) == ROGUE,
-       "…and preserving the locks it DID hold — the migration rewrites the flag bit, not the mask")
-    local q = Scan.UnreadIds(a)
-    ck(#q == 3 and q[1] == 9425 and q[2] == 16905 and q[3] == 22589,
-       "…so the repair queue is the three real rows, in id order")
-
-    -- ── (b) A HEALTHY e145ecb REPAIR: one redundant re-read, no loss ────────
-    local healthy = ownerCache(1, MAGE)                    -- its repair DID land the locks
-    local b = Scan.Normalize(healthy)
-    ck(b.unreadCount == 3,
-       "(b) a cache whose repair was HEALTHY is re-queued too — one redundant re-read is the price")
-    ck(select(3, Scan.Get(b, 22589)) == MAGE,
-       "…but it carries its correct locks through the migration untouched")
-    ck(select(3, Scan.Get(b, 16905)) == ROGUE, "…every one of them")
-    -- and that is what makes the redundant pass harmless: the picker is right the
-    -- whole time it runs, so the owner sees no regression while it re-reads
-    local warrior = { class = "WARRIOR", classBit = Scan.CLASS_BIT.WARRIOR,
-                      faction = Scan.FACTION_NONE, showUnusable = false }
-    local row = { id = 22589, name = "atiesh", display = "Atiesh",
-                  equipLoc = "INVTYPE_2HWEAPON",
-                  classID = Scan.ITEM_CLASS_WEAPON, subclassID = 10,
-                  classMask = select(3, Scan.Get(b, 22589)), faction = Scan.FACTION_NONE }
-    ck(Scan.Matches(row, "", { INVTYPE_2HWEAPON = true }, warrior) == false,
-       "…so a warrior's list still drops Atiesh WHILE the redundant pass is running")
-
-    -- ── (c) A CACHE WRITTEN BY THIS BUILD IS NEVER RE-FLAGGED ───────────────
-    local fresh = Scan.NewCache()
-    Scan.Put(fresh, 16905, "Bloodfang Chestpiece", 4, ROGUE, 0, false)
-    Scan.Put(fresh, 22589, "Atiesh, Greatstaff of the Guardian", 5, MAGE, 0, false)
-    fresh.scannedAt = 1785999999
-    ck(fresh.restrictStamp == Scan.RESTRICT_STAMP, "(c) a cache built by THIS build carries the current stamp")
-    local cN = Scan.Normalize(fresh)
-    ck(cN.unreadCount == 0, "…so the next login re-flags nothing")
-    ck(Scan.UnreadCount(cN) == 0, "…and owes no repair pass at all")
-    ck(select(3, Scan.Get(cN, 22589)) == MAGE, "…with the locks its own tooltips read left alone")
-    -- a genuine failure inside that scan is still owed, and only it
-    Scan.Put(cN, 9425, "Pendulum of Doom", 4, 0, 0, true)
-    local cN2 = Scan.Normalize(cN)
-    ck(cN2.unreadCount == 1 and Scan.UnreadIds(cN2)[1] == 9425,
-       "…while a row whose tooltip genuinely refused is queued, and it alone")
-
-    ----------------------------------------------------------------------
-    -- BEHAVIOURAL: drive the real login -> picker-open path, all three states.
-    -- itemScan.lua touches the WoW API only from inside functions, so the whole
-    -- pipeline runs headlessly against stubs. The scan RUNNER is never ticked —
-    -- what is under test is which passes start, and what gets stamped.
-    ----------------------------------------------------------------------
-    local function scanEnv()
-        local A = {}
-        local fnc, e = loadfile(P("itemScan.lua"))
-        if not fnc then return nil, "compile: " .. tostring(e) end
-        local okl, el = pcall(fnc, "Daseeki-Armory", A)
-        if not okl then return nil, "load: " .. tostring(el) end
-        A.Tag  = function() return "[Armory]" end
-        A.Wrap = function(_, _, s) return s end
-        return A
-    end
-
-    local NIL  = {}
-    local KEYS = { "CreateFrame", "GetTime", "GetBuildInfo", "time", "UnitClass",
-                   "print", "UIParent", "C_Item", "DaseekiArmoryScanDB" }
-    local function withStubs(fn)
-        local saved = {}
-        for _, k in ipairs(KEYS) do
-            local v = _G[k]
-            saved[k] = (v == nil) and NIL or v
-        end
-        local frame = {}
-        function frame:Hide() end
-        function frame:Show() end
-        function frame:SetScript() end
-        function frame:RegisterEvent() end
-        function frame:UnregisterAllEvents() end
-        _G.CreateFrame   = function() return frame end
-        _G.GetTime       = function() return 1000 end
-        _G.GetBuildInfo  = function() return "1.15.7", "60111" end
-        _G.time          = function() return 1786000000 end
-        _G.UnitClass     = function() return "Warrior", "WARRIOR" end
-        _G.UIParent      = frame
-        _G.C_Item        = nil
-        _G.print         = function() end
-        local packed = { pcall(fn) }
-        for _, k in ipairs(KEYS) do
-            local v = saved[k]
-            _G[k] = (v ~= NIL) and v or nil
-        end
-        return unpack(packed)
-    end
-
-    -- (a) poisoned cache: login normalises it, the picker's call starts a pass
-    local A1 = scanEnv()
-    ck(A1 ~= nil, "a headless itemScan environment loads with no WoW API present")
-    if A1 then
-        local sv = ownerCache(1, 0)
-        local ok, started, queued, owed = withStubs(function()
-            _G.DaseekiArmoryScanDB = sv
-            A1:ItemScanCache()                       -- LOGIN: the migration runs here
-            local n = Scan.UnreadCount(sv)
-            local s = A1:MaybeRepairRestrictions()   -- PICKER OPEN
-            local st = A1:ItemScanStatus()
-            A1:StopItemScan()
-            return s, st and st.total or -1, n
-        end)
-        ck(ok == true, "(a) the poisoned cache drives the real login->picker path (" .. tostring(started) .. ")")
-        ck(owed == 3, "(a) login leaves three rows owed again (got " .. tostring(owed) .. ")")
-        ck(started == true, "(a) THE FORCING FIX: a repair pass starts on the owner's own cache state")
-        ck(queued == 3, "…queued with exactly the re-flagged rows (got " .. tostring(queued) .. ")")
-        ck(sv.restrictStamp == Scan.RESTRICT_STAMP, "…and the cache is on the new stamp on disk")
-    end
-
-    -- the counterfactual: the SAME cache already on the current stamp starts nothing
-    local A0 = scanEnv()
-    if A0 then
-        local sv0 = ownerCache(Scan.RESTRICT_STAMP, 0)
-        local ok0, started0 = withStubs(function()
-            _G.DaseekiArmoryScanDB = sv0
-            A0:ItemScanCache()
-            local s = A0:MaybeRepairRestrictions()
-            A0:StopItemScan()
-            return s
-        end)
-        ck(ok0 == true, "the counterfactual runs")
-        ck(started0 == false,
-           "WITHOUT the bump the same consumed cache starts nothing — that is the bug being forced open")
-    end
-
-    -- (b) healthy cache: one pass, and its locks are intact going into it
-    local A2 = scanEnv()
-    if A2 then
-        local sv2 = ownerCache(1, MAGE)
-        local ok2, started2, mask = withStubs(function()
-            _G.DaseekiArmoryScanDB = sv2
-            A2:ItemScanCache()
-            local s = A2:MaybeRepairRestrictions()
-            A2:StopItemScan()
-            return s, select(3, Scan.Get(sv2, 22589))
-        end)
-        ck(ok2 == true, "(b) the healthy cache drives the same path")
-        ck(started2 == true, "(b) …and pays one redundant re-read (accepted, not a defect)")
-        ck(mask == MAGE, "…with every lock it already held still in the cache")
-    end
-
-    -- (c) a FULL rescan finishing under this build stamps itself, and is not
-    --     followed by a repair — the owner's manual rescan must be the end of it
-    local A3 = scanEnv()
-    if A3 then
-        local sv3 = Scan.NewCache()
-        sv3.restrictStamp = 1                        -- it began life poisoned
-        local ok3, stamp, scanned, unread, after = withStubs(function()
-            _G.DaseekiArmoryScanDB = sv3
-            local cache = A3:ItemScanCache()         -- login: re-flagged (nothing in it yet)
-            A3:StartItemScan()                       -- the owner's Rescan Items
-            Scan.Put(cache, 16905, "Bloodfang Chestpiece", 4, ROGUE, 0, false)
-            Scan.Put(cache, 22589, "Atiesh, Greatstaff of the Guardian", 5, MAGE, 0, false)
-            A3:FinishItemScan()                      -- …runs to completion
-            local s = A3:MaybeRepairRestrictions()   -- picker opens afterwards
-            A3:StopItemScan()
-            return cache.restrictStamp, cache.scannedAt, cache.unreadCount, s
-        end)
-        ck(ok3 == true, "(c) a full scan runs to completion headlessly (" .. tostring(stamp) .. ")")
-        ck(stamp == Scan.RESTRICT_STAMP,
-           "(c) FinishItemScan stamps a COMPLETED FULL SCAN with the current capture (got "
-           .. tostring(stamp) .. ")")
-        ck(scanned == 1786000000, "…and marks it complete")
-        ck(unread == 0, "…with nothing left unread — its own tooltips were read")
-        ck(after == false,
-           "(c) …so his manual rescan is NOT followed by a pointless repair pass")
-        ck(Scan.Normalize(sv3).unreadCount == 0, "…and the NEXT login re-flags nothing either")
-    end
-
-    -- and the repair path stamps too, so a completed repair is terminal
-    local A4 = scanEnv()
-    if A4 then
-        local sv4 = ownerCache(1, 0)
-        local ok4, stamp4, repaired, unread4 = withStubs(function()
-            _G.DaseekiArmoryScanDB = sv4
-            local cache = A4:ItemScanCache()
-            A4:MaybeRepairRestrictions()
-            for _, id in ipairs({ 9425, 16905, 22589 }) do          -- the pass reads them
-                local nm, qq = Scan.Get(cache, id)
-                Scan.Put(cache, id, nm, qq, id == 22589 and MAGE or 0, 0, false)
-            end
-            A4:FinishItemScan()
-            return cache.restrictStamp, cache.restrictRepairedAt, cache.unreadCount
-        end)
-        ck(ok4 == true, "a finished repair pass runs headlessly")
-        ck(stamp4 == Scan.RESTRICT_STAMP, "…and carries the current capture stamp")
-        ck(repaired == 1786000000, "…records when it ran")
-        ck(unread4 == 0, "…and leaves nothing owed")
-        ck(sv4.restrictLocked == 1 and sv4.restrictUnreadable == 0,
-           "…with the result persisted for /darmory scanstatus to read back")
-        ck(Scan.Normalize(sv4).unreadCount == 0, "…so the next login does not repeat it")
-    end
-
-    -- ── source contract: the comparison is against the CONSTANT ─────────────
-    local fh = io.open(P("itemScan.lua"), "r")
-    ck(fh ~= nil, "itemScan.lua is readable")
-    if fh then
-        local s = fh:read("*a"); fh:close()
-        ck(s:find("Scan%.RESTRICT_STAMP%s*=%s*3") ~= nil,
-           "the capture constant is at 3 in the source")
-        ck(s:find("  3  THE SECOND FORCING BUMP") ~= nil,
-           "…and the bump carries its rationale, so the next reader knows WHY it moved")
-        ck(s:find("cache%.restrictStamp%s*~=%s*Scan%.RESTRICT_STAMP") ~= nil,
-           "Normalize compares against the CONSTANT, so the next bump needs one edit and no other")
-        ck(s:find("restrictStamp%s*~=%s*1") == nil and s:find("restrictStamp%s*==%s*1") == nil,
-           "…and nothing anywhere tests the stamp against a literal")
-        ck(s:find("if reread%s+then unflag = not flag end") ~= nil,
-           "a stamp mismatch re-flags every non-internal row unread")
-        ck(s:find("cache%.unreadCount%s*=%s*unread%s*\n%s*cache%.restrictStamp%s*=%s*Scan%.RESTRICT_STAMP") ~= nil,
-           "FinishItemScan stamps in the UNCONDITIONAL recount block, so a full scan records it too")
-    end
-end)
-
-----------------------------------------------------------------------
 -- A FAILED RE-READ MAY NOT ERASE A LOCK IT DID NOT READ  (1.3.1)
 --
 -- THE DEFECT (pre-existing, found while reviewing the capture-stamp bump):
@@ -3718,240 +3441,6 @@ end)
 -- Scan.ReadRestrictions answers a tooltip that did not build with
 -- 0, FACTION_NONE, false. So a row whose RE-READ failed had its previously-good
 -- mask overwritten with 0 — correctly flagged unread, but with the evidence gone.
---
--- That matters because the pass most likely to hit it is the redundant one: a
--- capture-stamp bump re-queues EVERY real row (state (b) of
--- item-scan-capture-restamp), so a single transient tooltip failure over a
--- healthy row downgrades good data, and Atiesh is back in a warrior's list until
--- some later session happens to read it again.
---
--- Failing OPEN on an unreadable tooltip is policy and is unchanged. Destroying
--- what an earlier read already established is not.
-----------------------------------------------------------------------
-suite("item-scan-mask-preserve", function(ck)
-    if type(Scan) ~= "table" then ck(false, "itemScan.lua did not load"); return end
-
-    local ROGUE   = Scan.CLASS_BIT.ROGUE
-    local WARRIOR = Scan.CLASS_BIT.WARRIOR
-    local MAGE    = Scan.CLASS_BIT.MAGE
-
-    -- ── 1. THE PRIMITIVE: Scan.Put's precedence, case by case ───────────────
-    local c = Scan.NewCache()
-    Scan.Put(c, 16905, "Bloodfang Chestpiece", 4, ROGUE, 0, false)   -- a tooltip that BUILT
-    ck(select(3, Scan.Get(c, 16905)) == ROGUE, "the row starts with the lock its tooltip named")
-
-    -- good mask + FAILED re-read: the mask survives, the row goes unread
-    Scan.Put(c, 16905, "Bloodfang Chestpiece", 4, 0, 0, true)
-    local nm, q, m, _, _, u = Scan.Get(c, 16905)
-    ck(m == ROGUE, "THE FIX: a failed re-read does NOT overwrite the stored class lock")
-    ck(u == true, "…while the row IS flagged unread, so the repair pass still owes it a look")
-    ck(q == 4 and nm == "Bloodfang Chestpiece", "…and name / quality are written as before")
-    ck(Scan.UnreadIds(c)[1] == 16905, "…so it is queued for the next pass, not written off")
-
-    -- good mask + a re-read that SUCCEEDS with a different answer: updated
-    Scan.Put(c, 16905, "Bloodfang Chestpiece", 4, MAGE, 0, false)
-    ck(select(3, Scan.Get(c, 16905)) == MAGE, "a successful re-read replaces the stored lock")
-    ck(select(6, Scan.Get(c, 16905)) == false, "…and clears the unread flag")
-
-    -- a READ write of 0 is EVIDENCE, and may still clear a lock
-    Scan.Put(c, 16905, "Bloodfang Chestpiece", 4, 0, 0, false)
-    ck(select(3, Scan.Get(c, 16905)) == 0,
-       "a tooltip that built and named no class clears the lock — a finding, not a gap")
-
-    -- no prior data + failed read: zeros and unread, exactly as 1.3.1 already did
-    Scan.Put(c, 22476, "Bonescythe Breastplate", 4, 0, 0, true)
-    local _, _, m2, f2, _, u2 = Scan.Get(c, 22476)
-    ck(m2 == 0 and f2 == Scan.FACTION_NONE and u2 == true,
-       "a row with nothing stored still lands 0 / FACTION_NONE / unread (fail-open, unchanged)")
-
-    -- the faction lock is preserved on the same rule, independently of the mask
-    Scan.Put(c, 12592, "Blackblade of Shahram", 4, 0, Scan.FACTION_HORDE, false)
-    Scan.Put(c, 12592, "Blackblade of Shahram", 4, 0, 0, true)
-    ck(select(4, Scan.Get(c, 12592)) == Scan.FACTION_HORDE,
-       "…and a failed re-read does not erase a stored FACTION lock either")
-    ck(select(6, Scan.Get(c, 12592)) == true, "…which is still flagged for the repair pass")
-
-    -- an UNREAD write that nonetheless carries a value still wins
-    Scan.Put(c, 9425, "Pendulum of Doom", 4, 0, 0, false)
-    Scan.Put(c, 9425, "Pendulum of Doom", 4, ROGUE, 0, true)
-    ck(select(3, Scan.Get(c, 9425)) == ROGUE,
-       "evidence is evidence: an unread write that DOES carry a mask is not thrown away")
-
-    -- the bookkeeping still adds up after all of that
-    local n = Scan.Normalize(c)
-    ck(n.count == 4, "the cache still holds its four rows")
-    ck(n.unreadCount == 3, "…with three of them owed a re-read (got " .. tostring(n.unreadCount) .. ")")
-
-    ----------------------------------------------------------------------
-    -- 2. BEHAVIOURAL: drive the REAL repair pass over a REAL refusing tooltip.
-    -- itemScan.lua touches the WoW API only from inside functions, so the whole
-    -- recorder — StartItemScan, ScanTick, recordItem, tooltipLines,
-    -- ReadRestrictions, Scan.Put, FinishItemScan — runs headlessly against stubs.
-    ----------------------------------------------------------------------
-    local function scanEnv()
-        local A = {}
-        local fnc = loadfile(P("itemScan.lua"))
-        if not fnc then return nil end
-        local okl = pcall(fnc, "Daseeki-Armory", A)
-        if not okl then return nil end
-        A.Tag  = function() return "[Armory]" end
-        A.Wrap = function(_, _, s) return s end
-        A.SLOT_INVTYPES = { chest = { INVTYPE_ROBE = true } }
-        return A
-    end
-
-    local NAMES = { [16905] = "Bloodfang Chestpiece", [9425] = "Pendulum of Doom" }
-    local NIL   = {}
-    local KEYS  = { "CreateFrame", "GetTime", "GetBuildInfo", "time", "UnitClass",
-                    "print", "UIParent", "C_Item", "C_CreatureInfo", "GetItemInfo",
-                    "GetItemInfoInstant", "LOCALIZED_CLASS_NAMES_MALE",
-                    "LOCALIZED_CLASS_NAMES_FEMALE", "ITEM_CLASSES_ALLOWED",
-                    "DaseekiArmoryScanDB" }
-    for i = 1, 8 do KEYS[#KEYS + 1] = "DaseekiArmoryItemScanTipTextLeft" .. i end
-
-    -- The hidden scanning tooltip, driven exactly as itemScan.lua drives it:
-    -- SetItemByID publishes the line font-strings under the tooltip's global name
-    -- and NumLines reports what is there. tipLines = nil IS the defect's own
-    -- condition — a tooltip that does not build at all.
-    local tipLines
-    local function withStubs(fn)
-        local saved = {}
-        for _, k in ipairs(KEYS) do
-            local v = _G[k]; saved[k] = (v == nil) and NIL or v
-        end
-        local frame = {}
-        function frame:Hide() end
-        function frame:Show() end
-        function frame:SetScript() end
-        function frame:RegisterEvent() end
-        function frame:UnregisterAllEvents() end
-        function frame:SetOwner() end
-        function frame:ClearLines() end
-        function frame:SetItemByID()
-            for i = 1, 8 do _G["DaseekiArmoryItemScanTipTextLeft" .. i] = nil end
-            for i, txt in ipairs(tipLines or {}) do
-                local t = txt
-                _G["DaseekiArmoryItemScanTipTextLeft" .. i] = { GetText = function() return t end }
-            end
-        end
-        function frame:NumLines() return tipLines and #tipLines or 0 end
-        _G.CreateFrame        = function() return frame end
-        _G.GetTime            = function() return 1000 end
-        _G.GetBuildInfo       = function() return "1.15.7", "60111" end
-        _G.time               = function() return 1786000000 end
-        _G.UnitClass          = function() return "Warrior", "WARRIOR" end
-        _G.UIParent           = frame
-        _G.C_Item             = nil
-        _G.C_CreatureInfo     = nil
-        _G.print              = function() end
-        _G.LOCALIZED_CLASS_NAMES_MALE   = { ROGUE = "Rogue", WARRIOR = "Warrior", MAGE = "Mage" }
-        _G.LOCALIZED_CLASS_NAMES_FEMALE = nil
-        _G.ITEM_CLASSES_ALLOWED = "Classes: %s"
-        _G.GetItemInfo        = function(id) return NAMES[id] or "Corehound Belt", nil, 4 end
-        _G.GetItemInfoInstant = function(id) return id, nil, nil, "INVTYPE_ROBE", 12345 end
-        local packed = { pcall(fn) }
-        for _, k in ipairs(KEYS) do
-            local v = saved[k]; _G[k] = (v ~= NIL) and v or nil
-        end
-        return unpack(packed)
-    end
-
-    local function runToIdle(A)
-        local t = 0
-        while A:IsScanning() and t < 40 do A:ScanTick(1); t = t + 1 end
-        A:StopItemScan()
-        return t
-    end
-
-    -- ── (a) the redundant pass over a HEALTHY row whose tooltip refuses ──────
-    local A1 = scanEnv()
-    ck(A1 ~= nil, "a headless itemScan environment loads with no WoW API present")
-    if A1 then
-        local sv = Scan.NewCache()
-        Scan.Put(sv, 16905, "Bloodfang Chestpiece", 4, ROGUE, 0, false)
-        sv.scannedAt     = 1785862751
-        sv.restrictStamp = 1              -- off disk on the old stamp: re-queued
-        tipLines = nil                    -- …and no tooltip builds this session
-        local ok, owed, ticks = withStubs(function()
-            _G.DaseekiArmoryScanDB = sv
-            A1:ItemScanCache()                       -- LOGIN: re-flags, keeps the mask
-            local n = Scan.UnreadCount(sv)
-            A1:StartItemScan({ repair = true })      -- PICKER OPEN: the redundant pass
-            return n, runToIdle(A1)
-        end)
-        ck(ok == true, "(a) the repair pass runs headlessly over a refusing tooltip")
-        ck(owed == 1, "(a) login leaves the healthy row owed a re-read (got " .. tostring(owed) .. ")")
-        ck(ticks == Scan.TOOLTIP_TRIES,
-           "…and it costs one tick per try, never all three inside one frame (got "
-           .. tostring(ticks) .. ")")
-        ck(select(3, Scan.Get(sv, 16905)) == ROGUE,
-           "(a) THE FIX, END TO END: three failed tooltip builds leave the class lock standing")
-        ck(select(6, Scan.Get(sv, 16905)) == true,
-           "…with the row still flagged unread, so a later session tries again")
-        ck(sv.restrictLocked == 1,
-           "…and the pass reports the lock as still held (got " .. tostring(sv.restrictLocked) .. ")")
-        ck(sv.restrictUnreadable == 1, "…alongside the read it could not make")
-        ck(sv.unreadCount == 1, "…so exactly one row remains owed on disk")
-    end
-
-    -- ── (b) the same pass with a tooltip that DOES build, saying something new ─
-    local A2 = scanEnv()
-    if A2 then
-        local sv2 = Scan.NewCache()
-        Scan.Put(sv2, 16905, "Bloodfang Chestpiece", 4, ROGUE, 0, false)
-        sv2.scannedAt     = 1785862751
-        sv2.restrictStamp = 1
-        tipLines = { "Bloodfang Chestpiece", "Binds when picked up", "Chest", "Leather",
-                     "Classes: Warrior" }
-        local ok2 = withStubs(function()
-            _G.DaseekiArmoryScanDB = sv2
-            A2:ItemScanCache()
-            A2:StartItemScan({ repair = true })
-            return runToIdle(A2)
-        end)
-        ck(ok2 == true, "(b) the same pass runs against a tooltip that builds")
-        ck(select(3, Scan.Get(sv2, 16905)) == WARRIOR,
-           "(b) a successful re-read OVERWRITES the stored lock with what it read (got "
-           .. tostring(select(3, Scan.Get(sv2, 16905))) .. ")")
-        ck(select(6, Scan.Get(sv2, 16905)) == false, "…and the row is no longer owed")
-        ck(sv2.unreadCount == 0, "…so the cache owes nothing at all")
-    end
-
-    -- ── (c) PHASE 2's FIRST read of an id: no prior data, behaviour unchanged ─
-    local A3 = scanEnv()
-    if A3 then
-        A3.ItemScan.RANGES = { { 9425, 9426 } }   -- a two-id id space: phase 1 is instant
-        local sv3 = Scan.NewCache()
-        tipLines = nil                            -- every tooltip refuses
-        local ok3 = withStubs(function()
-            _G.DaseekiArmoryScanDB = sv3
-            A3:ItemScanCache()
-            A3:StartItemScan()                    -- a FULL scan, not a repair
-            return runToIdle(A3)
-        end)
-        ck(ok3 == true, "(c) a full scan runs over a two-id space")
-        ck(sv3.count == 2, "…recording both ids the walk found (got " .. tostring(sv3.count) .. ")")
-        local _, _, m3, f3, _, u3 = Scan.Get(sv3, 9425)
-        ck(m3 == 0 and f3 == Scan.FACTION_NONE and u3 == true,
-           "(c) a first read has nothing to preserve, so it still lands 0 / FACTION_NONE / unread")
-        ck(sv3.unreadCount == 2, "…and both rows are owed the repair pass")
-    end
-
-    -- ── the rule lives in the primitive, so every writer inherits it ─────────
-    local fh = io.open(P("itemScan.lua"), "r")
-    ck(fh ~= nil, "itemScan.lua is readable")
-    if fh then
-        local s = fh:read("*a"); fh:close()
-        ck(s:find("A WRITE THAT CARRIES NO EVIDENCE MAY NOT ERASE EVIDENCE") ~= nil,
-           "the precedence is stated where the code enforces it")
-        local put = s:find("function Scan%.Put")
-        local rec = s:find("Scan%.Put%(ST%.cache")
-        ck(put ~= nil and rec ~= nil and rec > put,
-           "…and the scan's one and only writer goes through it")
-    end
-end)
-
-----------------------------------------------------------------------
 -- AN UNRESTRICTED VERDICT IS ONLY BELIEVABLE FROM A LOADED ITEM  (1.3.1,
 -- third and final generation of the restriction fix)
 --
@@ -3968,406 +3457,6 @@ end)
 --
 -- Corroboration in the same cache: the one Bonescythe piece that DID capture
 -- mask 8 is the one whose data happened to be warm at read time, and the
--- contiguous Tier-3 band that lost every lock in the original scan is the same
--- mechanism with round one's retry spin on top of it.
---
--- THE FIX under test here: Scan.TrustRead. An empty verdict is believed only
--- when the item's data is verifiably loaded; a restriction that WAS found is
--- believed unconditionally (evidence is evidence — the same precedence
--- Scan.Put applies to a write). A cold row is asked for and requeued instead,
--- with a patient ceiling, and an exhausted ceiling persists it unread — which,
--- under mask-preserve, costs it nothing it already knew.
-----------------------------------------------------------------------
-suite("item-scan-data-gate", function(ck)
-    if type(Scan) ~= "table" then ck(false, "itemScan.lua did not load"); return end
-
-    local ROGUE   = Scan.CLASS_BIT.ROGUE
-    local WARRIOR = Scan.CLASS_BIT.WARRIOR
-    local NONE    = Scan.FACTION_NONE
-    local HORDE   = Scan.FACTION_HORDE
-
-    -- ── 1. THE PRIMITIVE: the truth table, every cell ───────────────────────
-    ck(type(Scan.TrustRead) == "function", "Scan.TrustRead is published as a pure primitive")
-    if type(Scan.TrustRead) ~= "function" then return end
-
-    ck(Scan.TrustRead(false, 0, NONE, true) == false,
-       "a tooltip that did not build is never trusted, however warm the item is")
-    ck(Scan.TrustRead(false, ROGUE, NONE, true) == false,
-       "…not even when the parser somehow produced a mask from nothing")
-    ck(Scan.TrustRead(true, ROGUE, NONE, false) == true,
-       "THE GATE'S OTHER HALF: a class line that DID render is trusted on a cold item")
-    ck(Scan.TrustRead(true, 0, HORDE, false) == true,
-       "…and so is a faction line: the restriction block rendered, so the missing "
-       .. "class line is a finding")
-    ck(Scan.TrustRead(true, Scan.CLASS_UNKNOWN, NONE, false) == true,
-       "…and an unresolved class token is still a class line, so it is trusted too")
-    ck(Scan.TrustRead(true, 0, NONE, true) == true,
-       "a LOADED item that names no class really has no class lock")
-    ck(Scan.TrustRead(true, 0, NONE, false) == false,
-       "THE FIX: an EMPTY verdict off a COLD item is not evidence and is not trusted")
-    ck(Scan.TrustRead(true, 0, NONE, nil) == false,
-       "…and an unanswerable cache probe reads as cold, not as permission")
-
-    -- the ceiling exists, and is patient enough to be worth having
-    ck(type(Scan.DATA_TRIES) == "number" and Scan.DATA_TRIES >= 5,
-       "a cold row gets a patient retry ceiling (got " .. tostring(Scan.DATA_TRIES) .. ")")
-    ck(Scan.DATA_TRIES > Scan.TOOLTIP_TRIES,
-       "…more patient than a tooltip that will not build at all, whose prospects are worse")
-
-    ----------------------------------------------------------------------
-    -- 2. BEHAVIOURAL: drive the REAL recorder against a REAL partial tooltip.
-    -- The stubs model the defect exactly — GetItemInfo answers with the name
-    -- (which is why recordItem gets as far as the tooltip at all), the tooltip
-    -- builds with a name line and no restriction block, and
-    -- C_Item.IsItemDataCachedByID tells the truth about the item's data.
-    ----------------------------------------------------------------------
-    local function scanEnv()
-        local A = {}
-        local fnc = loadfile(P("itemScan.lua"))
-        if not fnc then return nil end
-        if not pcall(fnc, "Daseeki-Armory", A) then return nil end
-        A.Tag  = function() return "[Armory]" end
-        A.Wrap = function(_, _, s) return s end
-        A.SLOT_INVTYPES = { chest = { INVTYPE_ROBE = true } }
-        return A
-    end
-
-    local NIL  = {}
-    local KEYS = { "CreateFrame", "GetTime", "GetBuildInfo", "time", "UnitClass",
-                   "print", "UIParent", "C_Item", "C_CreatureInfo", "GetItemInfo",
-                   "GetItemInfoInstant", "LOCALIZED_CLASS_NAMES_MALE",
-                   "LOCALIZED_CLASS_NAMES_FEMALE", "ITEM_CLASSES_ALLOWED",
-                   "DaseekiArmoryScanDB" }
-    for i = 1, 8 do KEYS[#KEYS + 1] = "DaseekiArmoryItemScanTipTextLeft" .. i end
-
-    -- world state the cases drive
-    local W = {}
-    local function resetWorld()
-        W.cached  = {}   -- [id] = true once the item's data is "loaded"
-        W.tip     = {}   -- [id] = the tooltip lines this id builds RIGHT NOW
-        W.names   = {}
-        W.asked   = {}   -- [id] = how many times the server was asked
-        W.asks    = 0    -- total asks
-        W.peakAsk = 0    -- most asks inside any one tick
-        W.noAPI   = false
-        W.warmTip = nil    -- the lines an id builds ONCE its data has arrived
-        W.loadAfter = nil  -- ask count at which an id's data arrives
-    end
-    resetWorld()
-
-    local function withStubs(fn)
-        local saved = {}
-        for _, k in ipairs(KEYS) do
-            local v = _G[k]; saved[k] = (v == nil) and NIL or v
-        end
-        local frame = {}
-        function frame:Hide() end
-        function frame:Show() end
-        function frame:SetScript() end
-        function frame:RegisterEvent() end
-        function frame:UnregisterAllEvents() end
-        function frame:SetOwner() end
-        function frame:ClearLines() end
-        local shown
-        function frame:SetItemByID(id)
-            shown = W.tip[id]
-            for i = 1, 8 do _G["DaseekiArmoryItemScanTipTextLeft" .. i] = nil end
-            for i, txt in ipairs(shown or {}) do
-                local t = txt
-                _G["DaseekiArmoryItemScanTipTextLeft" .. i] = { GetText = function() return t end }
-            end
-        end
-        function frame:NumLines() return shown and #shown or 0 end
-        _G.CreateFrame  = function() return frame end
-        _G.GetTime      = function() return 1000 end
-        _G.GetBuildInfo = function() return "1.15.9", "68808" end
-        _G.time         = function() return 1786000000 end
-        _G.UnitClass    = function() return "Warrior", "WARRIOR" end
-        _G.UIParent     = frame
-        _G.print        = function() end
-        _G.C_CreatureInfo = nil
-        _G.LOCALIZED_CLASS_NAMES_MALE   = { ROGUE = "Rogue", WARRIOR = "Warrior" }
-        _G.LOCALIZED_CLASS_NAMES_FEMALE = nil
-        _G.ITEM_CLASSES_ALLOWED = "Classes: %s"
-        _G.GetItemInfo        = function(id) return W.names[id], nil, 4 end
-        _G.GetItemInfoInstant = function(id) return id, nil, nil, "INVTYPE_ROBE", 12345 end
-        -- NOT `W.noAPI and nil or {…}` — in Lua that always yields the table.
-        _G.C_Item = nil
-        if not W.noAPI then _G.C_Item = {
-            IsItemDataCachedByID = function(id) return W.cached[id] and true or false end,
-            RequestLoadItemDataByID = function(id)
-                W.asked[id] = (W.asked[id] or 0) + 1
-                W.asks = W.asks + 1
-                W.tickAsks = (W.tickAsks or 0) + 1
-                if W.peakAsk < W.tickAsks then W.peakAsk = W.tickAsks end
-                if W.loadAfter and W.asked[id] >= W.loadAfter then
-                    W.cached[id] = true
-                    if W.warmTip and W.warmTip[id] then W.tip[id] = W.warmTip[id] end
-                end
-            end,
-        } end
-        local packed = { pcall(fn) }
-        for _, k in ipairs(KEYS) do
-            local v = saved[k]; _G[k] = (v ~= NIL) and v or nil
-        end
-        return unpack(packed)
-    end
-
-    local function runToIdle(A, cap)
-        local t = 0
-        while A:IsScanning() and t < (cap or 200) do
-            W.tickAsks = 0
-            A:ScanTick(1); t = t + 1
-        end
-        A:StopItemScan()
-        return t
-    end
-
-    -- ── (a) THE DEFECT'S OWN CASE: cold item, partial tooltip ───────────────
-    -- Round two would have read "no Classes: line" here and written mask 0 over
-    -- a real rogue lock. The gate must refuse it, ask the server, and come back.
-    local A1 = scanEnv()
-    ck(A1 ~= nil, "a headless itemScan environment loads with C_Item present")
-    if A1 then
-        resetWorld()
-        W.names[22476] = "Bonescythe Breastplate"
-        W.tip[22476]   = { "Bonescythe Breastplate", "Binds when picked up" }  -- PARTIAL
-        W.warmTip      = { [22476] = { "Bonescythe Breastplate", "Binds when picked up",
-                                       "Chest", "Leather", "Classes: Rogue" } }
-        W.loadAfter    = 2   -- the realm answers on the second ask
-        local sv = Scan.NewCache()
-        Scan.Put(sv, 22476, "Bonescythe Breastplate", 4, 0, 0, true)
-        sv.scannedAt = 1785862751
-        local ok, ticks = withStubs(function()
-            _G.DaseekiArmoryScanDB = sv
-            A1:ItemScanCache()
-            A1:StartItemScan({ repair = true })
-            return runToIdle(A1)
-        end)
-        ck(ok == true, "(a) the gated repair pass runs over a partial tooltip")
-        ck(ticks < Scan.DATA_TRIES,
-           "(a) it finishes once the data arrives, well inside the ceiling (got "
-           .. tostring(ticks) .. ")")
-        ck(W.asks >= 2, "(a) the cold row was ASKED for, not written off (asks="
-           .. tostring(W.asks) .. ")")
-        local _, _, m, f, _, u = Scan.Get(sv, 22476)
-        ck(m == ROGUE,
-           "(a) THE FIX, END TO END: the class lock is captured once the item loads (got "
-           .. tostring(m) .. ")")
-        ck(f == NONE and u == false, "…the row is read, and owes nothing further")
-        ck(sv.unreadCount == 0, "…so the cache is clean")
-        ck(sv.restrictLocked == 1,
-           "…and the pass reports the lock it found (got " .. tostring(sv.restrictLocked) .. ")")
-    end
-
-    -- ── (b) THE ROUND-TWO REGRESSION, pinned: never recorded unrestricted ───
-    -- Same partial tooltip, but the realm NEVER answers. The row must not come
-    -- out of the pass claiming to be unrestricted-and-read.
-    local A2 = scanEnv()
-    if A2 then
-        resetWorld()
-        W.names[22476] = "Bonescythe Breastplate"
-        W.tip[22476]   = { "Bonescythe Breastplate", "Binds when picked up" }
-        W.cached[22476] = false           -- and it stays cold for ever
-        local sv2 = Scan.NewCache()
-        Scan.Put(sv2, 22476, "Bonescythe Breastplate", 4, ROGUE, 0, false)  -- a KNOWN lock
-        sv2.scannedAt     = 1785862751
-        sv2.restrictStamp = 2             -- off disk on the partial-blind stamp
-        local ok2, owed, ticks2 = withStubs(function()
-            _G.DaseekiArmoryScanDB = sv2
-            A2:ItemScanCache()                      -- LOGIN under stamp 3: re-armed
-            local n = Scan.UnreadCount(sv2)
-            A2:StartItemScan({ repair = true })
-            return n, runToIdle(A2)
-        end)
-        ck(ok2 == true, "(b) the pass runs against a tooltip that never fills in")
-        ck(owed == 1, "(b) the stamp-3 bump re-arms the row round two consumed")
-        ck(ticks2 == Scan.DATA_TRIES,
-           "(b) the ceiling is spent one try per TICK, never inside one frame (got "
-           .. tostring(ticks2) .. ")")
-        local _, _, m2, _, _, u2 = Scan.Get(sv2, 22476)
-        ck(m2 == ROGUE,
-           "(b) THE REGRESSION CANNOT RECUR: an exhausted ceiling keeps the stored lock")
-        ck(u2 == true, "…and leaves the row flagged unread for a later session")
-        ck(sv2.restrictUnreadable == 1,
-           "…so the pass reports it as UNREADABLE rather than as read-and-clean")
-        ck(sv2.unreadCount == 1, "…and the debt survives on disk")
-    end
-
-    -- ── (c) a COLD item whose tooltip DOES name a class: trusted at once ────
-    local A3 = scanEnv()
-    if A3 then
-        resetWorld()
-        W.names[16905] = "Bloodfang Chestpiece"
-        W.tip[16905]   = { "Bloodfang Chestpiece", "Chest", "Leather", "Classes: Warrior" }
-        W.cached[16905] = false           -- cold, and it does not matter
-        local sv3 = Scan.NewCache()
-        Scan.Put(sv3, 16905, "Bloodfang Chestpiece", 4, ROGUE, 0, true)
-        sv3.scannedAt = 1785862751
-        local ok3, ticks3 = withStubs(function()
-            _G.DaseekiArmoryScanDB = sv3
-            A3:ItemScanCache()
-            A3:StartItemScan({ repair = true })
-            return runToIdle(A3)
-        end)
-        ck(ok3 == true, "(c) the pass runs over a cold item with a real class line")
-        ck(ticks3 == 1, "(c) it is believed on the FIRST look — no wait, no retry (got "
-           .. tostring(ticks3) .. ")")
-        ck(W.asks == 0, "…and the server is never troubled for it")
-        local _, _, m3, _, _, u3 = Scan.Get(sv3, 16905)
-        ck(m3 == WARRIOR, "(c) evidence is evidence: the found lock is recorded as read")
-        ck(u3 == false, "…and the row owes nothing")
-    end
-
-    -- ── (d) a WARM item with no class line: trusted unrestricted ────────────
-    local A4 = scanEnv()
-    if A4 then
-        resetWorld()
-        W.names[9425] = "Pendulum of Doom"
-        W.tip[9425]   = { "Pendulum of Doom", "Binds when equipped", "Two-Hand", "Mace" }
-        W.cached[9425] = true             -- LOADED, so the silence means something
-        local sv4 = Scan.NewCache()
-        Scan.Put(sv4, 9425, "Pendulum of Doom", 4, ROGUE, 0, true)  -- a stale mask
-        sv4.scannedAt = 1785862751
-        local ok4, ticks4 = withStubs(function()
-            _G.DaseekiArmoryScanDB = sv4
-            A4:ItemScanCache()
-            A4:StartItemScan({ repair = true })
-            return runToIdle(A4)
-        end)
-        ck(ok4 == true, "(d) the pass runs over a warm item with no restriction block")
-        ck(ticks4 == 1, "(d) a loaded item is answered on the first look (got "
-           .. tostring(ticks4) .. ")")
-        ck(W.asks == 0, "…with no server round trip at all")
-        local _, _, m4, _, _, u4 = Scan.Get(sv4, 9425)
-        ck(m4 == 0,
-           "(d) THE GATE IS NOT A BLANKET REFUSAL: a read off a LOADED item still clears "
-           .. "a stale lock (got " .. tostring(m4) .. ")")
-        ck(u4 == false, "…and the row is recorded as read")
-        ck(sv4.unreadCount == 0, "…so no repair is owed afterwards")
-    end
-
-    -- ── (e) THROTTLE: re-asks spend the same credit as first-asks ───────────
-    -- The gate turns nearly every cold row into a server ask, so the retry path
-    -- is where a repair pass's traffic now lives. If it requested outside the
-    -- credit the peak would quietly double.
-    local A5 = scanEnv()
-    if A5 then
-        resetWorld()
-        local sv5 = Scan.NewCache()
-        for id = 30001, 30120 do
-            W.names[id] = "Cold Item " .. id
-            W.tip[id]   = { "Cold Item " .. id, "Binds when picked up" }   -- all partial
-            Scan.Put(sv5, id, "Cold Item " .. id, 4, 0, 0, true)
-        end
-        sv5.scannedAt = 1785862751
-        local ok5 = withStubs(function()
-            _G.DaseekiArmoryScanDB = sv5
-            A5:ItemScanCache()
-            A5:StartItemScan({ repair = true })
-            return runToIdle(A5, 400)
-        end)
-        ck(ok5 == true, "(e) a 120-row all-cold repair pass runs to completion")
-        ck(W.peakAsk <= Scan.REQUEST_PER_TICK,
-           "(e) THE THROTTLE HOLDS: no tick ever asks more than REQUEST_PER_TICK times (peak "
-           .. tostring(W.peakAsk) .. " vs " .. tostring(Scan.REQUEST_PER_TICK) .. ")")
-        ck(sv5.unreadCount == 120,
-           "…every row that never loaded is still owed (got " .. tostring(sv5.unreadCount) .. ")")
-        local capped = true
-        for id = 30001, 30120 do
-            if (W.asked[id] or 0) > Scan.DATA_TRIES then capped = false end
-        end
-        ck(capped, "…and no row was asked more times than its ceiling allows")
-    end
-
-    -- ── (e2) …including on the ARRIVALS path, which is where the dispatch ───
-    -- loop's own guard cannot reach. Items whose data arrived are drained under
-    -- TOOLTIP_BUDGET (25), not under REQUEST_PER_TICK (15); if such a row is
-    -- STILL cold when its tooltip is read — the realm answered the event and the
-    -- data went away again, or answered for a different id — it takes the retry
-    -- path and asks. Only requestLoad's own credit test bounds that.
-    local A5b = scanEnv()
-    if A5b then
-        resetWorld()
-        local sv5b = Scan.NewCache()
-        local IDS = {}
-        for id = 31001, 31040 do
-            IDS[#IDS + 1] = id
-            W.tip[id] = { "Arrived Item " .. id, "Binds when picked up" }   -- partial
-            Scan.Put(sv5b, id, "Arrived Item " .. id, 4, 0, 0, true)
-        end
-        sv5b.scannedAt = 1785862751
-        local ok5b, peak = withStubs(function()
-            _G.DaseekiArmoryScanDB = sv5b
-            A5b:ItemScanCache()
-            A5b:StartItemScan({ repair = true })
-            -- GetItemInfo answers for nothing yet, so every row goes IN FLIGHT
-            for _ = 1, 6 do W.tickAsks = 0; A5b:ScanTick(1) end
-            -- …then the whole batch "arrives" at once
-            for _, id in ipairs(IDS) do W.names[id] = "Arrived Item " .. id end
-            for _, id in ipairs(IDS) do A5b:ScanItemLoaded(id, true) end
-            W.peakAsk, W.tickAsks = 0, 0
-            A5b:ScanTick(1)               -- the drain tick: up to 25 tooltip reads
-            local p = W.peakAsk
-            A5b:StopItemScan()
-            return p
-        end)
-        ck(ok5b == true, "(e2) a batch of 40 arrivals drains under the tooltip budget")
-        ck(peak > 0, "(e2) …and the still-cold rows do ask the server (asks=" .. tostring(peak) .. ")")
-        ck(peak <= Scan.REQUEST_PER_TICK,
-           "(e2) THE CREDIT IS THE ONLY THING BOUNDING THE ARRIVALS PATH: "
-           .. tostring(peak) .. " asks in one tick, ceiling " .. tostring(Scan.REQUEST_PER_TICK))
-    end
-
-    -- ── (f) NO C_Item NAMESPACE: degrades, never raises ─────────────────────
-    local A6 = scanEnv()
-    if A6 then
-        resetWorld()
-        W.noAPI = true
-        W.names[9425] = "Pendulum of Doom"
-        W.tip[9425]   = { "Pendulum of Doom", "Two-Hand", "Mace" }
-        local sv6 = Scan.NewCache()
-        Scan.Put(sv6, 9425, "Pendulum of Doom", 4, 0, 0, true)
-        sv6.scannedAt = 1785862751
-        local ok6 = withStubs(function()
-            _G.DaseekiArmoryScanDB = sv6
-            A6:ItemScanCache()
-            A6:StartItemScan({ repair = true })
-            return runToIdle(A6)
-        end)
-        ck(ok6 == true, "(f) a build with no C_Item namespace still completes the pass")
-        ck(select(6, Scan.Get(sv6, 9425)) == false,
-           "…falling back to GetItemInfo, which is 1.3.1's behaviour unchanged — no build is "
-           .. "made worse by the gate")
-    end
-
-    -- ── source contract ─────────────────────────────────────────────────────
-    local fh = io.open(P("itemScan.lua"), "r")
-    ck(fh ~= nil, "itemScan.lua is readable")
-    if fh then
-        local s = fh:read("*a"); fh:close()
-        ck(s:find("A TOOLTIP THAT BUILT IS NOT THE SAME THING AS AN ITEM THAT LOADED") ~= nil,
-           "the rule is stated where the code enforces it")
-        ck(s:find("C_Item%.IsItemDataCachedByID") ~= nil,
-           "the probe is the client's own documented answer (1.15.9 API catalogue)")
-        ck(s:find("Scan%.TrustRead%(read, classMask, faction, cached%)") ~= nil,
-           "…and recordItem routes its verdict through the pure primitive")
-        local trust  = s:find("function Scan%.TrustRead")
-        local caller = s:find("Scan%.TrustRead%(read, classMask")
-        ck(trust ~= nil and caller ~= nil and caller > trust,
-           "…which is defined in the pure layer, above its one in-game caller")
-        ck(s:find("Scan%.DATA_TRIES") ~= nil and s:find("Scan%.TOOLTIP_TRIES") ~= nil,
-           "the two causes keep separate ceilings")
-        ck(s:find("if requestLoad%(id%) then tries%[id%] = t end") ~= nil,
-           "a try is spent on an ASK, so a throttled lap of the queue costs the row nothing")
-        ck(s:find("ST%.loadSent") ~= nil,
-           "…and both ask paths spend one shared per-tick credit")
-        ck(s:find("_G%.C_Item%.RequestLoadItemDataByID%(id%)\n") == nil,
-           "…with no ungoverned request left anywhere in the file")
-    end
-end)
-
-----------------------------------------------------------------------
 -- THE SESSION LATCH  (1.3.1) — "opening the picker does nothing"
 --
 -- THE OWNER'S BUG, in his words: /darmory scanstatus reads
@@ -4387,490 +3476,6 @@ end)
 -- the data gate describes, where the client returns no item data at all, so it
 -- re-read 9 240 rows, captured nothing and reported "0 locked, 9 240 unreadable".
 -- Addon._restrictRepairTried was stamped the moment that pass STARTED and was
--- never released, so every later picker open was refused, in silence, for the
--- rest of the session while the status line kept saying a pass was owed.
---
--- THE SHAPE 1 315 CHECKS NEVER BUILT: a SECOND picker open in the SAME session,
--- after a first pass that finished without paying the debt down. Every existing
--- behavioural case opens the picker exactly once per environment (suite
--- item-scan-capture-restamp) or starts the pass directly through StartItemScan
--- (suite item-scan-data-gate), so the latch was only ever observed in its
--- unstamped state and the second open was never taken.
-----------------------------------------------------------------------
-suite("item-scan-repair-gate", function(ck)
-    if type(Scan) ~= "table" then ck(false, "itemScan.lua did not load"); return end
-    local ROGUE = Scan.CLASS_BIT.ROGUE
-    local NONE  = Scan.FACTION_NONE
-
-    -- ── SINGLE-SOURCE BIT LAYOUT (suspect 1, refuted and pinned) ────────────
-    -- The unread-flag WRITER (Normalize's re-flag) and the repair-queue READER
-    -- (UnreadIds) can only disagree if somebody keeps a second copy of the
-    -- layout. There is exactly one, it is private to itemScan.lua, and every
-    -- reader in the addon goes through Scan.PackMeta / Scan.UnpackMeta.
-    do
-        local h = io.open(P("itemScan.lua"), "r")
-        ck(h ~= nil, "itemScan.lua is readable")
-        if h then
-            local s = h:read("*a"); h:close()
-            local _, defs = s:gsub("local%s+U_SHIFT%s*=", "")
-            ck(defs == 1, "the unread bit's position is declared exactly ONCE (got "
-               .. tostring(defs) .. ")")
-            local _, packs = s:gsub("cache%.meta%[id%]%s*=%s*Scan%.PackMeta", "")
-            ck(packs == 2, "…and only Normalize and Scan.Put ever write a packed record (got "
-               .. tostring(packs) .. ")")
-            -- no other shipped file may open the record by hand
-            local toc, others = io.open(P("Daseeki-Armory.toc"), "r"), 0
-            if toc then
-                for line in toc:lines() do
-                    local f = line:match("^%s*([%w_%-]+%.lua)%s*$")
-                    if f and f ~= "itemScan.lua" then
-                        local fh = io.open(P(f), "r")
-                        if fh then
-                            local body = fh:read("*a"); fh:close()
-                            if body:find("U_SHIFT") or body:find("I_SHIFT")
-                               or body:find("524288") or body:find("262144") then
-                                others = others + 1
-                            end
-                        end
-                    end
-                end
-                toc:close()
-            end
-            ck(others == 0, "…and no other shipped file knows a bit position (got "
-               .. tostring(others) .. " that do)")
-        end
-    end
-
-    -- …and the layout is PINNED, because it is not private to this build: every
-    -- packed record is sitting in somebody's SavedVariables right now. Moving a
-    -- bit position re-reads every stored record as something else — an owner's
-    -- 9 240 unread flags would come back as internal flags, or as nothing — so a
-    -- move is only safe together with a Scan.CACHE_VERSION bump, which discards
-    -- the old payload instead of misreading it. These literals make that pairing
-    -- a deliberate, visible edit rather than a silent one.
-    do
-        ck(Scan.PackMeta(1, 0, 0, false, false) == 1,      "layout: quality occupies the low bits")
-        ck(Scan.PackMeta(0, 1, 0, false, false) == 16,     "layout: classMask starts at 16")
-        ck(Scan.PackMeta(0, 0, 1, false, false) == 65536,  "layout: faction starts at 65536")
-        ck(Scan.PackMeta(0, 0, 0, true,  false) == 262144, "layout: the INTERNAL flag is 262144")
-        ck(Scan.PackMeta(0, 0, 0, false, true)  == 524288,
-           "layout: the UNREAD flag is 524288 — move it and every cache on disk is misread")
-        ck(Scan.CACHE_VERSION == 1,
-           "…so CACHE_VERSION is pinned beside it: a layout change must bump this in the same edit")
-        ck(select(5, Scan.UnpackMeta(524288)) == true,
-           "…and the reader opens that exact bit as `unread`")
-        ck(select(4, Scan.UnpackMeta(262144)) == true, "…and that exact bit as `internal`")
-    end
-
-    -- every reader of the flag agrees on the same fixture, by construction
-    do
-        local c = Scan.NewCache()
-        Scan.Put(c, 101, "Read Row",   4, ROGUE, 0, false)
-        Scan.Put(c, 102, "Unread Row", 4, 0, 0, true)
-        Scan.Put(c, 103, "[PH] Thing", 1, 0, 0, true)   -- internal: never owed
-        local n = Scan.Normalize(c)
-        local report = table.concat(Scan.StatusReport(n, nil), "\n")
-        ck(n.unreadCount == 1, "the WRITER's tally counts one owed row")
-        ck(#Scan.UnreadIds(n) == 1, "…the repair-queue READER finds the same one")
-        ck(Scan.UnreadIds(n)[1] == 102, "…and it is the row that is actually flagged")
-        ck(report:find("1 still unread") ~= nil, "…and the status walk agrees with both")
-    end
-
-    -- ── THE BLOCK REASON IS SESSION STATE ───────────────────────────────────
-    -- It lives on the cache only so /darmory scanstatus can read it back, and
-    -- every reason it can carry is phrased about THIS session. A reason that
-    -- survived a relog would be a lie in the one place the owner goes for the
-    -- truth, so the login normalise clears it.
-    do
-        local c = Scan.NewCache()
-        Scan.Put(c, 102, "Unread Row", 4, 0, 0, true)
-        c.scannedAt      = 1785862751
-        c.repairBlocked  = "this session's repair pass already ran and left all 9240 rows unread"
-        local n = Scan.Normalize(c)
-        ck(n.repairBlocked == nil,
-           "a block reason does not survive the login that ends the session it described")
-        ck(table.concat(Scan.StatusReport(n, nil), "\n"):find("repair blocked") == nil,
-           "…so a fresh session's scanstatus does not report a stale block")
-        ck(n.unreadCount == 1, "…while the debt itself, which IS on disk, survives untouched")
-    end
-
-    -- ── THE GATE ITSELF, pure ────────────────────────────────────────────────
-    local function gate(t) return Scan.RepairGate(t) end
-    do
-        local ok, why = gate({ scanning = false, complete = true, owed = 9240 })
-        ck(ok == true and why == nil, "an owed debt on a complete cache runs a pass")
-
-        ok, why = gate({ scanning = false, complete = true, owed = 0 })
-        ck(ok == false and why == nil,
-           "nothing owed is NOT a refusal — there must be no complaint about a healthy cache")
-
-        ok, why = gate({ scanning = true, complete = true, owed = 9240 })
-        ck(ok == false and type(why) == "string", "a running scan refuses WITH a reason")
-
-        ok, why = gate({ scanning = false, complete = false, owed = 9240 })
-        ck(ok == false and (why or ""):find("Rescan Items") ~= nil,
-           "an unscanned account is told to scan, not left guessing")
-
-        -- THE DEFECT'S OWN CASE
-        ok, why = gate({ scanning = false, complete = true, owed = 9240,
-                         tried = true, lastFrom = 9240 })
-        ck(ok == false and type(why) == "string",
-           "a pass that paid NOTHING off refuses the next open — and says why")
-        ck((why or ""):find("9240") ~= nil and (why or ""):find("relog") ~= nil,
-           "…naming the debt and the remedy (got: " .. tostring(why) .. ")")
-
-        -- THE FIX: progress re-opens the door
-        ok, why = gate({ scanning = false, complete = true, owed = 4000,
-                         tried = true, lastFrom = 9240 })
-        ck(ok == true and why == nil,
-           "THE FIX: a pass that paid the debt DOWN lets the next open run another")
-        ok = gate({ scanning = false, complete = true, owed = 1, tried = true, lastFrom = 2 })
-        ck(ok == true, "…however small the payment was")
-        ok = gate({ scanning = false, complete = true, owed = 9241,
-                    tried = true, lastFrom = 9240 })
-        ck(ok == false, "…while a debt that GREW does not re-open it (it cannot converge)")
-        ck(gate({ scanning = false, complete = true, owed = 5, tried = false }) == true,
-           "…and the first open of a session always runs")
-    end
-
-    ----------------------------------------------------------------------
-    -- BEHAVIOURAL: his cache shape, the real picker-open path, one call at a
-    -- time. A FEW HUNDRED rows is the shape; 9 240 is only the count, and
-    -- fixturing it buys nothing but minutes.
-    ----------------------------------------------------------------------
-    local function scanEnv()
-        local A = {}
-        local fnc = loadfile(P("itemScan.lua"))
-        if not fnc then return nil end
-        if not pcall(fnc, "Daseeki-Armory", A) then return nil end
-        A.Tag  = function() return "[Armory]" end
-        A.Wrap = function(_, _, s) return s end
-        A.SLOT_INVTYPES = { [1] = { INVTYPE_ROBE = true } }
-        return A
-    end
-
-    local NIL  = {}
-    local KEYS = { "CreateFrame", "GetTime", "GetBuildInfo", "time", "UnitClass", "print",
-                   "UIParent", "C_Item", "GetItemInfo", "GetItemInfoInstant",
-                   "ITEM_CLASSES_ALLOWED", "LOCALIZED_CLASS_NAMES_MALE",
-                   "LOCALIZED_CLASS_NAMES_FEMALE", "C_CreatureInfo", "DaseekiArmoryScanDB" }
-    for i = 1, 8 do KEYS[#KEYS + 1] = "DaseekiArmoryItemScanTipTextLeft" .. i end
-
-    local W = {}
-    local CHAT = {}
-    local function withStubs(fn)
-        local saved = {}
-        for _, k in ipairs(KEYS) do
-            local v = _G[k]; saved[k] = (v == nil) and NIL or v
-        end
-        local frame, shown = {}, nil
-        function frame:Hide() end
-        function frame:Show() end
-        function frame:SetScript() end
-        function frame:RegisterEvent() end
-        function frame:UnregisterAllEvents() end
-        function frame:SetOwner() end
-        function frame:ClearLines() end
-        function frame:SetItemByID(id)
-            shown = W.tip[id]
-            for i = 1, 8 do _G["DaseekiArmoryItemScanTipTextLeft" .. i] = nil end
-            for i, txt in ipairs(shown or {}) do
-                local t = txt
-                _G["DaseekiArmoryItemScanTipTextLeft" .. i] = { GetText = function() return t end }
-            end
-        end
-        function frame:NumLines() return shown and #shown or 0 end
-        _G.CreateFrame  = function() return frame end
-        _G.GetTime      = function() return W.now or 1000 end
-        _G.GetBuildInfo = function() return "1.15.9", "68808" end
-        _G.time         = function() return 1786000000 end
-        _G.UnitClass    = function() return "Warrior", "WARRIOR" end
-        _G.UIParent     = frame
-        _G.print        = function(s) CHAT[#CHAT + 1] = tostring(s) end
-        _G.C_CreatureInfo = nil
-        _G.ITEM_CLASSES_ALLOWED = "Classes: %s"
-        _G.LOCALIZED_CLASS_NAMES_MALE   = { ROGUE = "Rogue", WARRIOR = "Warrior" }
-        _G.LOCALIZED_CLASS_NAMES_FEMALE = nil
-        _G.GetItemInfo        = function(id) return W.names[id], nil, 4 end
-        _G.GetItemInfoInstant = function(id) return id, nil, nil, "INVTYPE_ROBE", 12345 end
-        _G.C_Item = {
-            IsItemDataCachedByID = function(id) return W.cached[id] and true or false end,
-            RequestLoadItemDataByID = function(id)
-                W.asks = W.asks + 1
-                if W.answers then
-                    W.cached[id] = true
-                    if W.warmTip[id] then W.tip[id] = W.warmTip[id] end
-                end
-            end,
-        }
-        local packed = { pcall(fn) }
-        for _, k in ipairs(KEYS) do
-            local v = saved[k]; _G[k] = (v ~= NIL) and v or nil
-        end
-        return unpack(packed)
-    end
-
-    -- HIS CACHE SHAPE: a few hundred real rows off a completed scan, every one
-    -- of them flagged unread by the stamp-3 migration, already ON capture 3.
-    local ROWS = 300
-    local function ownerShape(answers)
-        W.cached, W.tip, W.warmTip, W.names, W.asks, W.now = {}, {}, {}, {}, 0, 1000
-        W.answers = answers and true or false
-        local sv = Scan.NewCache()
-        for i = 1, ROWS do
-            local id = 20000 + i
-            W.names[id] = "Owner Item " .. i
-            W.tip[id]   = { W.names[id], "Binds when picked up" }      -- PARTIAL
-            -- one row in eight is a rogue piece once its data lands
-            if i % 8 == 0 then
-                W.warmTip[id] = { W.names[id], "Binds when picked up", "Chest",
-                                  "Leather", "Classes: Rogue" }
-            else
-                W.warmTip[id] = { W.names[id], "Binds when picked up", "Chest", "Leather" }
-            end
-            Scan.Put(sv, id, W.names[id], 4, 0, 0, true)
-        end
-        sv.scannedAt          = 1785862751
-        sv.restrictStamp      = Scan.RESTRICT_STAMP     -- ALREADY on 3, off disk
-        sv.restrictRepairedAt = 1785899160
-        sv.restrictLocked, sv.restrictUnreadable = 834, 0
-        return sv
-    end
-
-    -- A BOUNDED driver. Never a bare `while`: the ceiling is an assert, because
-    -- a repair state machine that will not finish must fail this harness rather
-    -- than run the machine out of memory.
-    local function runToIdle(A, cap)
-        local t = 0
-        while A:IsScanning() do
-            t = t + 1
-            assert(t <= (cap or 800),
-                   "TICK CEILING: the repair pass did not finish in " .. tostring(cap or 800))
-            W.now = W.now + 1
-            A:ScanTick(1)
-        end
-        return t
-    end
-
-    -- ── (1) THE PERMANENT REPRODUCTION: his shape, picker open, pass runs ────
-    local A1 = scanEnv()
-    ck(A1 ~= nil, "a headless itemScan environment loads for the reproduction")
-    if A1 then
-        local sv = ownerShape(true)          -- a client that DOES answer
-        CHAT = {}
-        local ok, started, ticks, owedBefore = withStubs(function()
-            _G.DaseekiArmoryScanDB = sv
-            local cache = A1:ItemScanCache()               -- login
-            local owed  = Scan.UnreadCount(cache)
-            local s     = A1:MaybeRepairRestrictions()     -- PICKER OPEN
-            local t     = runToIdle(A1)
-            return s, t, owed
-        end)
-        ck(ok == true, "(1) his shape drives the real picker-open path (" .. tostring(started) .. ")")
-        ck(owedBefore == ROWS, "(1) login leaves every real row owed (got "
-           .. tostring(owedBefore) .. " of " .. ROWS .. ")")
-        ck(started == true, "(1) THE PASS STARTS on the owner's own cache state")
-        ck(type(ticks) == "number" and ticks > 0,
-           "(1) …and it COMPLETES over the fixture (" .. tostring(ticks) .. " ticks)")
-        ck(sv.unreadCount == 0, "(1) …leaving nothing owed (got " .. tostring(sv.unreadCount) .. ")")
-        ck(#Scan.UnreadIds(sv) == 0, "…by the flags as well as the tally")
-        local expectLocks = math.floor(ROWS / 8)
-        ck(sv.restrictLocked == expectLocks,
-           "(1) …and it CAPTURED the class locks it came for (got "
-           .. tostring(sv.restrictLocked) .. " of " .. tostring(expectLocks) .. ")")
-        ck(select(3, Scan.Get(sv, 20008)) == ROGUE, "…on the rows that carry one")
-        ck(sv.repairBlocked == nil, "(1) …and nothing is blocked on a healthy finish")
-    end
-
-    -- ── (2) THE OWNER'S DEFECT: the pass pays nothing, the SECOND open ──────
-    local A2 = scanEnv()
-    if A2 then
-        local sv = ownerShape(false)         -- the client never returns item data
-        CHAT = {}
-        local ok, s1, s2, why2, said, status = withStubs(function()
-            _G.DaseekiArmoryScanDB = sv
-            local cache = A2:ItemScanCache()
-            local a = A2:MaybeRepairRestrictions()         -- PICKER OPEN #1
-            runToIdle(A2)
-            local before = #CHAT
-            local b, w   = A2:MaybeRepairRestrictions()    -- PICKER OPEN #2, same session
-            return a, b, w, #CHAT - before,
-                   table.concat(Scan.StatusReport(cache, A2:ItemScanStatus()), "\n")
-        end)
-        ck(ok == true, "(2) the degenerate pass runs headlessly")
-        ck(s1 == true, "(2) the first open starts a pass")
-        ck(sv.unreadCount == ROWS,
-           "(2) …which pays NOTHING off — his exact evidence (got "
-           .. tostring(sv.unreadCount) .. " still unread)")
-        ck(s2 == false, "(2) the SECOND open in the same session does not start another")
-        -- …and THIS is the bug: before the fix it returned false and said nothing.
-        ck(type(why2) == "string" and why2 ~= "",
-           "(2) SILENCE IS A META-BUG: the refusal carries a reason")
-        ck(said == 1, "(2) …spoken in chat, exactly once (got " .. tostring(said) .. " lines)")
-        ck(status:find("repair blocked: ") ~= nil,
-           "(2) …and surfaced in /darmory scanstatus as `repair blocked: <reason>`")
-        ck(status:find("a repair pass is still owed") ~= nil,
-           "…right beside the line that says a pass is owed, so the two agree")
-        ck(sv.repairBlocked == why2, "…persisted on the cache, so it survives the scrollback")
-    end
-
-    -- ── (3) NO SPAM: reopening the picker repeats nothing ───────────────────
-    local A3 = scanEnv()
-    if A3 then
-        local sv = ownerShape(false)
-        CHAT = {}
-        local ok, extra = withStubs(function()
-            _G.DaseekiArmoryScanDB = sv
-            A3:ItemScanCache()
-            A3:MaybeRepairRestrictions()
-            runToIdle(A3)
-            A3:MaybeRepairRestrictions()      -- speaks once
-            local before = #CHAT
-            for i = 1, 12 do                  -- bounded: the picker gets opened a lot
-                assert(i <= 12, "open ceiling")
-                A3:MaybeRepairRestrictions()
-            end
-            return #CHAT - before
-        end)
-        ck(ok == true, "(3) twelve more picker opens run")
-        ck(extra == 0, "(3) …and say nothing further: one reason, one line (got "
-           .. tostring(extra) .. ")")
-    end
-
-    -- ── (4) A HEALTHY CACHE NEVER COMPLAINS ─────────────────────────────────
-    local A4 = scanEnv()
-    if A4 then
-        W.cached, W.tip, W.warmTip, W.names, W.asks, W.answers = {}, {}, {}, {}, 0, true
-        local sv = Scan.NewCache()
-        Scan.Put(sv, 16905, "Bloodfang Chestpiece", 4, ROGUE, 0, false)
-        sv.scannedAt = 1785862751
-        CHAT = {}
-        local ok, started, why, lines, status = withStubs(function()
-            _G.DaseekiArmoryScanDB = sv
-            local cache = A4:ItemScanCache()
-            local s, w = A4:MaybeRepairRestrictions()
-            return s, w, #CHAT, table.concat(Scan.StatusReport(cache, nil), "\n")
-        end)
-        ck(ok == true, "(4) a healthy cache opens the picker")
-        ck(started == false and why == nil,
-           "(4) …starts no pass and reports no reason: there is no debt to be blocked about")
-        ck(lines == 0, "(4) …and says nothing in chat (got " .. tostring(lines) .. " lines)")
-        ck(status:find("repair blocked") == nil, "(4) …and scanstatus stays quiet too")
-        ck(status:find("a repair pass is still owed") == nil, "…because nothing is owed")
-    end
-
-    -- ── (5) THE LIVE-LOCK FINGERPRINT, made impossible ──────────────────────
-    -- An EMPTY repair queue while the tally says work is owed is the state that
-    -- invites MaybeRepairRestrictions in on every open of every session and turns
-    -- it away in silence every time. The flags are the truth; the tally is
-    -- reconciled to them, loudly, and the state ends.
-    local A5 = scanEnv()
-    if A5 then
-        W.cached, W.tip, W.warmTip, W.names, W.asks, W.answers = {}, {}, {}, {}, 0, true
-        local sv = Scan.NewCache()
-        Scan.Put(sv, 16905, "Bloodfang Chestpiece", 4, ROGUE, 0, false)   -- READ
-        sv.scannedAt   = 1785862751
-        sv.unreadCount = 9240                       -- a tally that is simply wrong
-        CHAT = {}
-        local ok, started, why, again, why2, lines = withStubs(function()
-            _G.DaseekiArmoryScanDB = sv
-            -- bind WITHOUT Normalize's recount: this is the tally lying to the gate
-            local cache = sv
-            A5.ItemScanCache = function() return cache end
-            local s, w = A5:MaybeRepairRestrictions()
-            local s2, w2 = A5:MaybeRepairRestrictions()      -- and again, next open
-            return s, w, s2, w2, #CHAT
-        end)
-        ck(ok == true, "(5) the impossible state is driven")
-        ck(started == false, "(5) no pass starts on an empty queue")
-        ck(type(why) == "string" and why:find("9240") ~= nil,
-           "(5) …but it is LOUD about it (got: " .. tostring(why) .. ")")
-        ck(sv.unreadCount == 0,
-           "(5) THE STATE IS ENDED: the tally is reconciled to the flags (got "
-           .. tostring(sv.unreadCount) .. ")")
-        ck(#Scan.UnreadIds(sv) == 0, "…which is what the flags actually say")
-        ck(again == false and why2 == nil,
-           "(5) …so the NEXT open finds a healthy cache and has nothing to report")
-        ck(lines == 1, "(5) …and the whole episode cost exactly one chat line (got "
-           .. tostring(lines) .. ")")
-        ck(A5:IsScanning() == false, "(5) …and left no half-started scan behind")
-    end
-
-    -- ── (6) MUTATION: each guard, broken, turns this suite red ──────────────
-    do
-        local MUT = {
-            ["latch measures the attempt, not the debt (THE BUG)"] = function(st)
-                if st.scanning or not st.complete then return false end
-                if (tonumber(st.owed) or 0) <= 0 then return false end
-                if st.tried then return false end          -- the shipped 1.3.1 line
-                return true
-            end,
-            ["a refused pass returns without a reason"] = function(st)
-                local okk = Scan.RepairGate(st)
-                return okk
-            end,
-            ["progress does not re-open the door"] = function(st)
-                if st.scanning or not st.complete then return false end
-                if (tonumber(st.owed) or 0) <= 0 then return false end
-                if st.tried then return false end
-                return true
-            end,
-            ["a healthy cache is treated as a refusal"] = function(st)
-                local okk = Scan.RepairGate(st)
-                return okk
-            end,
-        }
-        local CASES = {
-            { scanning = false, complete = true, owed = 300, tried = true, lastFrom = 300 },
-            { scanning = false, complete = true, owed = 100, tried = true, lastFrom = 300 },
-            { scanning = false, complete = true, owed = 0 },
-            { scanning = false, complete = false, owed = 300 },
-            { scanning = true,  complete = true, owed = 300 },
-            { scanning = false, complete = true, owed = 300 },
-        }
-        local names = {}
-        for k in pairs(MUT) do names[#names + 1] = k end
-        table.sort(names)
-        for _, nm in ipairs(names) do
-            local killed = false
-            for _, cse in ipairs(CASES) do
-                local realOk, realWhy = Scan.RepairGate(cse)
-                local mok, mwhy = MUT[nm](cse)
-                if (mok and true or false) ~= realOk then killed = true; break end
-                -- a mutant that keeps the verdict but drops the reason is still dead
-                if nm:find("reason") or nm:find("healthy") then
-                    if (mwhy ~= nil) ~= (realWhy ~= nil) then killed = true; break end
-                end
-            end
-            ck(killed, "mutation killed: " .. nm)
-        end
-    end
-
-    -- ── (7) THE SHIPPING PATH still reaches the gate ────────────────────────
-    do
-        local g = io.open(P("goalPicker.lua"), "r")
-        ck(g ~= nil, "goalPicker.lua is readable")
-        if g then
-            local s = g:read("*a"); g:close()
-            local call = s:find("Addon:MaybeRepairRestrictions%(%)")
-            local show = s:find("function Addon:ShowGoalPicker")
-            ck(call ~= nil and show ~= nil and call > show,
-               "the picker-open path still calls the repair, from inside ShowGoalPicker")
-        end
-        local h = io.open(P("itemScan.lua"), "r")
-        if h then
-            local s = h:read("*a"); h:close()
-            ck(s:find("function Scan%.RepairGate") ~= nil, "the gate is a pure, named rule")
-            ck(s:find("function Addon:BlockRepair") ~= nil, "the refusal has one voice")
-            ck(s:find("Addon%._restrictRepairFrom%s*=%s*owed") ~= nil,
-               "…and the latch records the debt the pass attacked, not merely that it ran")
-            ck(s:find("repair blocked: ") ~= nil, "…which /darmory scanstatus reads back")
-            ck(s:find("if ST%.queueTotal == 0 then ST = nil; return false end") == nil,
-               "the silent empty-queue return is GONE")
-        end
-    end
-end)
-
 ----------------------------------------------------------------------
 -- Every shipped file compiles (loadfile gate)
 ----------------------------------------------------------------------
@@ -4892,6 +3497,20 @@ suite("loadfile-all-files", function(ck)
     for _, f in ipairs(files) do
         local c, e = loadfile(P(f))
         ck(c ~= nil, "compiles: " .. f .. (c and "" or (" -> " .. tostring(e))))
+    end
+
+    -- The generator is not shipped (it is not in the TOC and never loads in game),
+    -- but a generator that does not compile is a restriction table nobody can
+    -- regenerate, which is the one repair path this design leaves.
+    local g, ge = loadfile(P("dev/gen-restrictions.lua"))
+    ck(g ~= nil, "compiles: dev/gen-restrictions.lua" .. (g and "" or (" -> " .. tostring(ge))))
+    local gh = io.open(P("dev/gen-restrictions.lua"), "r")
+    ck(gh ~= nil, "…and it is committed alongside the table it writes")
+    if gh then
+        local gs = gh:read("*a"); gh:close()
+        ck(gs:find("MEM_CEILING_KB") ~= nil and gs:find("ITER_CEILING") ~= nil,
+           "…under a memory ceiling and an iteration ceiling (headless discipline)")
+        ck(gs:find('io%.open%(path, "w"%)') ~= nil, "…and writes restrictions.lua itself")
     end
 end)
 

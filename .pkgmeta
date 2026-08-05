@@ -6,5 +6,6 @@ ignore:
   - DESCRIPTION.md
   - .github
   - harness
+  - dev
 
 manual-changelog: CHANGELOG.md

@@ -12,6 +12,7 @@
 core.lua
 itemDB.lua
 pvpItems.lua
+restrictions.lua
 itemScan.lua
 iconData.lua
 sets.lua
