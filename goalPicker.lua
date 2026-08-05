@@ -164,6 +164,64 @@ function Rows.Slice(n, offset)
     return out
 end
 
+-- THE ORDER OF THE LIST, AND THE CAP AT THE END OF IT.
+--
+-- THE DEFECT (owner report, 1.3.1): "the classic wow era legendaries should still
+-- display … thunderfury is missing now." It was missing, and no filter rule had
+-- removed it — Scan.RowVerdict answers "usable" for id 19019 on a warrior against
+-- the owner's own cache, and the index carries it. It was sorted off the end.
+--
+-- The list is ordered by ITEM LEVEL, which is not a fact the client holds offline:
+-- GetItemInfo answers nil for an item the server has not sent this session, and
+-- ilvlOf turns that nil into 0. On a freshly opened picker that is EVERY row, so
+-- the item-level key is uniformly 0, the whole order collapses onto the
+-- alphabetical tie-break, and MAX_RESULTS then keeps the first 500 names — which
+-- is to say the letters A through roughly C.
+--
+-- Measured on the owner's account-1 cache (9 240 offerable rows): Atiesh sorts at
+-- 3.5% and Corrupted Ashbringer at 18.9%, so both survive the cap and he could see
+-- them — while Sulfuras sorts at 86.5% and Thunderfury at 90.1%, and each needs
+-- its slot's list to be shorter than ~554 rows to survive at all. The weapon slots
+-- are not remotely that short. That is the whole bug, and it is exactly the shape
+-- of the report: some legendaries displayed, the two late in the alphabet did not.
+--
+-- THE FIX IS TO STOP LETTING AN ABSENT VALUE DECIDE THE ORDER. Quality is the one
+-- ranking fact the scan PERSISTS (Scan.PackMeta writes it into the cache), so it
+-- is never cold, and it is what the row is already tinted by. It becomes the key
+-- BELOW item level: while levels are unknown the order is by rarity, and the 21
+-- legendary/artifact rows in a 9 240-row index cannot be reached by a 500-row cap.
+-- Once the levels stream in, item level leads again exactly as before and quality
+-- is only a tie-break among equal levels — which used to fall straight to the
+-- alphabet.
+--
+-- THE KEYS ARE SNAPSHOTTED BEFORE THE SORT, NOT READ INSIDE THE COMPARATOR. Both
+-- lookups reach for the client, and a comparator whose answers can change while
+-- table.sort is running is not an order at all: Lua 5.1 detects the inconsistency
+-- and raises "invalid order function for sorting", which in a picker refresh is an
+-- empty list. One pass to snapshot, then a comparator that is pure arithmetic over
+-- two tables, is what makes the order a total order.
+--
+--   list      the filtered entries, sorted and capped IN PLACE (also returned)
+--   levelOf   entry -> item level, 0 when the client has not sent it
+--   qualityOf entry -> item quality, nil when unknown (ranked below Poor)
+function Rows.SortAndCap(list, levelOf, qualityOf)
+    local lvl, qual = {}, {}
+    for i = 1, #list do
+        local e = list[i]
+        lvl[e]  = tonumber(levelOf   and levelOf(e))   or 0
+        qual[e] = tonumber(qualityOf and qualityOf(e)) or -1
+    end
+    table.sort(list, function(a, b)
+        local la, lb = lvl[a], lvl[b]
+        if la ~= lb then return la > lb end       -- highest item level first
+        local qa, qb = qual[a], qual[b]
+        if qa ~= qb then return qa > qb end       -- then rarest first
+        return a.display < b.display              -- then by name
+    end)
+    for i = #list, MAX_RESULTS + 1, -1 do list[i] = nil end
+    return list
+end
+
 -- -> r, g, b, needsLoad
 -- All three components or none: a caller can never be handed a partial color.
 -- needsLoad is true exactly when the quality is not known yet, which is the
@@ -328,13 +386,9 @@ local function filtered(query, validLoc, ctx)
     -- Sort FIRST, cap after: capping during the gather would hand back an arbitrary
     -- 500 (the index is walked in table order) and only then sort them, so the
     -- "highest item level first" promise held only when the result set was small.
-    table.sort(out, function(a, b)
-        local la, lb = ilvlOf(a), ilvlOf(b)
-        if la ~= lb then return la > lb end   -- highest item level first
-        return a.display < b.display
-    end)
-    for i = #out, MAX_RESULTS + 1, -1 do out[i] = nil end
-    return out
+    -- The order itself is Rows.SortAndCap — pure, harness-gated, and the place the
+    -- owner's missing-legendary defect was fixed; see the note beside it.
+    return Rows.SortAndCap(out, ilvlOf, qualityOf)
 end
 
 -- ── Footer widgets (Core factories when present, Blizzard templates otherwise) ─

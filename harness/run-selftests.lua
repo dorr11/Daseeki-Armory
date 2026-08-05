@@ -2443,9 +2443,20 @@ suite("goal-picker-row-model", function(ck)
     ck(src:find("Addon:ScanContext") ~= nil, "…against the VIEWING character's context")
     ck(src:find("StartItemScan") ~= nil, "the picker can start a rescan")
     ck(src:find("showUnusable") ~= nil, "…and exposes the show-unusable escape hatch")
-    -- the cap must come after the sort, or "highest ilvl first" is a lie on big result sets
-    local fs, ss = src:find("table%.sort%(out"), src:find("for i = #out, MAX_RESULTS")
-    ck(fs ~= nil and ss ~= nil and ss > fs, "results are capped AFTER the ilvl sort, not before")
+    -- The cap must come after the sort, or "highest ilvl first" is a lie on big
+    -- result sets. Both now live inside Rows.SortAndCap, which is what makes the
+    -- order testable rather than merely readable — so the ordering is asserted
+    -- there (see the legendary-sweep suite) and what is pinned here is that
+    -- `filtered` has no order of its own left to get wrong.
+    local fs, ss = src:find("table%.sort%(list"), src:find("for i = #list, MAX_RESULTS")
+    ck(fs ~= nil and ss ~= nil and ss > fs, "results are capped AFTER the sort, not before")
+    ck(src:find("function Rows%.SortAndCap") ~= nil,
+       "…and the order is a published, pure function rather than a local in the filter")
+    ck(src:find("return Rows%.SortAndCap%(out, ilvlOf, qualityOf%)") ~= nil,
+       "…which `filtered` hands the item level AND the quality, so a cold client still ranks")
+    local sortCount = 0
+    for _ in src:gmatch("table%.sort%(") do sortCount = sortCount + 1 end
+    ck(sortCount == 1, "there is exactly ONE ordering in the picker (found " .. sortCount .. ")")
 
     -- the scan cache is a NEW account-wide SavedVariables; the per-character one is untouched
     local t = io.open(P("Daseeki-Armory.toc"), "r")
@@ -3373,6 +3384,338 @@ suite("static-restrictions-shipped", function(ck)
         local i = toc:find("itemScan%.lua")
         ck(r ~= nil, "restrictions.lua is shipped")
         ck(r and i and r < i, "…and is loaded BEFORE itemScan.lua, which reads it")
+    end
+end)
+
+----------------------------------------------------------------------
+-- THE LEGENDARY SWEEP  (owner report, 1.3.1)
+--
+-- OWNER, verbatim: "the classic wow era legendaries should still display, just
+-- only for the classes that can get it. for example, thunderfury is missing now."
+--
+-- THE DIAGNOSIS, TRACED RATHER THAN GUESSED. Driving the real chain over the
+-- owner's own account-1 cache, id 19019 survives EVERY rule:
+--
+--     names[19019]           = "Thunderfury, Blessed Blade of the Windseeker"
+--     meta[19019]            = 5      -> quality 5, internal false
+--     Scan.InternalPattern   -> nil            (no denylist pattern touches it)
+--     StaticRestrictions     -> absent         (classMask 0, faction 0)
+--     StaticUnobtainable     -> absent
+--     Scan.RowVerdict(WARRIOR) -> shown = true, rule = "usable"
+--     BuildGoalItemDB over the real cache -> 9 240 entries, 19019 among them
+--
+-- No rule hid it. It was SORTED OFF THE END. The list is ordered by item level,
+-- which the client does not hold offline — GetItemInfo answers nil for anything
+-- the server has not sent this session and ilvlOf turns that into 0 — so on a
+-- freshly opened picker every key is 0, the order collapses onto the alphabetical
+-- tie-break, and MAX_RESULTS keeps the first 500 names. Measured on the owner's
+-- 9 240 offerable rows: Atiesh sorts at 3.5% and Corrupted Ashbringer at 18.9%
+-- (both visible, which is why he said legendaries "should STILL display"), while
+-- Sulfuras sorts at 86.5% and Thunderfury at 90.1% and each needs its slot list to
+-- be shorter than ~554 rows to survive the cap at all.
+--
+-- So this suite pins BOTH halves, per item: the right classes see it (filter), and
+-- it is never truncated out of the list (order). "Legendaries display correctly"
+-- becomes an invariant instead of a per-report fix.
+--
+-- THE INVENTORY IS A CENSUS, NOT A HAND LIST. Every quality>=5 row in the owner's
+-- account-1 cache (10 504 ids, Era build 68940): 28 rows, of which 7 are caught by
+-- the internal denylist and 5 are on the owner-reviewed unobtainable list, leaving
+-- the 16 below. Corrupted Ashbringer is carried alongside them because the owner
+-- counts it a legendary even though this client stamps it Epic (quality 4).
+----------------------------------------------------------------------
+suite("legendary-sweep", function(ck)
+    if type(Scan) ~= "table" then ck(false, "itemScan.lua did not load"); return end
+    if type(ScanAddon.StaticRestrictions) ~= "table" then
+        ck(false, "restrictions.lua did not load"); return
+    end
+    local SR, UN = ScanAddon.StaticRestrictions, ScanAddon.StaticUnobtainable
+    local B, CLASSES = Scan.CLASS_BIT,
+        { "WARRIOR", "PALADIN", "HUNTER", "ROGUE", "PRIEST", "SHAMAN", "MAGE", "WARLOCK", "DRUID" }
+    local function viewer(c, showUnusable)
+        return { class = c, classBit = B[c] or 0, faction = Scan.FACTION_NONE,
+                 showUnusable = showUnusable and true or false }
+    end
+
+    -- ── 1. THE INVENTORY ────────────────────────────────────────────────────
+    -- name       the CLIENT's name, lower-cased the way an index entry carries it
+    -- verdict    the obtainability reading, stated per item and owner-facing
+    local OFFERABLE = {
+        { 6698,  "stone of pierce",   6, "artifact-quality developer record (a Blizzard staff name); no loot table — CANDIDATE for the unobtainable list, owner decision" },
+        { 6707,  "stone of lapidis",  6, "same family as 6698" },
+        { 6708,  "stone of goodman",  6, "same family as 6698" },
+        { 6711,  "stone of kurtz",    6, "same family as 6698" },
+        { 6724,  "stone of backus",   6, "same family as 6698" },
+        { 6728,  "stone of brownell", 6, "same family as 6698" },
+        { 12947, "alex's ring of audacity", 6, "artifact-quality developer record — CANDIDATE, owner decision" },
+        { 17142, "shard of the defiler",    5, "legendary-quality quest item the client ships and the scan found; left offerable (fail-open)" },
+        { 17182, "sulfuras, hand of ragnaros", 5, "OBTAINABLE — Molten Core; two-handed mace, proficiency is the only gate" },
+        { 17782, "talisman of binding shard",    5, "legendary-quality Molten Core quest item; left offerable" },
+        { 17783, "talisman of binding fragment", 5, "as 17782" },
+        { 19019, "thunderfury, blessed blade of the windseeker", 5, "OBTAINABLE — the owner's reported item; one-handed sword, proficiency is the only gate" },
+        { 22589, "atiesh, greatstaff of the guardian", 5, "OBTAINABLE — Naxxramas; class-locked MAGE by shipped static knowledge" },
+        { 22630, "atiesh, greatstaff of the guardian", 5, "OBTAINABLE — class-locked WARLOCK" },
+        { 22631, "atiesh, greatstaff of the guardian", 5, "OBTAINABLE — class-locked PRIEST" },
+        { 22632, "atiesh, greatstaff of the guardian", 5, "OBTAINABLE — class-locked DRUID" },
+        { 22691, "corrupted ashbringer", 4, "OBTAINABLE — Naxxramas drop; kept off the unobtainable list on the owner's 2026-08-04 decision" },
+    }
+    -- The quality>=5 rows the DENYLIST removes: Blizzard's own legendary-stamped
+    -- scaffolding. Each must still be condemned by a pattern, because a denylist
+    -- that stopped catching these would put "TEST Legendary" at the top of every
+    -- list the moment quality started carrying the order.
+    local INTERNAL = {
+        { 2189,  "Tigole's Boomstick (TEST)" },
+        { 3687,  "Deprecated Unholy Avenger" },
+        { 3895,  "TEST Legendary" },
+        { 5828,  "Ring of Uber Resists (TEST)" },
+        { 17802, "Thunderfury, Blessed Blade of the Windseeker DEPRECATED" },
+        { 18881, "TEST Ragnaros Hammer" },
+        { 19158, "TEST Sulfuras, Hand of Ragnaros" },
+    }
+    -- The quality>=5 rows the owner-reviewed policy list removes.
+    local HIDDEN = { 13262, 18582, 18583, 18584, 22736 }
+
+    ck(#OFFERABLE == 17, "the census carries all 17 offerable rows (16 legendary/artifact + Corrupted Ashbringer)")
+
+    -- ── 2. NOTHING MAY HIDE THEM BY ACCIDENT ────────────────────────────────
+    for _, row in ipairs(OFFERABLE) do
+        local id, nm = row[1], row[2]
+        ck(Scan.IsUnobtainable(id) == false,
+           ("%d (%s) is not on the unobtainable list"):format(id, nm))
+        ck(Scan.InternalPattern(nm) == nil,
+           ("…and no denylist pattern condemns its live name (%s)"):format(
+               tostring(Scan.InternalPattern(nm))))
+    end
+    -- The twin pair, which is the whole reason the denylist has to be exact: one
+    -- real Thunderfury and one Blizzard leftover, one word apart.
+    ck(Scan.InternalPattern("thunderfury, blessed blade of the windseeker") == nil
+       and Scan.InternalPattern("thunderfury, blessed blade of the windseeker deprecated") ~= nil,
+       "THE TWIN PAIR: the real Thunderfury survives the denylist and the DEPRECATED twin does not")
+    for _, row in ipairs(INTERNAL) do
+        ck(Scan.InternalPattern(row[2]:lower()) ~= nil,
+           ("Blizzard's own %q is still condemned by a pattern"):format(row[2]))
+    end
+    for _, id in ipairs(HIDDEN) do
+        ck(UN[id] == true, ("the owner-reviewed hidden id %d is still hidden"):format(id))
+    end
+
+    -- ── 3. THE RIGHT CLASSES, PER ITEM ──────────────────────────────────────
+    -- The general invariant first: for every offerable id, sweep all 21 weapon
+    -- subclasses and all 10 armour subclasses against all 9 classes and require the
+    -- picker's answer to be EXACTLY (the shipped lock admits this class) and (the
+    -- class is proficient with this subclass). Whatever the item turns out to be,
+    -- nothing else is allowed to have an opinion about it.
+    local anyLoc = { INVTYPE_WEAPON = true }
+    for _, row in ipairs(OFFERABLE) do
+        local id, nm = row[1], row[2]
+        local mask = select(1, Scan.StaticFor(id))
+        local wrong = 0
+        for _, classID in ipairs({ Scan.ITEM_CLASS_WEAPON, Scan.ITEM_CLASS_ARMOR }) do
+            local top = (classID == Scan.ITEM_CLASS_WEAPON) and 20 or 9
+            for sub = 0, top do
+                local e = { id = id, equipLoc = "INVTYPE_WEAPON", name = nm,
+                            classID = classID, subclassID = sub }
+                for _, c in ipairs(CLASSES) do
+                    -- if/else, NOT `cond and a or b`: `a` is nil for a subclass the
+                    -- class cannot use, which is exactly when the `or` branch fires
+                    -- and answers with the wrong proficiency table.
+                    local prof
+                    if classID == Scan.ITEM_CLASS_WEAPON then prof = Scan.PROF[c].weapon[sub]
+                    else                                      prof = Scan.PROF[c].armor[sub] end
+                    local lockOK = (mask == 0) or Scan.HasBit(mask, B[c])
+                    local want = (prof == true) and lockOK
+                    if Scan.Matches(e, "", anyLoc, viewer(c)) ~= want then wrong = wrong + 1 end
+                end
+            end
+        end
+        ck(wrong == 0,
+           ("%d (%s): lock+proficiency is the WHOLE gate over 279 shapes (%d disagreements)")
+           :format(id, nm, wrong))
+    end
+
+    -- The named facts the owner gave, against the real item shapes.
+    local function offeredTo(id, nm, classID, sub)
+        local e = { id = id, equipLoc = "INVTYPE_WEAPON", name = nm,
+                    classID = classID, subclassID = sub }
+        local out = {}
+        for _, c in ipairs(CLASSES) do
+            if Scan.Matches(e, "", anyLoc, viewer(c)) then out[#out + 1] = c end
+        end
+        return table.concat(out, "+")
+    end
+    ck(offeredTo(19019, "thunderfury, blessed blade of the windseeker", Scan.ITEM_CLASS_WEAPON, 7)
+       == "WARRIOR+PALADIN+HUNTER+ROGUE+MAGE+WARLOCK",
+       "THUNDERFURY (one-handed sword) is offered to exactly the sword-wielders — got "
+       .. offeredTo(19019, "thunderfury", Scan.ITEM_CLASS_WEAPON, 7))
+    ck(offeredTo(17182, "sulfuras, hand of ragnaros", Scan.ITEM_CLASS_WEAPON, 5)
+       == "WARRIOR+PALADIN+SHAMAN+DRUID",
+       "SULFURAS (two-handed mace) is offered to exactly the mace-wielders — got "
+       .. offeredTo(17182, "sulfuras", Scan.ITEM_CLASS_WEAPON, 5))
+    ck(offeredTo(22691, "corrupted ashbringer", Scan.ITEM_CLASS_WEAPON, 8)
+       == "WARRIOR+PALADIN+HUNTER",
+       "CORRUPTED ASHBRINGER (two-handed sword) is offered to exactly its wielders — got "
+       .. offeredTo(22691, "corrupted ashbringer", Scan.ITEM_CLASS_WEAPON, 8))
+    local ATIESH = { [22589] = "MAGE", [22630] = "WARLOCK", [22631] = "PRIEST", [22632] = "DRUID" }
+    for _, id in ipairs({ 22589, 22630, 22631, 22632 }) do
+        ck(offeredTo(id, "atiesh, greatstaff of the guardian", Scan.ITEM_CLASS_WEAPON, 10)
+           == ATIESH[id],
+           ("ATIESH %d is offered to %s and to nobody else"):format(id, ATIESH[id]))
+    end
+
+    -- ── 4. AND IT MUST SURVIVE THE LIST'S OWN ORDER  (the reported defect) ──
+    local A = { ItemScan = Scan }
+    local gfn = loadfile(P("goalPicker.lua"))
+    ck(gfn ~= nil, "goalPicker.lua compiles")
+    local okl = gfn and pcall(gfn, "Daseeki-Armory", A)
+    ck(okl == true, "…and loads with no WoW API present")
+    local Rows = A.GoalPickerRows
+    ck(type(Rows) == "table" and type(Rows.SortAndCap) == "function",
+       "the picker publishes its order as a pure function")
+    if type(Rows) == "table" and type(Rows.SortAndCap) == "function" then
+        local CAP = Rows.MAX_RESULTS
+        -- The owner's shape, made deterministic: one legendary whose name sorts
+        -- LAST, buried under CAP+200 ordinary rows, on a client that has sent no
+        -- item level for anything.
+        local function corpus()
+            local t = {}
+            for i = 1, CAP + 200 do
+                t[#t + 1] = { id = 1000 + i, display = ("Common Item %04d"):format(i), quality = 2 }
+            end
+            t[#t + 1] = { id = 19019,
+                          display = "Zzz Thunderfury, Blessed Blade of the Windseeker",
+                          quality = 5 }
+            return t
+        end
+        local cold = function() return 0 end
+        local qual = function(e) return e.quality end
+        local function holds(list, id)
+            for _, e in ipairs(list) do if e.id == id then return true end end
+            return false
+        end
+
+        local sorted = Rows.SortAndCap(corpus(), cold, qual)
+        ck(#sorted == CAP, "the cap still holds the list to " .. CAP .. " rows")
+        ck(holds(sorted, 19019),
+           "THE DEFECT: a legendary the client has sent no item level for is NOT sorted off the end")
+        ck(sorted[1] and sorted[1].id == 19019,
+           "…it leads the list, because rarity carries the order while levels are unknown")
+
+        -- TEETH. The rule as it was — item level, then the alphabet — must FAIL this
+        -- same fixture, or the assertion above is proving nothing.
+        local old = corpus()
+        table.sort(old, function(a, b) return a.display < b.display end)
+        for i = #old, CAP + 1, -1 do old[i] = nil end
+        ck(holds(old, 19019) == false,
+           "…and the OLD order really did cut it, so this is not a vacuous test")
+
+        -- ITEM LEVEL STILL LEADS once the client has answered: a warm epic with a
+        -- higher level outranks a legendary, exactly as before.
+        local warm = { { id = 1, display = "Warm Epic",    quality = 4 },
+                       { id = 2, display = "Cold Legend",  quality = 5 } }
+        local lvl = { [1] = 92, [2] = 80 }
+        Rows.SortAndCap(warm, function(e) return lvl[e.id] end, qual)
+        ck(warm[1].id == 1, "with real item levels, item level still leads the order")
+
+        -- A TOTAL ORDER, NOT A COMPARATOR THAT CAN CHANGE ITS MIND. table.sort in
+        -- Lua 5.1 raises "invalid order function for sorting" on an inconsistent
+        -- comparator, and in a picker refresh that is an empty list; the keys are
+        -- snapshotted before the sort precisely so it cannot happen. Duplicate
+        -- names (the four Atiesh) and duplicate keys are the stress case.
+        local dup = {}
+        for i = 1, 400 do
+            dup[#dup + 1] = { id = i, display = "Atiesh, Greatstaff of the Guardian", quality = 5 }
+        end
+        local okSort = pcall(Rows.SortAndCap, dup, cold, qual)
+        ck(okSort == true, "400 rows sharing one name and one key sort without raising")
+        local nilQ = { { id = 1, display = "Seed Row", quality = nil },
+                       { id = 2, display = "Scanned Row", quality = 0 } }
+        local okNil = pcall(Rows.SortAndCap, nilQ, cold, qual)
+        ck(okNil == true, "an entry with no quality at all (a pre-scan seed row) sorts too")
+        ck(nilQ[1].id == 2, "…and ranks below a row whose quality is known to be Poor")
+    end
+
+    -- ── 5. AND THE CACHE MUST STILL HOLD THEM AFTER A RESCAN ───────────────
+    -- The picker can only offer what the scan wrote down. Deleting the restriction
+    -- machinery out of recordItem took the Scan.Put with it, so a forced rescan
+    -- WIPED the cache (StartItemScan clears it first) and refilled it with nothing
+    -- — 10 504 rows to 0 against the owner's own cache — while still announcing a
+    -- completed scan. Every legendary above, and every other item, went with it.
+    -- This drives the REAL runner over a small id space on the warmest possible
+    -- client: if it does not persist here it can never persist.
+    local S = {}
+    local sfn = loadfile(P("itemScan.lua"))
+    ck(sfn ~= nil, "itemScan.lua compiles")
+    if sfn and pcall(sfn, "Daseeki-Armory", S) then
+        local ITEMS = { [19019] = { "Thunderfury, Blessed Blade of the Windseeker", 5 },
+                        [17182] = { "Sulfuras, Hand of Ragnaros", 5 },
+                        [22691] = { "Corrupted Ashbringer", 4 },
+                        [13789] = { "[PH] Brilliant Dawn Cap", 1 } }
+        S.SLOT_INVTYPES = { [16] = { INVTYPE_WEAPON = true } }
+        S.Tag  = function() return "[Armory]" end
+        S.Wrap = function(_, _, s) return s end
+        local Sc = S.ItemScan
+        Sc.RANGES = { { 13789, 13789 }, { 17182, 17182 }, { 19019, 19019 }, { 22691, 22691 } }
+
+        local saved = { _G.GetItemInfo, _G.GetItemInfoInstant, _G.GetTime, _G.time,
+                        _G.GetBuildInfo, _G.C_Timer, _G.C_Item, _G.CreateFrame,
+                        _G.print, _G.DaseekiArmoryScanDB }
+        local T = 0
+        _G.GetItemInfo = function(id)
+            local it = ITEMS[id]; if not it then return nil end
+            return it[1], "link", it[2], 80
+        end
+        _G.GetItemInfoInstant = function(id)
+            if not ITEMS[id] then return nil end
+            return id, nil, nil, "INVTYPE_WEAPON", "icon", 2, 7
+        end
+        _G.GetTime       = function() return T end
+        _G.time          = function() return 1785900000 end
+        _G.GetBuildInfo  = function() return "1.15.9", "68940" end
+        _G.C_Timer       = { After = function() end }
+        _G.C_Item        = { RequestLoadItemDataByID = function() end }
+        _G.print         = function() end
+        local stub = { Show = function() end, Hide = function() end, SetScript = function() end,
+                       RegisterEvent = function() end, UnregisterAllEvents = function() end }
+        _G.CreateFrame   = function() return stub end
+        _G.DaseekiArmoryScanDB = Sc.NewCache()
+
+        local cache = S:ItemScanCache()
+        Sc.Put(cache, 19019, "Thunderfury, Blessed Blade of the Windseeker", 5)
+        local pre = cache.count
+
+        local started = S:StartItemScan({ force = true })
+        local ticks = 0
+        while S:IsScanning() and ticks < 5000 do
+            T = T + Sc.TICK; S:ScanTick(Sc.TICK); ticks = ticks + 1
+        end
+        local names, q5 = 0, 0
+        for id in pairs(cache.names) do
+            names = names + 1
+            local q = Sc.UnpackMeta(cache.meta[id])
+            if q >= 5 then q5 = q5 + 1 end
+        end
+
+        _G.GetItemInfo, _G.GetItemInfoInstant, _G.GetTime, _G.time,
+        _G.GetBuildInfo, _G.C_Timer, _G.C_Item, _G.CreateFrame,
+        _G.print, _G.DaseekiArmoryScanDB =
+            saved[1], saved[2], saved[3], saved[4], saved[5],
+            saved[6], saved[7], saved[8], saved[9], saved[10]
+
+        ck(started == true, "a forced rescan starts")
+        ck(pre == 1, "…over a cache that held a row before it (which force wipes)")
+        ck(S:IsScanning() == false, "…and it finishes (" .. ticks .. " ticks)")
+        ck(names == 4,
+           "A RESCAN WRITES WHAT IT READ: all 4 ids are back in the cache (got " .. names .. ")")
+        ck(cache.count == names, "…and the count field agrees with the rows")
+        ck(cache.names[19019] == "Thunderfury, Blessed Blade of the Windseeker",
+           "…Thunderfury among them, under the client's own name")
+        ck(q5 == 2, "…carrying the qualities the client gave (2 legendary rows)")
+        ck(Sc.IsComplete(cache) == true,
+           "…so the scan reads as COMPLETE and the bundled seed stays retired")
+        ck(cache.internalCount == 1,
+           "…and the one placeholder among them is still flagged internal")
+    else
+        ck(false, "itemScan.lua loads for the rescan drive")
     end
 end)
 

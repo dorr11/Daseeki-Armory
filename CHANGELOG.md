@@ -4,6 +4,37 @@
 
 ### Fixed
 
+- **The legendaries are back in the Goal picker, and a rescan no longer empties it.**
+  *Thunderfury* had gone missing from the list. Nothing had hidden it — it carries no
+  class lock, it is not on the retired-items list, no placeholder filter touches its
+  name, and the picker's own rules answer "usable" for it on a warrior. It was being
+  **sorted off the end of the list**.
+
+  The list is ordered by item level, and item level is not something your client knows
+  on its own: it has to come from the server, and it has not arrived yet for anything
+  when you first open the picker. Every row therefore ranked as level 0, the order fell
+  back to plain alphabetical, and only the first 500 names survived — which is roughly
+  the letters A to C. That is why some legendaries were fine and others were not:
+  *Atiesh* and the *Corrupted Ashbringer* sort early enough to make the cut, while
+  *Sulfuras* and *Thunderfury* sit at 87% and 90% of the way down the alphabet and never
+  did. The list now falls back to **rarity** while item levels are still unknown, so
+  legendaries lead every slot and no cap can reach them; once the levels arrive, item
+  level leads the order again exactly as before.
+
+  Underneath that, **Rescan Items was destroying your item cache.** Pulling the old
+  class-lock machinery out of the scan in this same release took the line that actually
+  *writes an item down* with it — it sat in the middle of the block that was removed. So
+  the scan walked the whole id space, reported progress, and announced "item scan
+  complete", having saved nothing at all: a real cache went from 10,504 items to zero,
+  after which the picker fell back to the bundled name list. Nobody who had not pressed
+  the button was affected, and pressing it is now safe again. If your list looks short or
+  your cache reads as empty, one **Rescan Items** rebuilds it.
+
+  Both are pinned by a sweep over every legendary and artifact-quality item in a real
+  client — *Thunderfury*, *Sulfuras*, the *Corrupted Ashbringer*, all four *Atiesh* and
+  the rest — which now asserts, per item, that it is offered to exactly the classes that
+  can wield it and that it survives into the visible list.
+
 - **Class and faction locks are now built into Armory, and the machinery that tried to
   work them out on your machine is gone.** *Classes: Rogue* on Bonescythe is a fact about
   a game that stopped changing years ago — but Armory was working it out fresh on every

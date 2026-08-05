@@ -910,6 +910,15 @@ end
 -- existed to derive one static fact. The fact is shipped now, so what is left is
 -- the question GetItemInfo actually answers: does the client have this item's name
 -- yet? Yes -> write it down. No -> ask, and come back when the event fires.
+--
+-- "WRITE IT DOWN" IS THE PART THAT WENT MISSING, and it is the whole function.
+-- Tearing the restriction machinery out of here took the Scan.Put with it, along
+-- with the done-marker and the resolved tally, because they sat in the middle of
+-- the block that was deleted. What was left compiled, ran, reported progress and
+-- announced a completed scan — while persisting nothing at all. A scan is not a
+-- traversal, it is a WRITE, so the three lines below are the point of the file and
+-- the harness now pins them by driving a whole forced rescan and demanding the
+-- cache come out the far side with rows in it.
 local function recordItem(id)
     if not ST then return false end
     local function clearInflight()
@@ -918,6 +927,12 @@ local function recordItem(id)
     if ST.doneIds[id] then clearInflight(); return true end
     local name, _, quality = GetItemInfo(id)
     if not name then return false end
+    -- A name came back, so the item is loaded and its quality came with it. The
+    -- internal flag is NOT passed: Scan.Put derives it from the name, so a rescan
+    -- and a normalise can never disagree about a row.
+    Scan.Put(ST.cache, id, name, quality)
+    ST.doneIds[id] = true
+    ST.resolved    = ST.resolved + 1
     clearInflight()
     return true
 end
