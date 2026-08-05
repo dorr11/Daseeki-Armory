@@ -35,15 +35,26 @@
   with the addon — the same gap for everyone, fixed in the next update — rather than
   something that went wrong on your account and has to heal itself there.
 
-- **Items that can no longer be obtained by anyone are out of the picker.** Eight of them:
-  the Warglaives of Azzinoth, *The Twin Blades of Azzinoth*, *Andonisus, Reaper of Souls*,
-  *Gressil, Dawn of Ruin*, *Iblis, Blade of the Fallen Seraph*, *Neretzek, The Blood
-  Drinker* and the original *Ashbringer*. They are real records in your client, which is
-  why the previous release deliberately left them in — but no character on a live realm
-  can get one, so they are not goals. They are hidden the same way Blizzard's own
+- **Items that can no longer be obtained by anyone are out of the picker.** Five of them:
+  the two Warglaives of Azzinoth, *The Twin Blades of Azzinoth*, the original
+  *Ashbringer*, and *Andonisus, Reaper of Souls*. They are real records in your client,
+  which is why the previous release deliberately left them in — but no character can end
+  up owning one, so they are not goals. They are hidden the same way Blizzard's own
   placeholders are: **Show unusable** does not bring them back, because there is no
   character anywhere for whom they are merely unusable. This is a plain list inside the
   addon, so it can be changed or emptied without a rescan.
+
+  **Three items have come back off that list.** *Gressil, Dawn of Ruin*, *Iblis, Blade of
+  the Fallen Seraph* and *Neretzek, The Blood Drinker* were listed on original-vanilla
+  history — and that was the wrong yardstick. On Classic Era **Anniversary** realms the
+  Scourge Invasion runs again and all three are genuine drops, so they are goals you can
+  actually finish. They are back in the picker, offered to any class that can wield them
+  and findable by name. *The Untamed Blade* was never on the list and is unaffected. The
+  rule going forward is that "nobody can get one" is judged against Era **as it is played
+  now**, event re-runs included, not against a 2006 loot table.
+
+  *Andonisus* stays hidden for a different reason: it drops on Anniversary too, but it
+  decays and destroys itself, so it is not something you can still own once you have it.
 
   **The *Corrupted* Ashbringer is not on that list and never will be.** It drops in
   Naxxramas on a live Era realm, so it is a goal you can actually finish — it stays in

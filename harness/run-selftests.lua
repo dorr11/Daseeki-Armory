@@ -3105,9 +3105,18 @@ suite("static-restrictions-shipped", function(ck)
     ck(type(ScanAddon.StaticUnobtainable) == "table",
        "restrictions.lua publishes the unobtainable-by-history list")
     local un = ScanAddon.StaticUnobtainable
-    for _, id in ipairs({ 18582, 18583, 18584, 22736, 23054 }) do
+    -- THE WHOLE LIST, BY ENUMERATION AND BY COUNT. Five ids, owner-reviewed one by
+    -- one on 2026-08-04. The count is pinned alongside the names so that an id
+    -- ADDED without a decision fails here too — enumeration alone only catches
+    -- deletions, and this list hides things from the player, so it earns both.
+    local KEPT_HIDDEN = { 13262, 18582, 18583, 18584, 22736 }
+    for _, id in ipairs(KEPT_HIDDEN) do
         ck(un[id] == true, "the owner's named unobtainable id " .. id .. " is on the list")
     end
+    local nUn = 0
+    for _ in pairs(un) do nUn = nUn + 1 end
+    ck(nUn == #KEPT_HIDDEN,
+       "…and the list is EXACTLY those " .. #KEPT_HIDDEN .. " ids, nothing else (saw " .. nUn .. ")")
     local oneHand = { INVTYPE_WEAPON = true }
     local glaive = { id = 18583, equipLoc = "INVTYPE_WEAPON", name = "",
                      classID = Scan.ITEM_CLASS_WEAPON, subclassID = 7 }
@@ -3157,6 +3166,87 @@ suite("static-restrictions-shipped", function(ck)
        "…it is offered to a warrior")
     ck(Scan.Matches(ashRow(22691), "ashbringer", twoHand, viewer("PALADIN")) == true,
        "…and a paladin searching 'ashbringer' is shown the one he can actually chase")
+
+    -- ── 4c. THE KRUUL BLADES — obtainable on Anniversary, so back in ────────
+    -- OWNER CORRECTION 2026-08-04, verbatim: "Gressil Iblis and Neretzek are all
+    -- obtainable unless there is another version in the code that reads as
+    -- legendary." The first pass hid them on ORIGINAL-VANILLA history; the realm
+    -- this addon is used on is Classic Era ANNIVERSARY, where the Scourge Invasion
+    -- re-ran and the blades are genuine drops. They were removed from the list.
+    --
+    -- THE CAVEAT WAS CHECKED, NOT ASSUMED. A census of the owner's account-1 scan
+    -- cache and the bundled seed for every id naming Gressil / Iblis / Neretzek /
+    -- Untamed found exactly four ids and NO TWINS — one record each, in both
+    -- sources, quality 4 (Epic). There is no legendary display variant to keep
+    -- hiding, which is the condition the owner attached to the correction, so the
+    -- assertion that stands in for the census is that no OTHER id answers to these
+    -- names in the shipped data — see the by-name sweep at the end of this block.
+    local KRUUL = {
+        [23054] = "gressil, dawn of ruin",
+        [23014] = "iblis, blade of the fallen seraph",
+        [21856] = "neretzek, the blood drinker",
+        [19334] = "the untamed blade",          -- never listed; pinned as the control
+    }
+    local kruulOrder = { 19334, 21856, 23014, 23054 }
+    for _, id in ipairs(kruulOrder) do
+        ck(un[id] == nil and Scan.IsUnobtainable(id) == false,
+           "Kruul blade " .. id .. " (" .. KRUUL[id] .. ") is NOT hidden as unobtainable")
+        ck(SR[id] == nil,
+           "…and carries no class lock in the shipped table either")
+    end
+
+    -- PROFICIENCY IS THE ONLY GATE LEFT, and that is the whole claim. The shipped
+    -- data now says nothing at all about these four ids, so whatever weapon they
+    -- turn out to be, the picker must offer each one to exactly the classes that
+    -- can wield that weapon — no more (the addon inventing a lock) and no fewer
+    -- (the addon still hiding them). Sweeping EVERY weapon subclass proves it
+    -- without this harness having to assert what subclass each blade really is:
+    -- that is a client fact, and the client is not in the room.
+    local CLASSES = { "WARRIOR", "PALADIN", "HUNTER", "ROGUE", "PRIEST",
+                      "SHAMAN", "MAGE", "WARLOCK", "DRUID" }
+    local mismatched, offeredSomewhere = 0, 0
+    for _, id in ipairs(kruulOrder) do
+        local everOffered = false
+        for sub = 0, 20 do
+            local wrow = { id = id, equipLoc = "INVTYPE_WEAPON", name = KRUUL[id],
+                           classID = Scan.ITEM_CLASS_WEAPON, subclassID = sub }
+            for _, c in ipairs(CLASSES) do
+                local shown = Scan.Matches(wrow, "", oneHand, viewer(c))
+                local canWield = Scan.PROF[c].weapon[sub] == true
+                if shown ~= canWield then mismatched = mismatched + 1 end
+                if shown then everOffered = true end
+            end
+        end
+        if everOffered then offeredSomewhere = offeredSomewhere + 1 end
+    end
+    ck(mismatched == 0,
+       "each restored blade is offered to EXACTLY the classes proficient with its weapon "
+       .. "subclass — proficiency is the only gate the shipped data leaves (" .. mismatched
+       .. " disagreements over 4 ids x 21 subclasses x 9 classes)")
+    ck(offeredSomewhere == 4,
+       "…and all four are genuinely reachable: every one is offered to somebody")
+
+    -- A NAME SEARCH FINDS THEM AGAIN. Hiding was the bug; being un-findable by
+    -- name is how the owner would notice it had come back.
+    for _, id in ipairs(kruulOrder) do
+        local swordRow = { id = id, equipLoc = "INVTYPE_WEAPON", name = KRUUL[id],
+                           classID = Scan.ITEM_CLASS_WEAPON, subclassID = 7 }
+        ck(Scan.Matches(swordRow, "blade", oneHand, viewer("ROGUE")) == true
+           or Scan.Matches(swordRow, KRUUL[id]:sub(1, 6), oneHand, viewer("ROGUE")) == true,
+           "…and a rogue searching for " .. id .. " by name is shown it")
+    end
+
+    -- THE ONE LEGENDARY IN THE NEIGHBOURHOOD STAYS HIDDEN, for its own reason:
+    -- Andonisus IS obtainable on an Anniversary realm, but it decays and destroys
+    -- itself, so it is not a goal a character can still own. It is the row the
+    -- Anniversary reasoning does NOT reach, which is exactly why it is worth
+    -- pinning next to the three it did.
+    ck(un[22736] == true and Scan.IsUnobtainable(22736) == true,
+       "ANDONISUS (22736) STAYS HIDDEN — obtainable, but a decaying weapon is not a goal")
+    ck(Scan.Matches({ id = 22736, equipLoc = "INVTYPE_WEAPON", name = "andonisus, reaper of souls",
+                      classID = Scan.ITEM_CLASS_WEAPON, subclassID = 7 },
+                    "andonisus", oneHand, viewer("WARRIOR", nil, true)) == false,
+       "…not by name, not under 'Show unusable' — the same treatment as before the correction")
 
     -- ── 5. THE SCAN → PICKER SEAM (the push that survived the deletion) ─────
     local sh = io.open(P("itemScan.lua"), "r")

@@ -194,9 +194,36 @@ local ATIESH = {
 -- either), so — exactly like Blizzard's internal placeholders — "Show unusable"
 -- does not reveal them.
 --
--- OWNER SIGN-OFF PENDING. This resolves an open question in the direction of
--- HIDING. Deleting a line here puts an item straight back in the picker with no
--- code change and no rescan, which is why it is data.
+-- OWNER-REVIEWED, PER ENTRY. This list is no longer an open question: the owner
+-- has walked it twice on 2026-08-04, and every surviving row now carries its own
+-- sign-off below. Deleting a line here puts an item straight back in the picker
+-- with no code change and no rescan, which is why it is data — and which is why
+-- three lines left it on the second pass rather than being argued about in code.
+--
+-- THE ANNIVERSARY CORRECTION, and the lesson in it. The first pass reasoned from
+-- ORIGINAL VANILLA history: Highlord Kruul was a Scourge Invasion boss whose
+-- blades never settled into a permanent loot table, so they were filed here as
+-- unobtainable. That framing was wrong for the realm this addon is actually used
+-- on. Classic Era ANNIVERSARY realms re-ran the Scourge Invasion and the blades
+-- are genuine, farmable drops there. Owner correction 2026-08-04, verbatim:
+-- "Gressil Iblis and Neretzek are all obtainable unless there is another version
+-- in the code that reads as legendary."
+--
+-- That caveat was checked before acting, not assumed away. A census of the
+-- owner's account-1 scan cache AND the bundled seed for every id whose name
+-- mentions Gressil, Iblis, Neretzek or Untamed returned FOUR ids, no twins: each
+-- blade exists exactly once, in both sources, under one name, at quality 4 (Epic)
+-- — 21856, 23014, 23054, plus 19334 The Untamed Blade, which was never on this
+-- list and stays offerable. There is no legendary display twin to keep hiding, so
+-- all three were removed outright rather than split. The one legendary in the
+-- neighbourhood is 22736 Andonisus, and it stays — for a different reason, given
+-- on its own line.
+--
+-- The standing rule this leaves behind: "no player can get one" must be judged
+-- against ERA-AS-PLAYED, including Anniversary event re-runs, not against a
+-- 2006 loot table. Removed 2026-08-04 per the correction above: 21856 Neretzek,
+-- The Blood Drinker · 23014 Iblis, Blade of the Fallen Seraph · 23054 Gressil,
+-- Dawn of Ruin.
 local UNOBTAINABLE = {
     -- OWNER DECISION 2026-08-04, verbatim: "only corrupted ashbringer stays".
     -- The original Ashbringer never reached a live Era loot table; the client
@@ -204,13 +231,22 @@ local UNOBTAINABLE = {
     -- Ashbringer is a genuine Naxxramas drop and a legitimate goal, so it is
     -- DELIBERATELY ABSENT from this list and stays offerable.
     { 13262, "Ashbringer" },
+
+    -- SIGNED OFF IMPLICITLY 2026-08-04, by surviving both owner passes (the
+    -- Ashbringer decision and the Kruul correction) untouched. Never itemised on
+    -- any Era realm, Anniversary included: these are Burning Crusade records the
+    -- frozen client happens to carry.
     { 18582, "The Twin Blades of Azzinoth" },
     { 18583, "Warglaive of Azzinoth (Right)" },
     { 18584, "Warglaive of Azzinoth (Left)" },
-    { 21856, "Neretzek, The Blood Drinker" },
+
+    -- SIGNED OFF IMPLICITLY 2026-08-04, and NOT an oversight in the Kruul pass:
+    -- Andonisus is the fourth Scourge Invasion reward and IS obtainable on an
+    -- Anniversary realm, but it is a TEMPORARY DECAYING weapon that destroys
+    -- itself. A goal you cannot still own once you have it is not a goal, so it
+    -- is hidden on the decay, not on the history — the one row here that would
+    -- survive even if the Anniversary reasoning were applied to it.
     { 22736, "Andonisus, Reaper of Souls" },
-    { 23014, "Iblis, Blade of the Fallen Seraph" },
-    { 23054, "Gressil, Dawn of Ruin" },
 }
 
 ----------------------------------------------------------------------

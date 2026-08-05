@@ -972,7 +972,7 @@ Addon.StaticRestrictions = {
 }
 
 -- ═══════════════════════════════════════════════════════════════════════════
--- UNOBTAINABLE BY HISTORY  (8 entries)
+-- UNOBTAINABLE BY HISTORY  (5 entries)
 --
 -- Real records in the client for items no player can acquire on a live Era
 -- realm — never itemised into a loot table, or removed before the game froze.
@@ -988,10 +988,7 @@ Addon.StaticUnobtainable = {
 [18582]=true,         -- The Twin Blades of Azzinoth
 [18583]=true,         -- Warglaive of Azzinoth (Right)
 [18584]=true,         -- Warglaive of Azzinoth (Left)
-[21856]=true,         -- Neretzek, The Blood Drinker
 [22736]=true,         -- Andonisus, Reaper of Souls
-[23014]=true,         -- Iblis, Blade of the Fallen Seraph
-[23054]=true,         -- Gressil, Dawn of Ruin
 }
 
--- Entry count at generation time: 910 restrictions, 8 unobtainable.
+-- Entry count at generation time: 910 restrictions, 5 unobtainable.
