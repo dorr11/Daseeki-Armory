@@ -4088,6 +4088,273 @@ suite("item-scan-no-auto-path", function(ck)
        "…with exactly one caller left, the scan starter (" .. binderCalls .. " call sites)")
 end)
 ----------------------------------------------------------------------
+-- SET-LIST REORDER DRAG: the drop bar must sit under the pointer at ANY scale.
+--
+-- GetCursorPosition() returns RAW screen units; child:GetTop() returns in the
+-- scroll child's OWN effective-scale space. The shipped ticker divided the
+-- cursor by UIParent's scale and compared the result against child:GetTop(),
+-- which agrees only while the list's effective scale equals UIParent's.
+--
+-- Nothing scales the Armory options pane today, so this was LATENT here — but it
+-- is byte-for-byte the shape that broke live in Daseeki-Raid-Prep the week a
+-- "List Scale" slider gave the row chain a SetScale (fixed in Raid Prep 1.3.1).
+-- The error is PROPORTIONAL to height above the screen's bottom edge, not a
+-- constant offset, so the bar drifts further the higher up the list you drag.
+--
+-- The arithmetic now lives as a pure seam, Addon.SetListDrag.DropLine in
+-- options.lua, following the goalPicker.lua precedent (Addon.GoalPickerRows: a
+-- UI file's row geometry published as a pure module and driven headlessly). The
+-- REAL function is driven below, against the SHIPPED 1.3.1 arithmetic kept here
+-- as a RED CONTROL, so these checks demonstrate the bug rather than merely
+-- assert the fix.
+----------------------------------------------------------------------
+suite("setlist-drag-drop-index", function(ck)
+    -- options.lua touches exactly one WoW global at load (StaticPopupDialogs).
+    -- Stub it, load into a FRESH namespace so nothing here can perturb the
+    -- statmath suites, and restore the global afterwards.
+    local savedSPD = _G.StaticPopupDialogs
+    _G.StaticPopupDialogs = {}
+    local A = { SLOTS = {}, ItemScan = {} }
+    local fn, err = loadfile(P("options.lua"))
+    ck(fn ~= nil, "options.lua compiles" .. (fn and "" or (" -> " .. tostring(err))))
+    if not fn then _G.StaticPopupDialogs = savedSPD; return end
+    local lok, lerr = pcall(fn, "Daseeki-Armory", A)
+    _G.StaticPopupDialogs = savedSPD
+    ck(lok, "options.lua loads with no WoW API but StaticPopupDialogs"
+            .. (lok and "" or (" -> " .. tostring(lerr))))
+    if not lok then return end
+
+    local D = A.SetListDrag
+    ck(type(D) == "table", "the pure layer is published as Addon.SetListDrag")
+    ck(type(D) == "table" and type(D.DropLine) == "function",
+       "…carrying DropLine as the seam the ticker decides through")
+    if type(D) ~= "table" or type(D.DropLine) ~= "function" then return end
+    local DropLine = D.DropLine
+
+    local ROW_H = 28            -- SET_ROW_H
+    local TOP   = 500           -- child:GetTop() in the LIST's own space
+
+    -- The SHIPPED 1.3.1 arithmetic, verbatim in spirit: cursor converted with
+    -- UIParent's scale, compared against a list-space top edge.
+    local function oldDropLine(childTop, rowH, count, cursorY, uiScale)
+        local my   = cursorY / uiScale
+        local relY = childTop - my
+        local hRow = math.floor(relY / rowH)
+        local frac = relY - hRow * rowH
+        local line = (frac < rowH / 2) and (hRow + 1) or (hRow + 2)
+        return math.max(1, math.min(count + 1, line))
+    end
+
+    -- What the player is pointing at, derived from the GEOMETRY rather than from
+    -- the implementation: rows run downward from childTop at rowH pitch, and the
+    -- half of a row the cursor is in decides before/after.
+    local function expected(childTop, rowH, count, listSpaceY)
+        local relY = childTop - listSpaceY
+        local line = (relY - math.floor(relY / rowH) * rowH < rowH / 2)
+                     and (math.floor(relY / rowH) + 1) or (math.floor(relY / rowH) + 2)
+        return math.max(1, math.min(count + 1, line))
+    end
+
+    -- The client's raw cursor Y for a point the player SEES at `listSpaceY`.
+    local function rawFor(listSpaceY, uiScale, paneScale)
+        return listSpaceY * uiScale * paneScale
+    end
+
+    -- THE IEEE754 SAMPLING TRAP (documented in Raid Prep's GATE DRAG): the sweeps
+    -- below step in list space from a HALF-INTEGER offset. Row midpoints sit at
+    -- integer list-space heights (TOP - 14 - 28k), so a half-integer sample can
+    -- never land on one. Sitting exactly on a boundary would make a
+    -- multiply-then-divide round trip decide the strict `<` on the last bit of a
+    -- float — that tests IEEE754, not the hit-test. The boundary itself is pinned
+    -- separately in (g), at scale 1, where the round trip is exact.
+    local function sweep(uiScale, paneScale, count, childTop, fnc)
+        local bad = 0
+        for k = 0, 79 do
+            local y = (childTop or TOP) - (0.5 + 3 * k)
+            local got = fnc(rawFor(y, uiScale, paneScale), uiScale * paneScale, uiScale)
+            if got ~= expected(childTop or TOP, ROW_H, count, y) then bad = bad + 1 end
+        end
+        return bad
+    end
+    local function newAt(count, childTop)
+        return function(raw, listScale) return DropLine(childTop, ROW_H, count, raw, listScale) end
+    end
+    local function oldAt(count, childTop)
+        return function(raw, _, uiScale) return oldDropLine(childTop, ROW_H, count, raw, uiScale) end
+    end
+
+    -- (a) BASELINE — everything at parity, which is every Armory install TODAY.
+    --     Old and new must AGREE here, or the fix would be a regression for the
+    --     untouched majority. This is the "nothing changed at scale 1" pin.
+    ck(sweep(1.0, 1.0, 6, TOP, newAt(6, TOP)) == 0,
+       "(a) scale 1 everywhere: every sampled cursor lands on the slot it is over")
+    ck(sweep(1.0, 1.0, 6, TOP, oldAt(6, TOP)) == 0,
+       "(a) at parity the OLD math was right too — this fix changes NOTHING today")
+    do
+        local same = true
+        for k = 0, 79 do
+            local y = TOP - (0.5 + 3 * k)
+            if DropLine(TOP, ROW_H, 6, y, 1.0) ~= oldDropLine(TOP, ROW_H, 6, y, 1.0) then same = false end
+        end
+        ck(same, "(a) old and new are the SAME function at scale 1 — a latent fix, not a behaviour change")
+    end
+
+    -- (b) THE LATENT DEFECT — the list chain takes a 0.8 SetScale (a list-scale
+    --     slider, a themed pane scale, a Core window scale). The old math must be
+    --     visibly WRONG here; that is the whole point of keeping it.
+    do
+        local raw = rawFor(TOP - 74.5, 1.0, 0.8)   -- 74.5 below the top -> row 3's lower half
+        local want = expected(TOP, ROW_H, 6, TOP - 74.5)
+        ck(want == 4, "(b) fixture sanity: 74.5px down a 28px pitch is row 3's lower half -> line 4")
+        ck(DropLine(TOP, ROW_H, 6, raw, 1.0 * 0.8) == want,
+           "(b) list scaled to 80%: the seam still returns the slot under the pointer")
+        ck(oldDropLine(TOP, ROW_H, 6, raw, 1.0) ~= want,
+           "(b) RED CONTROL: the shipped math does NOT return that slot")
+        ck(oldDropLine(TOP, ROW_H, 6, raw, 1.0) > want,
+           "(b) RED CONTROL: and it errs DOWNWARD — the bar would draw below the mouse")
+        ck(sweep(1.0, 0.8, 6, TOP, newAt(6, TOP)) == 0,
+           "(b) list scaled to 80%: correct across the whole list, top to bottom")
+        ck(sweep(1.0, 0.8, 6, TOP, oldAt(6, TOP)) > 0,
+           "(b) RED CONTROL: the shipped math is wrong somewhere in that same sweep")
+    end
+
+    -- (c) DRIFT, NOT OFFSET — the old error GROWS with height above the screen's
+    --     bottom edge. That signature is why Raid Prep's reporter saw the bar
+    --     "well below" the mouse near the top of the list and close to it low down.
+    do
+        local nearTop    = math.abs(oldDropLine(TOP, ROW_H, 40, rawFor(TOP - 5.5, 1.0, 0.8), 1.0)
+                                    - expected(TOP, ROW_H, 40, TOP - 5.5))
+        local nearBottom = math.abs(oldDropLine(TOP, ROW_H, 40, rawFor(TOP - 200.5, 1.0, 0.8), 1.0)
+                                    - expected(TOP, ROW_H, 40, TOP - 200.5))
+        ck(nearTop > nearBottom, "(c) RED CONTROL: the old error grows with height (drift, not a constant offset)")
+    end
+
+    -- (d) UI SCALE ALONE was NEVER the broken case: with the list at 100% the two
+    --     spaces coincide at any UI Scale. Pin that the new math keeps it so —
+    --     this is the half a careless "fix" would break.
+    do
+        for _, ui in ipairs({ 0.53, 0.71, 1.0, 1.25 }) do
+            ck(sweep(ui, 1.0, 6, TOP, newAt(6, TOP)) == 0,
+               ("(d) UI Scale %.2f, list 100%%: still exact"):format(ui))
+            ck(sweep(ui, 1.0, 6, TOP, oldAt(6, TOP)) == 0,
+               ("(d) UI Scale %.2f, list 100%%: never broken — pinned"):format(ui))
+        end
+    end
+
+    -- (e) BOTH off parity: the effective scale COMPOUNDS. Above 100% the old math
+    --     drifts the other way, so the bar would draw ABOVE the mouse.
+    do
+        ck(sweep(0.71, 1.25, 6, TOP, newAt(6, TOP)) == 0,
+           "(e) UI Scale 0.71 x list 125%: compounded scale handled")
+        ck(sweep(1.35, 0.6, 6, TOP, newAt(6, TOP)) == 0,
+           "(e) UI Scale 1.35 x list 60%: compounded the other way too")
+        local raw  = rawFor(TOP - 74.5, 0.71, 1.25)
+        local want = expected(TOP, ROW_H, 6, TOP - 74.5)
+        ck(oldDropLine(TOP, ROW_H, 6, raw, 0.71) < want,
+           "(e) RED CONTROL: above 100% the old math errs UPWARD (bar above the mouse)")
+        ck(DropLine(TOP, ROW_H, 6, raw, 0.71 * 1.25) == want, "(e) the seam is right in both directions")
+    end
+
+    -- (f) SCROLLED LIST — SetVerticalScroll moves the scroll child, so childTop is
+    --     simply somewhere else. The index must follow the ROWS, not the viewport.
+    do
+        local scrolledTop = TOP + 3 * ROW_H
+        ck(sweep(1.0, 0.8, 12, scrolledTop, newAt(12, scrolledTop)) == 0,
+           "(f) list scrolled down three rows at 80%: index follows the rows, not the viewport")
+        ck(sweep(1.0, 1.0, 12, scrolledTop, newAt(12, scrolledTop)) == 0,
+           "(f) …and at scale 1 as well")
+    end
+
+    -- (g) BOUNDARIES — pinned at scale 1, where the round trip is exact, so the
+    --     assertion is about the comparison and not about float representation.
+    do
+        ck(DropLine(TOP, ROW_H, 5, TOP - 14, 1) == 2,
+           "(g) exactly on row 1's midpoint resolves DOWN, once, with no tie")
+        ck(DropLine(TOP, ROW_H, 5, TOP - 13.999, 1) == 1,
+           "(g) a hair above that midpoint is the slot above — the boundary is where it says")
+        ck(DropLine(TOP, ROW_H, 5, TOP, 1) == 1, "(g) exactly on the list's top edge -> the head")
+        ck(DropLine(TOP, ROW_H, 5, TOP - 5 * ROW_H, 1) == 6,
+           "(g) exactly on the bottom edge of the last row -> past the tail")
+    end
+
+    -- (h) CURSOR OUTSIDE THE LIST at five scales: above every row -> the head;
+    --     below every row -> one past the tail. Never out of range either way.
+    do
+        for _, sc in ipairs({ 0.5, 0.8, 1.0, 1.25, 1.5 }) do
+            ck(DropLine(TOP, ROW_H, 5, rawFor(9000, 1.0, sc), sc) == 1,
+               ("(h) cursor far above the list at scale %d%% -> insert at the head"):format(sc * 100))
+            ck(DropLine(TOP, ROW_H, 5, rawFor(-9000, 1.0, sc), sc) == 6,
+               ("(h) cursor far below the list at scale %d%% -> insert past the tail"):format(sc * 100))
+        end
+    end
+
+    -- (i) EMPTY LIST: the only insertion point is 1, at any scale or cursor height.
+    do
+        ck(DropLine(TOP, ROW_H, 0, 400, 0.8) == 1, "(i) empty list -> insert at 1")
+        ck(DropLine(TOP, ROW_H, 0, -9999, 1.0) == 1, "(i) empty list, cursor off-screen low -> 1")
+        ck(DropLine(TOP, ROW_H, 0, 99999, 1.35) == 1, "(i) empty list, cursor off-screen high -> 1")
+    end
+
+    -- (j) DEGENERATE INPUT never raises and never returns a nil or fractional index.
+    do
+        local cases = {
+            { TOP, ROW_H, 4, 400, nil }, { TOP, ROW_H, 4, 400, 0 },   { TOP, ROW_H, 4, 400, -1 },
+            { TOP, ROW_H, 4, nil, 0.8 }, { nil, ROW_H, 4, 400, 0.8 }, { TOP, nil,  4, 400, 0.8 },
+            { TOP, 0,     4, 400, 0.8 }, { TOP, ROW_H, nil, 400, 0.8 }, { TOP, ROW_H, -3, 400, 0.8 },
+            { TOP, ROW_H, 4, 1 / 0, 0.8 },
+        }
+        local raised, oor = 0, 0
+        for _, c in ipairs(cases) do
+            local sok, line = pcall(DropLine, c[1], c[2], c[3], c[4], c[5])
+            if not sok then raised = raised + 1
+            elseif type(line) ~= "number" or line ~= line or line < 1 or line ~= math.floor(line) then
+                oor = oor + 1
+            end
+        end
+        ck(raised == 0, "(j) no degenerate input raises")
+        ck(oor == 0,    "(j) every answer is a whole index >= 1")
+        ck(DropLine(TOP, ROW_H, 4, 400, nil) == DropLine(TOP, ROW_H, 4, 400, 1),
+           "(j) a missing scale falls back to 1, never to a division by zero")
+    end
+
+    -- (k) STRUCTURAL — the ticker must decide through the seam, read the SCROLL
+    --     CHILD's scale for the hit-test, and keep UIParent's scale for the
+    --     movement threshold (which is a screen gesture and was always correct).
+    --     The anchor captured in OnMouseDown must stay in that same UIParent
+    --     space, or the 5px threshold would compare two different spaces.
+    do
+        local fh = io.open(P("options.lua"), "r")
+        ck(fh ~= nil, "options.lua is readable for the structural pins")
+        if fh then
+            local src = fh:read("*a"); fh:close()
+            ck(src:find("Drag.DropLine(childTop, SET_ROW_H, n, cy, listScale)", 1, true) ~= nil,
+               "(k) the drag ticker decides through the pure seam")
+            ck(src:find("child:GetEffectiveScale()", 1, true) ~= nil,
+               "(k) the hit-test reads the SCROLL CHILD's effective scale")
+
+            local block = src:match("dragTick:SetScript%(\"OnUpdate\", function%(%)(.-)\n    end%)") or ""
+            ck(block ~= "", "(k) the drag ticker is locatable")
+            ck(block:find("UIParent:GetEffectiveScale()", 1, true) ~= nil,
+               "(k) UIParent's scale is still read — for the movement threshold")
+            ck(block:find("uiMX", 1, true) ~= nil and block:find("uiMY", 1, true) ~= nil,
+               "(k) the UIParent-space cursor is named for what it is")
+            ck(block:match("Drag%.DropLine%([^)]*uiM") == nil,
+               "(k) REGRESSION PIN: the UIParent-space cursor never reaches the hit-test")
+            ck(block:find("childTop %- my") == nil and block:find("relY", 1, true) == nil,
+               "(k) REGRESSION PIN: the old inline midpoint arithmetic is gone from the ticker")
+
+            local anchor = src:match("panel%._dragSourceName = self%._name(.-)end%)") or ""
+            ck(anchor ~= "", "(k) the OnMouseDown anchor capture is locatable")
+            ck(anchor:find("UIParent:GetEffectiveScale()", 1, true) ~= nil,
+               "(k) the click anchor is captured in UIParent space — the SAME space the threshold reads")
+            ck(anchor:find("GetEffectiveScale", 1, true) ~= nil
+               and anchor:find("child:GetEffectiveScale()", 1, true) == nil,
+               "(k) …and NOT in the list's space, which would split the threshold across two spaces")
+        end
+    end
+end)
+
+----------------------------------------------------------------------
 -- Every shipped file compiles (loadfile gate)
 ----------------------------------------------------------------------
 suite("loadfile-all-files", function(ck)

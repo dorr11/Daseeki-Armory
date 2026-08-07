@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **Dragging a set to reorder it will keep dropping where you point, whatever the
+  settings window is scaled to.** Nothing changes for you today: at the scale every
+  install runs at right now, the drop bar already sits under the pointer, and it still
+  will. This is a repair to the arithmetic behind it, made before it could ever be
+  seen.
+
+  The window measured your cursor against the set list using the *screen's* scale
+  rather than the *list's*. Those are the same number today, so the sum came out
+  right — but they stop being the same number the moment anything in the chain above
+  the list is scaled, and then the error is not a fixed few pixels: it grows the
+  further up the list you drag, so the bar drifts away from the mouse and sets land
+  several rows from where the bar said they would. Daseeki Raid Prep shipped this
+  exact shape and a player hit it the week a list-scale slider arrived (Raid Prep
+  1.3.1, with a screenshot). Armory had the same latent sum in its set list; it now
+  measures the cursor against the list at the list's own scale, so the answer is right
+  at any scale, including the one you are using.
+
 ## 1.3.1 — 2026-08-05
 
 ### Changed
