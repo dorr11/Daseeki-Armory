@@ -137,6 +137,43 @@ function Drag.DropLine(childTop, rowH, count, cursorY, listScale)
     return line
 end
 
+-- ── Keybind collision: WHICH set the warning names (PURE) ────────────────────
+--
+-- ARM-9 (SUITE_ASYNC_AUDIT.md §3, Class 8). Assigning a combo that another set
+-- already holds pops a confirmation naming the set that will lose it. The search
+-- was `for n, s in pairs(Addon.db.sets) do ... break end` — first match wins out
+-- of a pairs() walk — so with two sets sharing one combo the dialog named an
+-- ARBITRARY one, and a different one between sessions.
+--
+-- IT IS THE MESSAGE THAT IS WRONG, NOT THE OUTCOME, and that is the reason to
+-- fix it rather than shrug: keybind.lua's SetSetKeybind (:107) clears EVERY set
+-- holding the combo, so the action was always deterministic. The dialog is the
+-- owner's only preview of it, and a preview that names a different set each time
+-- it is opened over identical data is a dialog you cannot trust or reproduce.
+--
+-- Sort the names, then take the first — a deterministic, alphabetical winner.
+-- Pure over a plain table, so the harness drives the real function; the same
+-- treatment Drag.DropLine above gets, and for the same reason.
+--
+-- `sets` is the name -> set map, `name` the set being bound (excluded), `combo`
+-- the captured key string. Returns the colliding set's name, or nil.
+local Keybind = {}
+Addon.SetKeybind = Keybind
+
+function Keybind.Collision(sets, name, combo)
+    if type(sets) ~= "table" or combo == nil or combo == "" then return nil end
+    local hits = {}
+    for n, s in pairs(sets) do
+        -- Non-string keys cannot be set names and would make the sort raise.
+        if type(n) == "string" and n ~= name and type(s) == "table" and s.key == combo then
+            hits[#hits + 1] = n
+        end
+    end
+    if #hits == 0 then return nil end
+    table.sort(hits)
+    return hits[1], #hits
+end
+
 -- Shared re-tinting FontObjects created by DaseekiUI (theme.lua). Referencing the
 -- global names keeps custom FontStrings themed — they re-color on ThemeChanged.
 local F_BODY, F_SMALL = "DaseekiUIFontBody", "DaseekiUIFontSmall"
@@ -935,10 +972,9 @@ function Addon:BuildSetsTab(flow)
             Addon:SetSetKeybind(name, nil)
         else
             Addon:CaptureKeybind(function(combo)
-                local warn, otherSet = "", nil
-                for n, s in pairs(Addon.db.sets) do
-                    if n ~= name and s.key == combo then otherSet = n; break end
-                end
+                local warn = ""
+                -- Deterministic winner, not a pairs() lottery — see Keybind.Collision.
+                local otherSet = Keybind.Collision(Addon.db.sets, name, combo)
                 if otherSet then
                     warn = "\n" .. Addon:Wrap("warn", "Already bound to Armory set \"" .. otherSet .. "\" — it will be reassigned.")
                 else

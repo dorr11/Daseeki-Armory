@@ -745,6 +745,40 @@ function Scan.IdAt(ranges, index)
     return nil
 end
 
+-- WHICH SILENT REQUEST GETS THE RETRY, and which runs out of tries. (ARM-8,
+-- SUITE_ASYNC_AUDIT.md §3, Class 8.)
+--
+-- The expiry sweep in ScanTick used to re-append straight out of its
+-- `pairs(ST.inflight)` walk. pairs() order differs per table lifetime, and the
+-- re-appended ids land in a queue drained under MAX_TRIES = 2, one request
+-- credit per tick (REQUEST_PER_TICK) and a MAX_INFLIGHT ceiling — so the walk
+-- order decides which id spends the last credit of a tick and, at the end of a
+-- run, which ids end up in the failed set. Two runs of the same scan over the
+-- same client answered with different failure lists.
+--
+-- The scan's overall correctness never depended on this (there are three
+-- independent retirement paths), which is exactly why it could sit unnoticed:
+-- the defect is not "wrong result", it is "a different result each time".
+--
+-- COLLECT, SORT, THEN RE-QUEUE. Same shape as Nexus friends.lua:423, which
+-- sorts BEFORE its ceiling, and as goalPicker.lua's Rows.SortAndCap, which
+-- sorts before the picker's row cap. Pure — no WoW API, no ST — so the harness
+-- drives the real function.
+--
+-- `inflight` is the id -> deadline map; `now` is GetTime(). Returns the expired
+-- ids in ascending order, never nil.
+function Scan.ExpiredIds(inflight, now)
+    local out = {}
+    if type(inflight) ~= "table" then return out end
+    now = tonumber(now)
+    if not now then return out end
+    for id, deadline in pairs(inflight) do
+        if type(deadline) == "number" and now > deadline then out[#out + 1] = id end
+    end
+    table.sort(out)
+    return out
+end
+
 -- The batching contract: given how many virtual indices are already consumed,
 -- yield the inclusive [from, to] slice for this tick and whether that finishes
 -- the walk. Returns nil, nil, true when there is nothing left.
@@ -1048,18 +1082,22 @@ function Addon:ScanTick(elapsed)
     -- the data gate's retry path, which used to share it, no longer exists.
     ST.loadSent = 0
 
-    -- expire silent requests, retrying once before writing them off
-    for id, deadline in pairs(ST.inflight) do
-        if now > deadline then
-            ST.inflight[id] = nil
-            ST.nInflight = ST.nInflight - 1
-            local t = ST.tries[id] or 1
-            if t < Scan.MAX_TRIES then
-                ST.tries[id] = t + 1
-                ST.queue[#ST.queue + 1] = id
-            else
-                ST.failed = ST.failed + 1
-            end
+    -- Expire silent requests, retrying once before writing them off. The ids are
+    -- COLLECTED AND SORTED first (Scan.ExpiredIds) rather than re-queued straight
+    -- out of a pairs() walk, so the retry order — and therefore which id spends
+    -- the last request credit of a tick, and which ends the run in the failed set
+    -- — is the same on every run over the same deadlines. ARM-8 / Class 8.
+    local expired = Scan.ExpiredIds(ST.inflight, now)
+    for i = 1, #expired do
+        local id = expired[i]
+        ST.inflight[id] = nil
+        ST.nInflight = ST.nInflight - 1
+        local t = ST.tries[id] or 1
+        if t < Scan.MAX_TRIES then
+            ST.tries[id] = t + 1
+            ST.queue[#ST.queue + 1] = id
+        else
+            ST.failed = ST.failed + 1
         end
     end
 
