@@ -13,18 +13,24 @@
         rules: drain only on PLAYER_REGEN_ENABLED / PLAYER_UNGHOST /
         PLAYER_ALIVE, never against a corpse, ascending slot order.
 
-    Design: census -> plan -> execute -> converge.
+    Design: census -> plan -> issue one settle-disjoint wave -> re-derive.
 
-      1. BuildCensus takes ONE sweep of bags and worn slots per pass and indexes
+      1. BuildCensus takes ONE sweep of bags and worn slots per step and indexes
          everything by exact identity key and by base item id, collecting free
-         bag slots and a global "is anything locked" flag as it goes.
+         bag slots as it goes.
       2. PlanSet turns (set, census) into an ordered operation list, claiming
          each source location so two slots of one set can never resolve to the
          same item, and accumulating the missing-item report.
-      3. ExecuteOp applies one operation behind the shared move guards.
-      4. EquipPass re-censuses and re-plans on every pass, driven by
-         ITEM_LOCK_CHANGED with a debounce, until the plan is empty or the pass
-         budget is spent.
+      3. ExecuteOp applies one operation behind the shared move guards and
+         returns the PREDICTION it just made: the content every slot it touched
+         is going to show once the server answers.
+      4. EquipPass issues only the ops whose involved slots are disjoint from
+         everything already in flight, then WAITS. A step retires when those
+         slots SHOW their predicted content — never when they merely unlock —
+         and the plan is then re-derived from the settled world.
+
+    See the SETTLE DISCIPLINE banner over the executor for why, and for the
+    ceilings that make the wait terminate no matter what the client does.
 
     Planning is separated from execution so the whole engine can be driven
     headlessly by harness/run-selftests.lua against a virtual inventory.
@@ -51,9 +57,37 @@
 local _, Addon = ...
 
 -- ── Tunables ──────────────────────────────────────────────────────────────────
-local MAX_PASSES    = 3      -- pass budget per equip request
-local PASS_DEBOUNCE = 0.2    -- seconds; ITEM_LOCK_CHANGED coalescing window
 local BAG_IDS       = { 0, 1, 2, 3, 4 }
+
+-- ── THE SETTLE DISCIPLINE (CLIENT_ASYNC_LESSONS.md Class 1) ──────────────────
+-- MAX_STEPS       runaway ceiling on re-plan steps in one equip run. A healthy
+--                 whole-set swap takes 1-3; the stall guard stops a wedged one
+--                 long before this.
+-- MAX_IN_FLIGHT   concurrent un-acked operations. Every op takes its involved
+--                 slots out of the planner's reach, so this is also how many
+--                 slots the next re-plan cannot use. Six covers a full weapon
+--                 set in one wave without freezing a third of the character.
+-- SETTLE_POLL     backstop cadence while waiting. The bag/lock events drive the
+--                 check; this exists so the wait can never be event-only.
+-- SETTLE_TTL      per-op ceiling. A prediction whose content never arrives (the
+--                 move was genuinely refused, or the server dropped it) is let
+--                 go here and the op is re-planned from OBSERVED state. This is
+--                 the ONLY path that may re-issue a move we already sent.
+-- RUN_CEILING     the latch is released this long after the run last made
+--                 PROGRESS (ARM-4). Re-based on every improvement, because a
+--                 slow server is a nuisance and a half-equipped set is a defect;
+--                 what must never happen is waiting on a residual that is not
+--                 shrinking, and the stall guard below covers that.
+-- MAX_NO_PROGRESS steps in a row whose residual plan did not shrink while
+--                 nothing of ours was in flight — i.e. a foreign lock is
+--                 sitting on a slot we need. Progress-based, not clock-based.
+local MAX_STEPS       = 64
+local MAX_IN_FLIGHT   = 6
+local SETTLE_POLL     = 0.10
+local SETTLE_TTL      = 1.50
+local RUN_CEILING     = 12.0
+local MAX_NO_PROGRESS = 20
+local MAX_DRAIN_ROUNDS = 24
 
 -- Abort codes (ITEMRACK_BEHAVIOR_SPEC.md §2.6).
 local ABORT_NO_ROOM   = 1
@@ -218,13 +252,19 @@ end
 
 -- ── Census ────────────────────────────────────────────────────────────────────
 -- One sweep of bags + worn slots, indexed for direct resolution. Rebuilt at the
--- start of every pass so it can never go stale mid-swap.
+-- start of every step so it can never go stale mid-swap.
 --
 -- A location is:
 --   { where = "bag",  bag = <id>, slot = <index>, link = <link> }
 --   { where = "worn", invSlot = <id>,             link = <link> }
+--
+-- DELIBERATELY ABSENT: a global "is anything locked" flag. It used to be here,
+-- and retiring the pass wait on it was ARM-2 — the client clears a lock BEFORE
+-- it rewrites the slot, so `locked == false` means "the answer is on its way",
+-- not "the answer has arrived". Settlement is per-slot and per-operation
+-- (Addon:OpSettled); nothing may ask this census whether the world is ready.
 function Addon:BuildCensus()
-    local census = { byExact = {}, byBase = {}, free = {}, locked = false }
+    local census = { byExact = {}, byBase = {}, free = {} }
 
     local function record(loc, str)
         if not str then return end
@@ -247,18 +287,18 @@ function Addon:BuildCensus()
         local generic = isGenericBag(bag)
         for slot = 1, bagSize(bag) do
             local link, locked = bagItem(bag, slot)
-            if locked then census.locked = true end
             if link then
                 record({ where = "bag", bag = bag, slot = slot, link = link },
                        Addon:ItemString(link))
-            elseif generic then
+            elseif generic and not locked then
+                -- A bare-but-LOCKED slot is the source half of a move still in
+                -- the air; offering it as free space would race that move.
                 table.insert(census.free, { bag = bag, slot = slot })
             end
         end
     end
 
     for _, slotId in ipairs(slotIds()) do
-        if IsInventoryItemLocked and IsInventoryItemLocked(slotId) then census.locked = true end
         local link = wornLink(slotId)
         if link then
             record({ where = "worn", invSlot = slotId, link = link },
@@ -405,12 +445,82 @@ local function bagLocked(bag, slot)
     return (select(2, bagItem(bag, slot))) and true or false
 end
 
+-- Every path that can leave one of OUR items dangling ends here. ClearCursor()
+-- returns the held item to where it came from — nothing is ever destroyed by
+-- calling it — so a refused op can no longer strand gear on the cursor with no
+-- way back (ARM-2a: there was no ClearCursor anywhere in this file).
+local function clearCursorBackstop()
+    if cursorLoaded() and ClearCursor then ClearCursor() end
+end
+Addon.ClearCursorBackstop = function() clearCursorBackstop() end
+
+-- ── Slot keys ─────────────────────────────────────────────────────────────────
+-- "b<bag>:<slot>" / "w<invSlot>" — the same spelling claimKey() uses, so a
+-- planner claim and an executor prediction name a location identically.
+local function wkey(slotId)     return "w" .. slotId end
+local function bkeyOf(bag, slot) return "b" .. bag .. ":" .. slot end
+
+local function parseSlotKey(key)
+    local bag, slot = tostring(key):match("^b(%d+):(%d+)$")
+    if bag then return "bag", tonumber(bag), tonumber(slot) end
+    local inv = tostring(key):match("^w(%d+)$")
+    if inv then return "worn", tonumber(inv) end
+    return nil
+end
+
+-- Published so the harness can pin AND mutate the settle rule without a client.
+function Addon:SlotKeyLocked(key)
+    local kind, a, b = parseSlotKey(key)
+    if kind == "bag"  then return bagLocked(a, b) end
+    if kind == "worn" then return slotLocked(a) end
+    return false
+end
+
+function Addon:SlotKeyLink(key)
+    local kind, a, b = parseSlotKey(key)
+    if kind == "bag"  then return (bagItem(a, b)) end
+    if kind == "worn" then return wornLink(a) end
+    return nil
+end
+
+-- Two links are "the same item" for settle purposes when their exact identity
+-- agrees. Raw string equality first, because in the common case it is.
+local function sameItem(a, b)
+    if a == nil or b == nil then return a == b end
+    if a == b then return true end
+    local sa, sb = Addon:ItemString(a), Addon:ItemString(b)
+    if not (sa and sb) then return false end
+    return Addon:ExactKey(sa) == Addon:ExactKey(sb)
+end
+
+-- ── THE SETTLE RULE ───────────────────────────────────────────────────────────
+-- Factored out as ONE named decision (the shape Daseeki-Bags/sort.lua's
+-- Sort.PredSettled ships) so the harness can pin it and mutate it. The defect
+-- this replaces is exactly the mutant "every involved slot is unlocked":
+-- the client releases a slot's lock BEFORE it rewrites the slot's contents, so
+-- retiring there reads the pre-operation world, re-plans the move that already
+-- landed, and re-issues it — ERR_INTERNAL_BAG_ERROR (ARM-2, Bags 2.0.2).
+--
+-- An operation is settled when the slots it touched SHOW WHAT IT PROMISED.
+-- Never inferred from an event about some other slot: only slot X's own
+-- contents can answer for X.
+function Addon:OpSettled(pred)
+    if not (pred and pred.expect) then return true end
+    for _, e in ipairs(pred.expect) do
+        if Addon:SlotKeyLocked(e.key) then return false end
+        if not sameItem(Addon:SlotKeyLink(e.key), e.link) then return false end
+    end
+    return true
+end
+
 -- Move whatever is worn in `invSlot` into a free bag slot, consuming one entry
--- from the census free list. Returns true, or false plus an abort code.
+-- from the census free list.
+-- Returns ok, abortCode, freeKey, movedLink.
 local function stow(invSlot, census)
-    if not wornLink(invSlot) then return true end
+    local held = wornLink(invSlot)
+    if not held then return true end
     -- Guards first: only consume the free slot once the move will actually run,
-    -- so an aborted stow doesn't shrink the pass's free-slot budget.
+    -- so an aborted stow doesn't shrink the step's free-slot budget.
     local g = moveGuard()
     if g then return false, g end
     local free = census.free[1]
@@ -419,7 +529,7 @@ local function stow(invSlot, census)
     table.remove(census.free, 1)
     pickupWorn(invSlot)
     pickupBag(free.bag, free.slot)
-    return true
+    return true, nil, bkeyOf(free.bag, free.slot), held
 end
 
 -- Does this location still hold the item the plan expects? An earlier move in
@@ -452,40 +562,100 @@ function Addon:OpStillNeeded(op)
     return locHolds(link, op.entry)
 end
 
--- Apply one planned operation. Returns true, or false plus an abort code.
+-- Every slot an operation will WRITE, computed from the observed world just
+-- before it is issued. This doubles as the disjointness test: two ops may go
+-- out together only if these sets do not intersect, so an op is never issued
+-- against a slot one of our own in-flight ops is about to rewrite.
+--
+-- The free-slot entries name census.free[1] because that is what stow() takes;
+-- executing the wave op-by-op keeps the two in step. A missing free slot is NOT
+-- reported here — ExecuteOp raises ABORT_NO_ROOM so the user gets the message.
+function Addon:OpSlotKeys(op, census)
+    if not op then return nil end
+    local keys = {}
+    local function add(k) if k then keys[#keys + 1] = k end end
+
+    if op.unequip then
+        add(wkey(op.slot))
+        local f = census and census.free[1]
+        if f then add(bkeyOf(f.bag, f.slot)) end
+        return keys
+    end
+
+    if not op.from then return nil end
+    add(wkey(op.slot))
+    if op.from.where == "bag" then
+        add(bkeyOf(op.from.bag, op.from.slot))
+        if op.twoHand and wornLink(17) then
+            add(wkey(17))
+            local f = census and census.free[1]
+            if f then add(bkeyOf(f.bag, f.slot)) end
+        end
+    else
+        add(wkey(op.from.invSlot))
+    end
+    return keys
+end
+
+-- Apply one planned operation.
+-- Returns true plus the PREDICTION (what each touched slot will show once the
+-- server answers), or false plus an abort code. The prediction is what the step
+-- waits on; nothing here re-reads the world it just wrote.
 function Addon:ExecuteOp(op, census)
     local g = moveGuard()
     if g then return false, g end
 
     -- Explicit-empty: move the worn item into a free bag slot. stow() raises
-    -- ABORT_NO_ROOM when there is nowhere to put it, and EquipPass stops the
-    -- whole pass there (spec §2.5A).
-    if op.unequip then return stow(op.slot, census) end
+    -- ABORT_NO_ROOM when there is nowhere to put it (spec §2.5A).
+    if op.unequip then
+        local ok, code, freeKey, moved = stow(op.slot, census)
+        if not ok then return false, code end
+        if not moved then return true, nil, nil end     -- already bare: nothing in flight
+        return true, nil, { expect = {
+            { key = wkey(op.slot), link = nil },
+            { key = freeKey,       link = moved },
+        } }
+    end
 
     if op.from.where == "bag" then
         if bagLocked(op.from.bag, op.from.slot) or slotLocked(op.slot) then
             return false, ABORT_LOCKED
         end
+        local srcKey  = bkeyOf(op.from.bag, op.from.slot)
+        local srcLink = (bagItem(op.from.bag, op.from.slot))
+        local expect  = {}
         -- A two-hander needs the off hand cleared first (spec §2.5).
         if op.twoHand and wornLink(17) then
-            local ok, code = stow(17, census)
+            local ok, code, freeKey, moved = stow(17, census)
             if not ok then return false, code end
+            expect[#expect + 1] = { key = wkey(17), link = nil }
+            expect[#expect + 1] = { key = freeKey,  link = moved }
         end
+        local displaced = wornLink(op.slot)
         pickupBag(op.from.bag, op.from.slot)
         pickupWorn(op.slot)
         -- Equipping into an occupied slot hands the displaced item back on the
         -- cursor; drop it into the bag slot the new item vacated.
         if cursorLoaded() then pickupBag(op.from.bag, op.from.slot) end
-        return true
+        clearCursorBackstop()
+        expect[#expect + 1] = { key = wkey(op.slot), link = srcLink }
+        expect[#expect + 1] = { key = srcKey,        link = displaced }
+        return true, nil, { expect = expect }
     end
 
     -- Worn -> worn: the exchange leaves the displaced item on the cursor, which
     -- goes back into the source slot the item was taken from.
     if slotLocked(op.from.invSlot) or slotLocked(op.slot) then return false, ABORT_LOCKED end
+    local srcLink   = wornLink(op.from.invSlot)
+    local displaced = wornLink(op.slot)
     pickupWorn(op.from.invSlot)
     pickupWorn(op.slot)
     if cursorLoaded() then pickupWorn(op.from.invSlot) end
-    return true
+    clearCursorBackstop()
+    return true, nil, { expect = {
+        { key = wkey(op.slot),         link = srcLink },
+        { key = wkey(op.from.invSlot), link = displaced },
+    } }
 end
 
 -- Public single-slot equip.
@@ -495,21 +665,60 @@ function Addon:EquipSlot(slotId, entry)
     local census = Addon:BuildCensus()
     local loc = resolve(census, entry, nil, slotId)
     if not loc then return false end
-    return (Addon:ExecuteOp({
+    local ok, code = Addon:ExecuteOp({
         slot    = slotId,
         from    = loc,
         twoHand = (slotId == 16) and (equipLocOf(loc.link) == "INVTYPE_2HWEAPON") or false,
-    }, census))
+    }, census)
+    if not ok then
+        if code ~= ABORT_CURSOR then clearCursorBackstop() end
+        return false
+    end
+    return true
 end
 
--- ── Multi-pass orchestration ──────────────────────────────────────────────────
--- Pass 1 runs synchronously; later passes are driven by ITEM_LOCK_CHANGED with a
--- debounce, and only once nothing anywhere is still locked (spec §2.7).
+-- ── Settle-aware run orchestration ────────────────────────────────────────────
+-- ONE STEP = census -> plan -> issue the slot-disjoint wave -> wait for those
+-- slots to SHOW their result -> re-derive the plan from the settled world.
+--
+-- The plan is never materialised and replayed: it is re-derived per step from
+-- the current world (the Gargul idempotence pattern; Conduit's ledger runner is
+-- the suite precedent). That is what makes a step safe to repeat and makes a
+-- half-finished run self-correcting rather than destructive.
+--
+-- Termination is guaranteed three ways and never depends on an event arriving:
+--   * per-op SETTLE_TTL      — a prediction that never lands is let go,
+--   * per-step MAX_NO_PROGRESS — a residual that stops shrinking is a stall,
+--   * per-run RUN_CEILING / MAX_STEPS — the latch is released regardless.
+
+local function now() return (GetTime and GetTime()) or 0 end
+local function canDefer() return (C_Timer and C_Timer.After) and true or false end
+
+-- Everything the client publishes when a move lands. ITEM_LOCK_CHANGED alone is
+-- the ARM-2 trap: it is the EARLY signal, and the contents follow it.
+local SETTLE_EVENTS = {
+    "ITEM_LOCK_CHANGED", "BAG_UPDATE", "BAG_UPDATE_DELAYED",
+    "PLAYER_EQUIPMENT_CHANGED", "UNIT_INVENTORY_CHANGED",
+}
+
 function Addon:EquipPass(name, attempt)
     local set = Addon:GetSet(name)
-    if not set then Addon._equipping = nil; return end
+    if not set then Addon:FinishEquip(name, false); return end
 
     attempt = attempt or 1
+
+    -- EquipPass is public, so it can be called cold. A run record is what the
+    -- settle machinery needs; make one rather than half-running without it.
+    local run = Addon._run
+    if not (run and run.name == name) then
+        Addon._runGen = (Addon._runGen or 0) + 1
+        run = { name = name, gen = Addon._runGen, progressed = now(),
+                inflight = {}, best = nil, stall = 0, issuedAny = false }
+        Addon._run = run
+    end
+    run.step = attempt
+    Addon._equipping = name
+
     local census = Addon:BuildCensus()
     local plan, missing = Addon:PlanSet(set, census)
 
@@ -517,73 +726,183 @@ function Addon:EquipPass(name, attempt)
         Addon:ChatMsg("could not find: [" .. table.concat(missing, "] [") .. "]")
     end
 
+    -- THE CENSUS CONFIRMS IT. An empty plan derived from settled state is the
+    -- only thing that may mark the set current — never dispatch (ARM-1).
     if #plan == 0 then
-        Addon:FinishEquip(name)
+        Addon:FinishEquip(name, true)
         return
     end
 
-    local abort
+    if attempt >= MAX_STEPS or (now() - run.progressed) >= RUN_CEILING then
+        Addon:AbortRun(name, nil)
+        return
+    end
+
+    -- Progress is measured on the residual, not the clock: a run that is still
+    -- shrinking its plan is still working, however slow the server is.
+    if run.best == nil or #plan < run.best then
+        run.best, run.stall, run.progressed = #plan, 0, now()
+    else
+        run.stall = run.stall + 1
+    end
+
+    -- ── Issue the wave ────────────────────────────────────────────────────────
+    -- Only ops whose involved slots are disjoint from everything already going
+    -- out this step. An op that overlaps is not skipped forever — it is simply
+    -- left for a later step, by which time its dependency has SETTLED and it is
+    -- planned against a world that really contains the earlier op's result.
+    local claimed, issued, abort = {}, 0, nil
     for _, op in ipairs(plan) do
+        if issued >= MAX_IN_FLIGHT then break end
         if Addon:OpStillNeeded(op) then
-            local ok, code = Addon:ExecuteOp(op, census)
-            if not ok and code then abort = code; break end
+            local keys, free = Addon:OpSlotKeys(op, census), true
+            if not keys then free = false end
+            for _, k in ipairs(keys or {}) do if claimed[k] then free = false end end
+            if free then
+                local ok, code, pred = Addon:ExecuteOp(op, census)
+                if ok then
+                    run.issuedAny = true
+                    for _, k in ipairs(keys) do claimed[k] = true end
+                    if pred then
+                        pred.at = now()
+                        run.inflight[#run.inflight + 1] = pred
+                        issued = issued + 1
+                    end
+                elseif code == ABORT_LOCKED then
+                    -- Someone else is holding a slot we need. That is a reason to
+                    -- WAIT, not to abandon the set; the stall guard ends it if the
+                    -- lock never clears (ARM-4's audited shape).
+                else
+                    abort = code
+                    break
+                end
+            end
         end
     end
 
-    if abort then
-        Addon:ChatMsg(ABORT_TEXT[abort] or "the swap was interrupted.")
-        Addon:FinishEquip(name)
+    if abort then Addon:AbortRun(name, abort); return end
+
+    -- Nothing issued, nothing in flight, and the residual is not shrinking: the
+    -- world is not going to answer us. End it rather than watch forever.
+    if issued == 0 and #run.inflight == 0 and run.stall >= MAX_NO_PROGRESS then
+        Addon:AbortRun(name, ABORT_LOCKED)
         return
     end
 
-    if attempt >= MAX_PASSES then
-        Addon:FinishEquip(name)
-        return
-    end
-
-    Addon._equipping = name
-    Addon:WatchLocks(name, attempt + 1)
+    Addon:WatchSettle()
 end
 
--- Re-drives the next pass once the inventory settles after a swap.
-function Addon:WatchLocks(name, nextAttempt)
-    if not Addon._lockWatcher then
-        if not CreateFrame then return end
+-- Arm the wait: the client's own publish events, plus a bounded backstop poll so
+-- the wait is NEVER event-only (ARM-4's live shape — a pass whose ops were all
+-- refused fires nothing at all and the old watcher never re-armed).
+function Addon:WatchSettle()
+    local run = Addon._run
+    if not run then return end
+
+    if CreateFrame and not Addon._lockWatcher then
         Addon._lockWatcher = CreateFrame("Frame")
         Addon._lockWatcher:SetScript("OnEvent", function()
             local w = Addon._lockWatcher
             if not (w and w._name) then return end
-            w._token = (w._token or 0) + 1
-            local token = w._token
-            local function fire()
-                local ww = Addon._lockWatcher
-                if not (ww and ww._name and ww._token == token) then return end
-                if Addon._equipping ~= ww._name then return end
-                if Addon:BuildCensus().locked then return end  -- still settling
-                local n, a = ww._name, ww._attempt
-                Addon:StopLockWatcher()
-                Addon:EquipPass(n, a)
-            end
-            if C_Timer and C_Timer.After then C_Timer.After(PASS_DEBOUNCE, fire) else fire() end
+            local r = Addon._run
+            if not (r and r.gen == w._gen) then return end
+            Addon:ScheduleSettleCheck(r.gen, 0)
         end)
     end
-    Addon._lockWatcher._name    = name
-    Addon._lockWatcher._attempt = nextAttempt
-    pcall(function() Addon._lockWatcher:RegisterEvent("ITEM_LOCK_CHANGED") end)
+    if Addon._lockWatcher then
+        Addon._lockWatcher._name = run.name
+        Addon._lockWatcher._gen  = run.gen
+        for _, e in ipairs(SETTLE_EVENTS) do
+            pcall(function() Addon._lockWatcher:RegisterEvent(e) end)
+        end
+    end
+
+    -- No way to defer at all (a bare environment): we cannot wait for a settle,
+    -- so finish honestly instead of leaving the latch set.
+    if not canDefer() then Addon:FinishEquip(run.name, false); return end
+    Addon:ScheduleSettleCheck(run.gen, SETTLE_POLL)
+end
+
+-- Exactly ONE check is ever live: each schedule takes the next tick and any
+-- earlier one that fires afterwards recognises itself as stale and returns. A
+-- publish burst is a dozen events about one landing, and it must cost one check,
+-- not a dozen re-plans.
+function Addon:ScheduleSettleCheck(gen, delay)
+    local run = Addon._run
+    if not (run and run.gen == gen) then return end
+    if not canDefer() then return end
+    local immediate = (delay or 0) <= 0
+    if immediate and run.burst then return end   -- the burst already has a check coming
+
+    run.tick  = (run.tick or 0) + 1
+    run.burst = immediate or nil
+    local tick = run.tick
+
+    C_Timer.After(delay or 0, function()
+        local r = Addon._run
+        if not (r and r.gen == gen and r.tick == tick) then return end   -- superseded
+        r.burst = nil
+        Addon:SettleCheck(gen)
+    end)
+end
+
+-- Retire what has landed, let go of what never will, then take the next step.
+function Addon:SettleCheck(gen)
+    local run = Addon._run
+    if not (run and run.gen == gen) then return end
+
+    local t, still = now(), {}
+    for _, p in ipairs(run.inflight) do
+        if Addon:OpSettled(p) then
+            -- Retired on CONTENT. This is the whole fix.
+        elseif (t - (p.at or t)) >= SETTLE_TTL then
+            -- Reality wins at the ceiling: the op is re-planned from OBSERVED
+            -- state, which is the only legitimate way to re-issue a move.
+            run.ttlDrops = (run.ttlDrops or 0) + 1
+        else
+            still[#still + 1] = p
+        end
+    end
+    run.inflight = still
+
+    if (t - run.progressed) >= RUN_CEILING then Addon:AbortRun(run.name, nil); return end
+
+    if #run.inflight > 0 then
+        Addon:ScheduleSettleCheck(gen, SETTLE_POLL)
+        return
+    end
+
+    Addon:EquipPass(run.name, (run.step or 1) + 1)
 end
 
 function Addon:StopLockWatcher()
     local w = Addon._lockWatcher
     if not w then return end
-    w._name, w._attempt = nil, nil
-    pcall(function() w:UnregisterEvent("ITEM_LOCK_CHANGED") end)
+    w._name, w._attempt, w._gen = nil, nil, nil
+    for _, e in ipairs(SETTLE_EVENTS) do
+        pcall(function() w:UnregisterEvent(e) end)
+    end
 end
 
-function Addon:FinishEquip(name)
+-- The one exit that is not convergence. Nothing of ours may be left hanging.
+function Addon:AbortRun(name, code)
+    local run = Addon._run
+    -- A cursor the guard tripped over BEFORE we touched anything is the user's,
+    -- not ours; clearing it would drop the item they were carrying.
+    if not (code == ABORT_CURSOR and not (run and run.issuedAny)) then
+        clearCursorBackstop()
+    end
+    Addon:ChatMsg(ABORT_TEXT[code] or "the swap was interrupted.")
+    Addon:FinishEquip(name, false)
+end
+
+-- `converged` is the census verdict, not the fact that we stopped.
+function Addon:FinishEquip(name, converged)
     Addon._equipping = nil
+    Addon._run       = nil
     Addon:StopLockWatcher()
 
-    if Addon:GetSet(name) then
+    if converged and Addon:GetSet(name) then
         Addon.db.currentSet = name
     end
     if Addon.ClearPendingSlots  then Addon:ClearPendingSlots()  end
@@ -594,6 +913,9 @@ end
 
 function Addon:RunEquip(name)
     if not Addon:GetSet(name) then return end
+    Addon._runGen = (Addon._runGen or 0) + 1
+    Addon._run = { name = name, gen = Addon._runGen, progressed = now(),
+                   inflight = {}, best = nil, stall = 0, issuedAny = false }
     Addon._equipping = name
     Addon:EquipPass(name, 1)
 end
@@ -651,41 +973,163 @@ function Addon:EnsureRegenWatcher()
     end
 end
 
+-- A queued action, resolved against the world AT DRAIN TIME.
+function Addon:ActionToOp(slot, a)
+    if not a then return nil end
+    if a.kind == "unequip" then return { slot = slot, unequip = true } end
+    if a.kind == "bag" then
+        local link = (bagItem(a.bag, a.slot))
+        if not link then return nil end                 -- the item moved; drop it
+        return {
+            slot    = slot,
+            from    = { where = "bag", bag = a.bag, slot = a.slot, link = link },
+            twoHand = (slot == 16) and (equipLocOf(link) == "INVTYPE_2HWEAPON") or false,
+        }
+    end
+    if a.kind == "worn" then
+        local link = wornLink(a.from)
+        if not link then return nil end
+        return { slot = slot, from = { where = "worn", invSlot = a.from, link = link } }
+    end
+    return nil
+end
+
+-- ── The drain ─────────────────────────────────────────────────────────────────
+-- ARM-3: the queue used to be emptied BEFORE the loop, so action 2 — refused on
+-- action 1's still-set locks — was gone forever. Now an action leaves the queue
+-- only when it has been ISSUED, a refusal leaves it queued for the next round,
+-- and the rounds are settle-paced and bounded.
 function Addon:DrainCombatQueue()
     -- Never consume the queue against a corpse — hold it for the resurrect.
     -- Also hold if still in combat: resurrecting mid-fight fires PLAYER_UNGHOST
     -- while swaps are still refused, and a whole-set equip consumed there would
     -- be lost silently.
     if Addon:MustQueueSwap() then return end
+    if not (Addon._combatQueue or Addon._pendingSet) then Addon:StopQueueWatcher(); return end
+    if Addon._drain then return end                     -- a drain is already walking it
 
-    local q    = Addon._combatQueue
-    local pend = Addon._pendingSet
-    if not q and not pend then Addon:StopQueueWatcher(); return end
+    Addon._drainGen = (Addon._drainGen or 0) + 1
+    Addon._drain = { gen = Addon._drainGen, round = 0, inflight = {}, progressed = now() }
+    Addon:DrainStep(Addon._drainGen)
+end
 
-    Addon._combatQueue = nil
-    Addon._pendingSet  = nil
-    Addon._pendingSkip = nil
-    Addon:StopQueueWatcher()
+function Addon:ScheduleDrainStep(gen, delay)
+    if not canDefer() then return end
+    C_Timer.After(delay or 0, function() Addon:DrainStep(gen) end)
+end
 
-    -- Deterministic order: ascending target slot, so trinket 13 drains before 14.
-    if q then
-        local slots = {}
-        for slot in pairs(q) do slots[#slots + 1] = slot end
-        table.sort(slots)
-        for _, slot in ipairs(slots) do
-            local a = q[slot]
-            if a.kind == "bag" then
-                Addon:EquipContainerItemToSlot(a.bag, a.slot, slot)
-            elseif a.kind == "worn" then
-                Addon:SwapEquippedSlots(a.from, slot)
-            elseif a.kind == "unequip" then
-                Addon:UnequipSlot(slot)
+function Addon:DrainStep(gen)
+    local d = Addon._drain
+    if not (d and d.gen == gen) then return end
+
+    -- Retire on CONTENT, exactly as the equip run does.
+    local t, still = now(), {}
+    for _, p in ipairs(d.inflight) do
+        if Addon:OpSettled(p) then                       -- landed
+        elseif (t - (p.at or t)) >= SETTLE_TTL then      -- never will; let it go
+        else still[#still + 1] = p end
+    end
+    d.inflight = still
+
+    -- Combat came back (or the player died) mid-drain: HOLD whatever is left.
+    if Addon:MustQueueSwap() then
+        Addon._drain = nil
+        Addon:EnsureRegenWatcher()
+        return
+    end
+
+    if #d.inflight > 0 then
+        if (t - d.progressed) < RUN_CEILING then Addon:ScheduleDrainStep(gen, SETTLE_POLL); return end
+        d.inflight = {}                                  -- ceiling: stop waiting on them
+    end
+
+    local q = Addon._combatQueue
+    if q and next(q) then
+        d.round = d.round + 1
+        if d.round > MAX_DRAIN_ROUNDS then
+            clearCursorBackstop()
+            Addon:ChatMsg("could not finish every queued swap.")
+            Addon._combatQueue = nil
+        else
+            local issued = Addon:DrainWave(d)
+            if issued > 0 then d.progressed = now() end   -- re-base: this round worked
+            if issued > 0 or (Addon._combatQueue and next(Addon._combatQueue)) then
+                if canDefer() then Addon:ScheduleDrainStep(gen, SETTLE_POLL); return end
             end
         end
     end
 
+    -- The per-slot queue is done. Only now does the whole-set request run, so it
+    -- plans against the world the queued actions actually produced.
+    Addon._combatQueue = nil
+    Addon._drain       = nil
+    Addon:StopQueueWatcher()
+
+    local pend = Addon._pendingSet
+    Addon._pendingSet, Addon._pendingSkip = nil, nil
     if pend then Addon:RunEquip(pend) end
     if Addon.ClearPendingSlots then Addon:ClearPendingSlots() end
+end
+
+-- One round of the drain: the slot-disjoint, dependency-ordered wave.
+--
+-- Deterministic order is ascending target slot (trinket 13 before 14), with one
+-- precedence rule on top: an action that SOURCES a slot another queued action
+-- TARGETS has to go first, or the second action would move the item the first
+-- one displaced rather than the item the user pointed at.
+function Addon:DrainWave(d)
+    local q = Addon._combatQueue
+    if not q then return 0 end
+
+    local slots = {}
+    for slot in pairs(q) do slots[#slots + 1] = slot end
+    table.sort(slots)
+
+    local sourcedBy = {}
+    for _, slot in ipairs(slots) do
+        local a = q[slot]
+        if a and a.kind == "worn" and a.from ~= slot then sourcedBy[a.from] = slot end
+    end
+    -- A cycle would block every action; fall back to plain ascending order.
+    local anyFree = false
+    for _, slot in ipairs(slots) do if not sourcedBy[slot] then anyFree = true end end
+
+    local census, claimed, issued = Addon:BuildCensus(), {}, 0
+    for _, slot in ipairs(slots) do
+        if issued >= MAX_IN_FLIGHT then break end
+        local a = q[slot]
+        if a and not (anyFree and sourcedBy[slot]) then
+            local op = Addon:ActionToOp(slot, a)
+            if not op then
+                q[slot] = nil                            -- the item is not there any more
+            else
+                local keys, free = Addon:OpSlotKeys(op, census), true
+                if not keys then free = false end
+                for _, k in ipairs(keys or {}) do if claimed[k] then free = false end end
+                if free then
+                    local ok, code, pred = Addon:ExecuteOp(op, census)
+                    if ok then
+                        for _, k in ipairs(keys) do claimed[k] = true end
+                        q[slot] = nil                    -- issued: it may leave the queue
+                        if pred then
+                            pred.at = now()
+                            d.inflight[#d.inflight + 1] = pred
+                            issued = issued + 1
+                        end
+                    elseif code == ABORT_LOCKED then
+                        -- Refused on a lock: KEEP it queued and retry next round.
+                    else
+                        clearCursorBackstop()
+                        Addon:ChatMsg(ABORT_TEXT[code] or "the swap was interrupted.")
+                        q[slot] = nil                    -- a hard refusal is not retried
+                    end
+                end
+            end
+        end
+    end
+
+    if not next(q) then Addon._combatQueue = nil end
+    return issued
 end
 
 local function sameAction(a, b)
@@ -734,6 +1178,19 @@ function Addon:DeferToCombatEnd(name, secureWeapons)
         .. " — it will equip " .. Addon:QueueWhen() .. "." .. tail)
 end
 
+-- ── One immediate action, out of combat ───────────────────────────────────────
+-- The single shared issue path for the flyout / sidebar / slot popouts, so the
+-- guards, the abort wording and the ClearCursor backstop are written once.
+function Addon:IssueAction(invSlot, a)
+    local op = Addon:ActionToOp(invSlot, a)
+    if not op then return false end
+    local ok, code = Addon:ExecuteOp(op, Addon:BuildCensus())
+    if ok then return true end
+    if code ~= ABORT_CURSOR then clearCursorBackstop() end
+    Addon:ChatMsg(ABORT_TEXT[code] or "the swap was interrupted.")
+    return false
+end
+
 -- ── Equip a specific inventory item into a slot (used by flyout / sidebar) ─────
 function Addon:EquipContainerItemToSlot(bag, slot, invSlot)
     if Addon:MustQueueSwap() then
@@ -743,23 +1200,7 @@ function Addon:EquipContainerItemToSlot(bag, slot, invSlot)
         end
         return queued
     end
-
-    local g = moveGuard()
-    if g then Addon:ChatMsg(ABORT_TEXT[g]); return false end
-    if bagLocked(bag, slot) or slotLocked(invSlot) then
-        Addon:ChatMsg(ABORT_TEXT[ABORT_LOCKED]); return false
-    end
-
-    local census = Addon:BuildCensus()
-    if invSlot == 16 and equipLocOf((bagItem(bag, slot))) == "INVTYPE_2HWEAPON" and wornLink(17) then
-        local ok, code = stow(17, census)
-        if not ok then Addon:ChatMsg(ABORT_TEXT[code]); return false end
-    end
-
-    pickupBag(bag, slot)
-    pickupWorn(invSlot)
-    if cursorLoaded() then pickupBag(bag, slot) end
-    return true
+    return Addon:IssueAction(invSlot, { kind = "bag", bag = bag, slot = slot })
 end
 
 -- Take off the item currently in an equipment slot (into a free bag slot).
@@ -769,11 +1210,7 @@ function Addon:UnequipSlot(invSlot)
         if queued and Addon.SetPendingSlot then Addon:SetPendingSlot(invSlot, UNEQUIP_ICON) end
         return queued
     end
-
-    local census = Addon:BuildCensus()
-    local ok, code = stow(invSlot, census)
-    if not ok then Addon:ChatMsg(ABORT_TEXT[code]); return false end
-    return true
+    return Addon:IssueAction(invSlot, { kind = "unequip" })
 end
 
 -- Move an already-equipped item from one slot to another (e.g. swap rings).
@@ -786,17 +1223,7 @@ function Addon:SwapEquippedSlots(fromSlot, toSlot)
         end
         return queued
     end
-
-    local g = moveGuard()
-    if g then Addon:ChatMsg(ABORT_TEXT[g]); return false end
-    if slotLocked(fromSlot) or slotLocked(toSlot) then
-        Addon:ChatMsg(ABORT_TEXT[ABORT_LOCKED]); return false
-    end
-
-    pickupWorn(fromSlot)
-    pickupWorn(toSlot)
-    if cursorLoaded() then pickupWorn(fromSlot) end
-    return true
+    return Addon:IssueAction(toSlot, { kind = "worn", from = fromSlot })
 end
 
 -- Items in bags that can go into a given inventory slot. When includeEquipped is
