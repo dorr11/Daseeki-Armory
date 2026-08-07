@@ -42,6 +42,26 @@ the tests are allowed to believe.*
   round to prove a refused action is still queued afterwards rather than gone.
   The whole body is 1,703 checks.
 
+- **The developer item scan now retries in a fixed order.** Nothing here is
+  reachable in normal play — the item database ships with the addon, and the scan
+  survives only as the tool that regenerates it for a new game build. But when the
+  scan asked the game for an item and got silence, the item it retried *first* was
+  whichever one an unordered walk happened to reach first, and under a fixed retry
+  budget that decided which items ended a run in the failed list. Two runs of the
+  same scan against the same client could therefore disagree, which is a poor
+  property in a tool whose whole job is producing a file to be diffed. The expired
+  requests are now collected and sorted before any of them is retried, so the run
+  is reproducible.
+
+- **Three more gate suites, and the first tests the popout buttons have ever
+  had.** The popout code is now loaded and driven for real — its event handler
+  installed and its events delivered to it — which is the only way the defect
+  below was observable at all: it was not visible in the list of events the file
+  registers, only in what the handler did with them. Each of the three keeps the
+  *old* behaviour beside the new one and requires them to differ, so the checks
+  demonstrate the bug rather than merely restate the fix. The body is 1,790
+  checks.
+
 ### Fixed
 
 - **Gear sets now equip correctly, completely, and once.** Swapping a set could
@@ -108,6 +128,38 @@ the tests are allowed to believe.*
   1.3.1, with a screenshot). Armory had the same latent sum in its set list; it now
   measures the cursor against the list at the list's own scale, so the answer is right
   at any scale, including the one you are using.
+
+- **Gear-slot popout buttons no longer come up empty when the game is slow to
+  answer at login.** If you keep detached slot buttons on your screen, they are
+  drawn the instant you log in — and if the game had not yet told the addon what
+  you are wearing, every one of them drew the grey "empty slot" outline instead.
+  Nothing ever came back to correct it: the buttons only redrew when a piece of
+  gear actually *changed*, so a fully geared character could sit and look at a row
+  of empty squares for the whole session, and the only cure was a reload.
+
+  Two things were wrong. The buttons were not listening for the moment the loading
+  screen ends, which is when the answer arrives — its sibling features (the trinket
+  cooldowns and the stats panel) both listen for it, and this was the odd one out.
+  And underneath that, the buttons were quietly ignoring the "you changed a piece
+  of equipment" message too: the code checked that the message was about *you* by
+  looking at a field that only *some* of these messages carry, and threw away the
+  ones that carry something else instead. So adding the new signal on its own would
+  have changed nothing.
+
+  Both are fixed, and the buttons now also come back for a second look on their
+  own. A button that finds nothing to draw at login is treating that as "the game
+  has not answered yet", not as "the slot is empty", so it re-checks a few times
+  over the following seconds and then stops. It cannot become a background
+  poller — the re-checks are a fixed, short list, and they end early as soon as
+  every button has an answer.
+
+- **The keybind confirmation names the same set every time.** Assigning a key that
+  another set already uses asks you to confirm, and names the set that will lose
+  it. If more than one set shared that key, the set it named was arbitrary — and a
+  different one on a different day, over data that had not changed. It now names
+  them in a fixed order, so the same question always reads the same way. (What
+  actually happens when you confirm has not changed: every set holding that key
+  gives it up, as it always did.)
 
 ## 1.3.1 — 2026-08-05
 

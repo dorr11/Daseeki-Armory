@@ -4981,6 +4981,512 @@ suite("setlist-drag-drop-index", function(ck)
 end)
 
 ----------------------------------------------------------------------
+-- ARM-6 — SLOT POPOUTS: THE SETTLE SIGNAL, AND THE FILTER THAT ATE IT
+-- (SUITE_ASYNC_AUDIT.md §3, Class 7 — Brief J)
+--
+-- A popout paints from GetInventoryItemTexture. InitSlotPopouts runs on the
+-- PLAYER_LOGIN leg and ShowSlotPopout paints IMMEDIATELY, so a cold inventory
+-- read at that moment paints the desaturated empty-slot placeholder — and the
+-- shipped event set had no signal that could ever repaint it: only equipment
+-- CHANGES re-fired, and the 1s border ticker only recolours borders. A fully
+-- geared character could sit at empty popout buttons for the session.
+--
+-- THE SECOND HALF IS WHY A ONE-LINE REGISTRATION WOULD NOT HAVE FIXED IT. The
+-- handler filtered every event through `unit == nil or unit == "player"`, and
+-- only UNIT_INVENTORY_CHANGED has a unit in arg1: PLAYER_EQUIPMENT_CHANGED's is
+-- a SLOT NUMBER, PLAYER_ENTERING_WORLD's is a BOOLEAN. So the equipment event
+-- was registered and inert, and the new registration would have been inert too.
+-- The shipped 1.3.1 handler is kept below as a RED CONTROL so these checks
+-- demonstrate that, rather than merely assert the fix.
+--
+-- slotpopout.lua is driven FOR REAL here — loaded, InitSlotPopouts run, events
+-- delivered to the handler it actually installed — over a recording frame stub.
+-- That is the only way the filter bug is observable at all: it is not visible in
+-- the event list, only in what the handler does with the event.
+----------------------------------------------------------------------
+suite("popout-settle-events", function(ck)
+    -- ── A recording frame stub. Any method not named here is a no-op returning
+    --    the frame, which is all the decoration chains in CreateSlotPopout need.
+    local function newFrame()
+        local f = { _shown = false, _ev = {}, _scripts = {} }
+        f._impl = {
+            CreateTexture = function() return newFrame() end,
+            SetScript  = function(self, k, fnc) self._scripts[k] = fnc; return self end,
+            GetScript  = function(self, k) return self._scripts[k] end,
+            RegisterEvent = function(self, e) self._ev[e] = true; return self end,
+            Show = function(self) self._shown = true; return self end,
+            Hide = function(self) self._shown = false; return self end,
+            IsShown = function(self) return self._shown end,
+            GetPoint  = function() return "TOPLEFT", nil, "CENTER", 0, 0 end,
+            GetCenter = function() return 0, 0 end,
+            GetSize   = function() return 38, 38 end,
+            SetTexture     = function(self, t) self._tex = t; return self end,
+            SetDesaturated = function(self, d) self._desat = d; return self end,
+        }
+        return setmetatable(f, { __index = function(t, k)
+            local v = rawget(t, "_impl") and rawget(t, "_impl")[k]
+            if v then return v end
+            -- Underscore keys are the RECORDING fields, not frame methods: an
+            -- absent one means "nothing wrote it", and must read as nil rather
+            -- than be auto-stubbed into a truthy no-op function.
+            if type(k) == "string" and k:sub(1, 1) == "_" then return nil end
+            local nop = function(self) return self end
+            rawset(t, k, nop)
+            return nop
+        end })
+    end
+
+    local saved = { _G.UIParent, _G.CreateFrame, _G.GetInventoryItemTexture,
+                    _G.GetInventoryItemLink, _G.C_Timer }
+    local WORN, TQ = {}, {}
+    _G.UIParent   = newFrame()
+    _G.CreateFrame = function() return newFrame() end
+    _G.GetInventoryItemTexture = function(_, slot) return WORN[slot] end
+    _G.GetInventoryItemLink    = function() return nil end
+    _G.C_Timer = {
+        After     = function(d, fnc) TQ[#TQ + 1] = { d = d, fn = fnc } end,
+        NewTicker = function() return { Cancel = function() end } end,
+    }
+
+    local A = {
+        SLOTS   = { { id = 1, name = "Head" }, { id = 5, name = "Chest" }, { id = 16, name = "Main Hand" } },
+        SLOT_IDS = { 1, 5, 16 },
+        EMPTY_ICON = "empty",
+        db = { settings = { slotPopouts = { buttons = { [1] = {}, [5] = {}, [16] = {} }, scale = 1 } },
+               sets = {} },
+    }
+    function A:Col() return 0, 0, 0, 1 end
+    function A:GetSlotEmptyTexture(s) return "empty-" .. s.id end
+
+    local fnc, lerr = loadfile(P("slotpopout.lua"))
+    ck(fnc ~= nil, "slotpopout.lua compiles" .. (fnc and "" or (" -> " .. tostring(lerr))))
+    local lok = fnc and pcall(fnc, "Daseeki-Armory", A)
+    ck(lok == true, "…and loads over a frame stub")
+    if not lok then
+        _G.UIParent, _G.CreateFrame, _G.GetInventoryItemTexture,
+        _G.GetInventoryItemLink, _G.C_Timer =
+            saved[1], saved[2], saved[3], saved[4], saved[5]
+        return
+    end
+
+    -- ── (a) THE EVENT SET, as data ─────────────────────────────────────────
+    local EV = A.POPOUT_EVENTS
+    ck(type(EV) == "table", "(a) the popout event set is declared as data")
+    local have = {}
+    for _, e in ipairs(EV or {}) do have[e] = true end
+    ck(have.UNIT_INVENTORY_CHANGED == true,  "(a) UNIT_INVENTORY_CHANGED is in the set")
+    ck(have.PLAYER_EQUIPMENT_CHANGED == true, "(a) PLAYER_EQUIPMENT_CHANGED is in the set")
+    ck(have.PLAYER_ENTERING_WORLD == true,
+       "(a) ARM-6: PLAYER_ENTERING_WORLD is in the set — the login paint can be re-earned")
+
+    -- THE SIBLINGS the audit cites as the in-repo precedent. If either of them
+    -- ever drops the registration, this file's rationale goes with it.
+    for _, sib in ipairs({ "trinkets.lua", "stats.lua" }) do
+        local sh = io.open(P(sib), "r")
+        ck(sh ~= nil, "(a) " .. sib .. " is readable")
+        if sh then
+            local ss = sh:read("*a"); sh:close()
+            ck(ss:find("PLAYER_ENTERING_WORLD", 1, true) ~= nil,
+               "(a) …and " .. sib .. " still registers it too — the asymmetry stays closed")
+        end
+    end
+
+    -- ── (b) THE HANDLER IS DRIVEN FOR REAL ─────────────────────────────────
+    WORN = { [1] = "tex-head", [5] = "tex-chest", [16] = "tex-mh" }
+    A:InitSlotPopouts()
+    local ev = A._popoutEv
+    ck(type(ev) == "table", "(b) InitSlotPopouts installed an event frame")
+    for _, e in ipairs(EV or {}) do
+        ck(ev._ev[e] == true, "(b) …with " .. e .. " actually registered on it")
+    end
+    local onEvent = ev and ev:GetScript("OnEvent")
+    ck(type(onEvent) == "function", "(b) …carrying an OnEvent handler")
+    if type(onEvent) ~= "function" then
+        _G.UIParent, _G.CreateFrame, _G.GetInventoryItemTexture,
+        _G.GetInventoryItemLink, _G.C_Timer =
+            saved[1], saved[2], saved[3], saved[4], saved[5]
+        return
+    end
+
+    -- Count repaints by watching the icon texture the REAL UpdateSlotPopout writes.
+    local head = A._popoutFrames[1]
+    local function repaintsWith(...)
+        head.icon._tex = nil
+        onEvent(ev, ...)
+        return head.icon._tex
+    end
+
+    -- THE SHIPPED 1.3.1 DISPATCH, verbatim, as the RED CONTROL.
+    local function oldDispatch(_, _, unit) return (unit == nil or unit == "player") end
+
+    ck(repaintsWith("UNIT_INVENTORY_CHANGED", "player") == "tex-head",
+       "(b) UNIT_INVENTORY_CHANGED for the player repaints (it always did)")
+    ck(repaintsWith("UNIT_INVENTORY_CHANGED", "party1") == nil,
+       "(b) …and another unit's inventory still does not")
+    ck(oldDispatch(nil, "UNIT_INVENTORY_CHANGED", "player") == true,
+       "(b) …which is the ONE case the old filter got right")
+
+    -- The equipment event: arg1 is a SLOT NUMBER.
+    ck(repaintsWith("PLAYER_EQUIPMENT_CHANGED", 16, true) == "tex-head",
+       "(b) THE DEFECT: PLAYER_EQUIPMENT_CHANGED (arg1 = slot 16) now repaints")
+    ck(oldDispatch(nil, "PLAYER_EQUIPMENT_CHANGED", 16) == false,
+       "(b) …and the OLD filter really did drop it, so this is not a vacuous test")
+
+    -- Entering world: arg1 is a BOOLEAN.
+    ck(repaintsWith("PLAYER_ENTERING_WORLD", true) == "tex-head",
+       "(b) ARM-6: PLAYER_ENTERING_WORLD (arg1 = isInitialLogin) repaints")
+    ck(oldDispatch(nil, "PLAYER_ENTERING_WORLD", true) == false,
+       "(b) …and the OLD filter would have dropped that too — the registration alone was not the fix")
+    ck(oldDispatch(nil, "PLAYER_ENTERING_WORLD", false) == false,
+       "(b) …on a zone change as well as the first login")
+
+    -- ── (c) THE COLD LOGIN, END TO END ─────────────────────────────────────
+    -- The audit's actual failure scenario: a geared character whose inventory
+    -- reads cold at login. The popouts paint placeholders, then the client warms
+    -- with NO further equipment change, and the ladder is the only thing that can
+    -- repair the paint.
+    do
+        local B = {
+            SLOTS = A.SLOTS, SLOT_IDS = A.SLOT_IDS, EMPTY_ICON = "empty",
+            db = { settings = { slotPopouts = { buttons = { [1] = {}, [5] = {} }, scale = 1 } },
+                   sets = {} },
+        }
+        function B:Col() return 0, 0, 0, 1 end
+        function B:GetSlotEmptyTexture(s) return "empty-" .. s.id end
+        local bfn = loadfile(P("slotpopout.lua"))
+        ck(bfn ~= nil and pcall(bfn, "Daseeki-Armory", B) == true, "(c) a second, cold instance loads")
+
+        TQ = {}
+        WORN = {}                     -- the client has answered for NOTHING yet
+        B:InitSlotPopouts()
+        ck(B._popoutFrames[1].icon._tex == "empty-1",
+           "(c) THE DEFECT REPRODUCED: a cold login paints the empty-slot placeholder")
+        ck(B:SlotPopoutsUnproven() == true,
+           "(c) …and the paint is recognised as UNPROVEN, not as a proven empty slot")
+        ck(#TQ >= 1, "(c) …so a follow-up is armed rather than left to gear changing")
+
+        -- The client warms. Nothing re-fires in game — no equipment changed.
+        WORN = { [1] = "tex-head", [5] = "tex-chest" }
+        local pumped = 0
+        while #TQ > 0 and pumped < 20 do
+            local job = table.remove(TQ, 1); pumped = pumped + 1; job.fn()
+        end
+        ck(B._popoutFrames[1].icon._tex == "tex-head",
+           "(c) THE FIX: the ladder repaints the head slot from the warm client")
+        ck(B._popoutFrames[5].icon._tex == "tex-chest", "(c) …and the chest slot with it")
+        ck(B:SlotPopoutsUnproven() == false, "(c) …leaving nothing unproven")
+        ck(pumped <= 3, "(c) …in at most 3 rungs (" .. pumped .. "), retiring early once proven")
+        ck(#TQ == 0, "(c) …and the ladder disarmed itself rather than rescheduling")
+        ck(B._popoutWarming == false, "(c) …releasing its in-flight latch")
+
+        -- ── (d) BOUNDED CEILING: an empty slot never proves itself ─────────
+        -- A character with no tabard reads exactly like a cold client, forever.
+        -- The ladder must stop anyway — this is the difference between a
+        -- follow-up and a poller.
+        TQ = {}
+        WORN = {}
+        B._popoutWarming = false
+        B:WarmSlotPopouts()
+        local rungs = 0
+        while #TQ > 0 and rungs < 50 do
+            local job = table.remove(TQ, 1); rungs = rungs + 1; job.fn()
+        end
+        ck(rungs == 3, "(d) a slot that never answers still stops the ladder at 3 rungs (" .. rungs .. ")")
+        ck(#TQ == 0, "(d) …with nothing left queued — the follow-up is not a poller")
+        ck(B._popoutWarming == false, "(d) …and the latch is released, so a later zone-in can re-arm")
+
+        -- ── (e) ONE LADDER AT A TIME ───────────────────────────────────────
+        -- PLAYER_ENTERING_WORLD fires on EVERY loading screen. Re-arming while a
+        -- ladder is in flight would multiply the timers with each one.
+        TQ = {}
+        B._popoutWarming = false
+        B:WarmSlotPopouts(); B:WarmSlotPopouts(); B:WarmSlotPopouts()
+        ck(#TQ == 1, "(e) three arming attempts in a row queue exactly one timer (" .. #TQ .. ")")
+
+        -- ── (f) A WARM LOGIN COSTS NOTHING ─────────────────────────────────
+        TQ = {}
+        B._popoutWarming = false
+        WORN = { [1] = "tex-head", [5] = "tex-chest" }
+        B:UpdateAllSlotPopouts()
+        B:WarmSlotPopouts()
+        ck(#TQ == 0, "(f) a login where every slot already answered arms no ladder at all")
+    end
+
+    _G.UIParent, _G.CreateFrame, _G.GetInventoryItemTexture,
+    _G.GetInventoryItemLink, _G.C_Timer =
+        saved[1], saved[2], saved[3], saved[4], saved[5]
+end)
+
+----------------------------------------------------------------------
+-- ARM-8 — WHICH SILENT REQUEST GETS THE RETRY
+-- (SUITE_ASYNC_AUDIT.md §3, Class 8 — Brief J)
+--
+-- DEV-ONLY SITE, FIXED ANYWAY. ScanTick is reachable only through
+-- /darmory devscan (core.lua:261 records the retirement; the item database ships
+-- in catalog.lua). It is still the tool that regenerates the shipped tables for a
+-- new client build, so a scan that answers differently on each run is a
+-- generator whose output cannot be reproduced or diffed — which is the whole
+-- point of keeping the runner.
+--
+-- The expiry sweep re-appended straight out of `pairs(ST.inflight)`, into a
+-- queue drained under MAX_TRIES = 2, one request credit per tick and a
+-- MAX_INFLIGHT ceiling. Which id got its retry first, and which ran out of
+-- ticks, was iteration luck.
+--
+-- THE TEETH ARE MEASURED, NOT ASSUMED: the fixture below first proves that this
+-- interpreter's pairs() really does walk these ids out of order, and that two
+-- tables holding the SAME ids in different insertion order walk them
+-- DIFFERENTLY. That is the defect verbatim. Then the real Scan.ExpiredIds is
+-- driven over both and must answer identically.
+----------------------------------------------------------------------
+suite("scan-retry-order", function(ck)
+    if type(Scan) ~= "table" then ck(false, "itemScan.lua did not load"); return end
+    ck(type(Scan.ExpiredIds) == "function",
+       "the expiry sweep is published as a pure seam, Scan.ExpiredIds")
+    if type(Scan.ExpiredIds) ~= "function" then return end
+
+    local IDS = { 19019, 13789, 22691, 17182 }   -- Thunderfury, a [PH] cap, Ashbringer, Sulfuras
+    local function inflightFrom(order, deadline)
+        local t = {}
+        for _, id in ipairs(order) do t[id] = deadline end
+        return t
+    end
+    local function rawOrder(t)
+        local o = {}
+        for k in pairs(t) do o[#o + 1] = k end
+        return o
+    end
+    local function ascending(o)
+        for i = 2, #o do if o[i] < o[i - 1] then return false end end
+        return true
+    end
+    local function join(o) return table.concat(o, ",") end
+
+    -- ── (a) THE FIXTURE HAS TEETH ──────────────────────────────────────────
+    local fwd  = inflightFrom({ 19019, 13789, 22691, 17182 }, 100)
+    local rev  = inflightFrom({ 17182, 22691, 13789, 19019 }, 100)
+    local rawF, rawR = rawOrder(fwd), rawOrder(rev)
+    ck(ascending(rawF) == false,
+       "(a) pairs() over these ids is NOT ascending (" .. join(rawF) .. ") — the sweep really was unordered")
+    ck(join(rawF) ~= join(rawR),
+       "(a) …and the SAME four ids walk differently by insertion order (" .. join(rawR)
+       .. ") — this is the defect, measured")
+
+    -- ── (b) THE SEAM ANSWERS THE SAME WAY EVERY TIME ───────────────────────
+    local gotF = Scan.ExpiredIds(fwd, 200)
+    local gotR = Scan.ExpiredIds(rev, 200)
+    ck(join(gotF) == "13789,17182,19019,22691",
+       "(b) THE FIX: expired ids come out in ascending order (" .. join(gotF) .. ")")
+    ck(join(gotF) == join(gotR),
+       "(b) …identically for both insertion orders — the retry queue is reproducible")
+    ck(#gotF == 4, "(b) …and every expired id is still there, none dropped by the sort")
+
+    -- ── (c) THE DEADLINE IS STILL THE DEADLINE ─────────────────────────────
+    local mixed = { [19019] = 100, [13789] = 900, [22691] = 100, [17182] = 900 }
+    local due = Scan.ExpiredIds(mixed, 200)
+    ck(join(due) == "19019,22691", "(c) only ids past `now` expire (" .. join(due) .. ")")
+    ck(#Scan.ExpiredIds(mixed, 100) == 0,
+       "(c) …and the comparison stays STRICT: a deadline exactly at `now` has not expired")
+    ck(#Scan.ExpiredIds(mixed, 1000) == 4, "(c) …while a late enough tick expires them all")
+
+    -- ── (d) IT CANNOT RAISE INSIDE A TICK ──────────────────────────────────
+    ck(#Scan.ExpiredIds(nil, 1) == 0, "(d) no inflight map at all answers empty, not nil")
+    ck(#Scan.ExpiredIds({}, 1) == 0, "(d) an empty map answers empty")
+    ck(#Scan.ExpiredIds({ [1] = 1 }, nil) == 0, "(d) a missing clock answers empty rather than comparing to nil")
+    ck(#Scan.ExpiredIds({ [7] = "soon" }, 999) == 0, "(d) a non-numeric deadline is ignored, not sorted against")
+
+    -- ── (e) THE REAL TICK USES IT ──────────────────────────────────────────
+    -- Source pin, because ScanTick's ST is a file-local the harness cannot reach:
+    -- the sweep must route through the seam, not keep its own pairs() walk.
+    local sh = io.open(P("itemScan.lua"), "r")
+    ck(sh ~= nil, "(e) itemScan.lua is readable")
+    if sh then
+        local ss = sh:read("*a"); sh:close()
+        ck(ss:find("Scan%.ExpiredIds%(ST%.inflight, now%)") ~= nil,
+           "(e) ScanTick's expiry sweep decides through the seam")
+        ck(ss:find("for id, deadline in pairs%(ST%.inflight%)") == nil,
+           "(e) REGRESSION PIN: the raw pairs() sweep is gone from the tick")
+        ck(ss:find("table%.sort%(out%)") ~= nil, "(e) …and the seam really sorts")
+    end
+
+    -- ── (f) THE RETRY LADDER STILL WORKS, driven through the REAL runner ───
+    -- A world where nothing ever loads: every id goes inflight, times out, is
+    -- retried once (MAX_TRIES = 2), times out again, and is written off. The
+    -- ladder has to still terminate with the sort in place, and every id has to
+    -- get the same number of asks — the fix is about ORDER, not about who gets
+    -- served.
+    local S = {}
+    local sfn = loadfile(P("itemScan.lua"))
+    if sfn and pcall(sfn, "Daseeki-Armory", S) then
+        S.SLOT_INVTYPES = { [16] = { INVTYPE_WEAPON = true } }
+        S.Tag  = function() return "[Armory]" end
+        S.Wrap = function(_, _, s) return s end
+        local Sc = S.ItemScan
+        Sc.RANGES = { { 13789, 13789 }, { 17182, 17182 }, { 19019, 19019 }, { 22691, 22691 } }
+
+        local sv = { _G.GetItemInfo, _G.GetItemInfoInstant, _G.GetTime, _G.time,
+                     _G.GetBuildInfo, _G.C_Timer, _G.C_Item, _G.CreateFrame,
+                     _G.print, _G.DaseekiArmoryScanDB }
+        local T, asks = 0, {}
+        _G.GetItemInfo = function() return nil end            -- the client NEVER answers
+        _G.GetItemInfoInstant = function(id)
+            for _, r in ipairs(Sc.RANGES) do if id == r[1] then return id, nil, nil, "INVTYPE_WEAPON", "icon", 2, 7 end end
+            return nil
+        end
+        _G.GetTime      = function() return T end
+        _G.time         = function() return 1785900000 end
+        _G.GetBuildInfo = function() return "1.15.9", "68940" end
+        _G.C_Timer      = { After = function() end }
+        _G.C_Item       = { RequestLoadItemDataByID = function(id) asks[#asks + 1] = id end }
+        _G.print        = function() end
+        local stub = { Show = function() end, Hide = function() end, SetScript = function() end,
+                       RegisterEvent = function() end, UnregisterAllEvents = function() end }
+        _G.CreateFrame  = function() return stub end
+        _G.DaseekiArmoryScanDB = Sc.NewCache()
+
+        local started = S:StartItemScan({ force = true })
+        local ticks = 0
+        while S:IsScanning() and ticks < 5000 do
+            T = T + Sc.TICK; S:ScanTick(Sc.TICK); ticks = ticks + 1
+        end
+        _G.GetItemInfo, _G.GetItemInfoInstant, _G.GetTime, _G.time,
+        _G.GetBuildInfo, _G.C_Timer, _G.C_Item, _G.CreateFrame,
+        _G.print, _G.DaseekiArmoryScanDB =
+            sv[1], sv[2], sv[3], sv[4], sv[5], sv[6], sv[7], sv[8], sv[9], sv[10]
+
+        ck(started == true, "(f) a scan over a client that never answers starts")
+        ck(S:IsScanning() == false, "(f) …and TERMINATES (" .. ticks .. " ticks), retries and all")
+        local per = {}
+        for _, id in ipairs(asks) do per[id] = (per[id] or 0) + 1 end
+        local n = 0
+        for _ in pairs(per) do n = n + 1 end
+        ck(n == 4, "(f) …having asked about all 4 ids (" .. n .. ")")
+        local even = true
+        for _, c in pairs(per) do if c ~= Sc.MAX_TRIES then even = false end end
+        ck(even, "(f) …each exactly MAX_TRIES times — the sort reorders retries, it does not ration them")
+        -- The retry round begins after the first round of 4 asks; with the sweep
+        -- sorted it is ascending, which the raw pairs() walk in (a) is not.
+        local retry = { asks[5], asks[6], asks[7], asks[8] }
+        ck(#asks == 8 and retry[1] ~= nil,
+           "(f) …in two rounds of four (" .. #asks .. " asks)")
+        ck(ascending(retry) == true,
+           "(f) THE FIX, END TO END: the retry round is ascending (" .. join(retry) .. ")")
+    else
+        ck(false, "(f) itemScan.lua loads for the retry drive")
+    end
+end)
+
+----------------------------------------------------------------------
+-- ARM-9 — WHICH SET THE KEYBIND WARNING NAMES
+-- (SUITE_ASYNC_AUDIT.md §3, Class 8 — Brief J)
+--
+-- Binding a combo another set already holds pops a confirmation naming the set
+-- that will lose it. The search was a `pairs()` walk with a `break`, so with two
+-- sets on one combo the dialog named an ARBITRARY one — a different one between
+-- sessions, over data that had not changed.
+--
+-- IT IS THE MESSAGE THAT WAS WRONG, NOT THE OUTCOME. keybind.lua's SetSetKeybind
+-- clears EVERY set holding the combo, so the action was always deterministic;
+-- the dialog is the owner's only preview of it, and a preview that renames
+-- itself each time it is opened is one you cannot reproduce or trust. That
+-- asymmetry is asserted below too, so the fix is pinned against the behaviour it
+-- is previewing rather than against itself.
+----------------------------------------------------------------------
+suite("keybind-collision-order", function(ck)
+    local savedSPD = _G.StaticPopupDialogs
+    _G.StaticPopupDialogs = {}
+    local A = { SLOTS = {}, ItemScan = {} }
+    local fnc, err = loadfile(P("options.lua"))
+    ck(fnc ~= nil, "options.lua compiles" .. (fnc and "" or (" -> " .. tostring(err))))
+    local lok = fnc and pcall(fnc, "Daseeki-Armory", A)
+    _G.StaticPopupDialogs = savedSPD
+    ck(lok == true, "…and loads with no WoW API but StaticPopupDialogs")
+    if not lok then return end
+
+    local KB = A.SetKeybind
+    ck(type(KB) == "table", "the collision search is published as Addon.SetKeybind")
+    ck(type(KB) == "table" and type(KB.Collision) == "function", "…carrying Collision as the seam")
+    if type(KB) ~= "table" or type(KB.Collision) ~= "function" then return end
+
+    -- ── (a) THE FIXTURE HAS TEETH ──────────────────────────────────────────
+    -- Four sets sharing one combo, named the way core.lua's own macro example
+    -- names them ("1 - DPS"). The RED CONTROL — the shipped pairs()+break search,
+    -- verbatim — is run over the same data first, so the checks below demonstrate
+    -- the defect rather than merely assert the fix.
+    local function setsWith(order)
+        local s = {}
+        for _, n in ipairs(order) do s[n] = { key = "CTRL-1" } end
+        s["Fishing"] = { key = "ALT-9" }
+        s["Unbound"] = {}
+        return s
+    end
+    local NAMES = { "1 - DPS", "2 - Tank", "3 - Heal", "4 - PvP" }
+    local fwd = setsWith(NAMES)
+    local rev = setsWith({ "4 - PvP", "3 - Heal", "2 - Tank", "1 - DPS" })
+    -- THE SHIPPED 1.3.1 SEARCH, verbatim.
+    local function oldSearch(s, name, combo)
+        for n, v in pairs(s) do if n ~= name and v.key == combo then return n end end
+    end
+    local rawF, rawR = oldSearch(fwd, "Current", "CTRL-1"), oldSearch(rev, "Current", "CTRL-1")
+    ck(rawF ~= nil and rawR ~= nil, "(a) both fixtures do hold a collision")
+    ck(rawF ~= "1 - DPS",
+       "(a) THE DEFECT: the old pairs()+break names \"" .. tostring(rawF)
+       .. "\", which is not the first set by any rule the owner can see")
+    -- And it is not following the data either: creating the sets in the opposite
+    -- order does not change the answer, because the answer was never about order
+    -- of creation — it is about the table's internal layout.
+    ck(rawR == rawF,
+       "(a) …and reversing the creation order does not move it, so it was never following the data")
+
+    -- ── (b) THE SEAM IS DETERMINISTIC, AND DIFFERENT ───────────────────────
+    local gotF, nF = KB.Collision(fwd, "Current", "CTRL-1")
+    local gotR, nR = KB.Collision(rev, "Current", "CTRL-1")
+    ck(gotF == "1 - DPS", "(b) THE FIX: the alphabetical first is named (" .. tostring(gotF) .. ")")
+    ck(gotF ~= rawF, "(b) …which is NOT what the old search answered, so this is not a vacuous test")
+    ck(gotF == gotR, "(b) …the same one whatever order the sets were created in")
+    ck(nF == 4 and nR == 4, "(b) …and the collision COUNT is reported, so the caller can say more later")
+
+    -- ── (c) THE ORDINARY CASES ─────────────────────────────────────────────
+    ck(KB.Collision(fwd, "1 - DPS", "CTRL-1") == "2 - Tank",
+       "(c) the set being bound is excluded from its own collision")
+    ck(KB.Collision(fwd, "Current", "CTRL-9") == nil, "(c) an unheld combo collides with nothing")
+    ck(KB.Collision({ ["Solo"] = { key = "CTRL-1" } }, "Solo", "CTRL-1") == nil,
+       "(c) …and a set already holding the combo does not collide with itself")
+    ck(select(2, KB.Collision(fwd, "Current", "ALT-9")) == 1, "(c) a single holder reports a count of 1")
+
+    -- ── (d) IT CANNOT RAISE INSIDE A CLICK HANDLER ─────────────────────────
+    ck(KB.Collision(nil, "x", "CTRL-1") == nil, "(d) no set table answers nil")
+    ck(KB.Collision(fwd, "Current", nil) == nil, "(d) no combo captured answers nil")
+    ck(KB.Collision(fwd, "Current", "") == nil, "(d) an empty combo answers nil")
+    ck(KB.Collision({ [1] = { key = "CTRL-1" }, ["A Set"] = { key = "CTRL-1" } }, "x", "CTRL-1") == "A Set",
+       "(d) a non-string key cannot reach the sort, which would raise on mixed types")
+    ck(KB.Collision({ ["Broken"] = "not a table" }, "x", "CTRL-1") == nil,
+       "(d) a malformed set entry is skipped rather than indexed")
+
+    -- ── (e) THE CALLER AND THE BEHAVIOUR IT PREVIEWS ───────────────────────
+    local oh = io.open(P("options.lua"), "r")
+    ck(oh ~= nil, "(e) options.lua is readable")
+    if oh then
+        local os_ = oh:read("*a"); oh:close()
+        ck(os_:find("Keybind%.Collision%(Addon%.db%.sets, name, combo%)") ~= nil,
+           "(e) the keybind button decides through the seam")
+        ck(os_:find("if n ~= name and s%.key == combo then otherSet = n; break end") == nil,
+           "(e) REGRESSION PIN: the inline pairs()+break search is gone")
+    end
+    local kh = io.open(P("keybind.lua"), "r")
+    ck(kh ~= nil, "(e) keybind.lua is readable")
+    if kh then
+        local ks = kh:read("*a"); kh:close()
+        local body = ks:match("function Addon:SetSetKeybind.-\n end") or ks
+        ck(ks:find("if n ~= name and s%.key == key then s%.key = nil end") ~= nil and body ~= nil,
+           "(e) …and SetSetKeybind still clears EVERY colliding set, with no break")
+        ck(ks:find("s%.key == key then s%.key = nil end") ~= nil
+           and ks:find("s%.key == key then s%.key = nil; break") == nil,
+           "(e) …so the outcome the dialog previews was never the arbitrary one — only the name was")
+    end
+end)
+
+----------------------------------------------------------------------
 -- Every shipped file compiles (loadfile gate)
 ----------------------------------------------------------------------
 suite("loadfile-all-files", function(ck)

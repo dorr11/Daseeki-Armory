@@ -351,6 +351,80 @@ function Addon:MarkSetPending(name, skip)
     if Addon.UpdatePaperdollPending then Addon:UpdatePaperdollPending() end
 end
 
+-- ── The settle signals a popout's paint depends on ────────────────────────────
+--
+-- ARM-6 (SUITE_ASYNC_AUDIT.md §3, Class 7). A popout paints from
+-- GetInventoryItemTexture, so its event set has to carry every signal that
+-- proves a slot's contents have settled — including the one that proves the
+-- client has answered about inventory AT ALL. Three things were wrong:
+--
+--  1. PLAYER_ENTERING_WORLD was not in the set. InitSlotPopouts runs at
+--     PLAYER_LOGIN and ShowSlotPopout paints immediately; if inventory reads
+--     cold that early, UpdateSlotPopout paints the desaturated EMPTY-slot
+--     placeholder and nothing re-fires until gear actually changes — a fully
+--     geared character sees empty popout buttons for the whole session. The 1s
+--     border ticker only recolours borders, so it cannot heal this. Siblings
+--     trinkets.lua:211 and stats.lua:727 both register it for exactly this
+--     reason; this file was the asymmetry.
+--
+--  2. THE FILTER WOULD HAVE SWALLOWED THE FIX. Every event was routed through
+--     `unit == nil or unit == "player"`, but only UNIT_INVENTORY_CHANGED has a
+--     unit for arg1: PLAYER_EQUIPMENT_CHANGED's is a SLOT NUMBER and
+--     PLAYER_ENTERING_WORLD's is a BOOLEAN (isInitialLogin). Both are dropped
+--     by that test, so PLAYER_EQUIPMENT_CHANGED has been registered and inert,
+--     and a bare registration of the third event would have been inert too.
+--     stats.lua:748–755 names this exact trap and handles the slot-number arg
+--     BEFORE the unit filter; the dispatch below does the same.
+--
+--  3. Class 7's second half — "a capture that observed a locked/unsettled slot
+--     schedules its own follow-up". An entering-world paint that comes back
+--     with NO texture for a slot is an UNPROVEN read, not a proven empty slot
+--     (Class 4's rule: absence of proof is not absence). WarmSlotPopouts arms a
+--     bounded ladder that re-paints and then STOPS. It cannot become a poller:
+--     WARM_LADDER is a fixed list of offsets, one ladder may be in flight at a
+--     time, and it retires early the moment every shown popout has an answer.
+--
+-- Declared as DATA so the harness can assert the set rather than the string.
+Addon.POPOUT_EVENTS = {
+    "UNIT_INVENTORY_CHANGED",   -- arg1 = unit
+    "PLAYER_EQUIPMENT_CHANGED", -- arg1 = SLOT NUMBER
+    "PLAYER_ENTERING_WORLD",    -- arg1 = isInitialLogin (boolean)
+}
+
+-- Cumulative seconds after PLAYER_ENTERING_WORLD. Three rungs inside six
+-- seconds: long enough to outlast a slow inventory hand-off, short enough that
+-- the last rung has landed before the player has finished reading the login
+-- message, and finite either way.
+local WARM_LADDER = { 0.5, 2, 5 }
+
+-- True while at least one SHOWN popout has no texture for its slot. A genuinely
+-- empty slot (no tabard, no shirt) reads identically — which is precisely why
+-- the ladder is BOUNDED rather than "retry until proven".
+function Addon:SlotPopoutsUnproven()
+    for slotId, b in pairs(Addon._popoutFrames or {}) do
+        if b:IsShown() and not GetInventoryItemTexture("player", slotId) then return true end
+    end
+    return false
+end
+
+function Addon:WarmSlotPopouts()
+    if Addon._popoutWarming then return end
+    if not Addon:SlotPopoutsUnproven() then return end
+    if not (C_Timer and C_Timer.After) then return end
+    Addon._popoutWarming = true
+    local rung = 0
+    local function step()
+        rung = rung + 1
+        Addon:UpdateAllSlotPopouts()
+        if rung >= #WARM_LADDER or not Addon:SlotPopoutsUnproven() then
+            Addon._popoutWarming = false
+            return
+        end
+        C_Timer.After(WARM_LADDER[rung + 1] - WARM_LADDER[rung], step)
+    end
+    C_Timer.After(WARM_LADDER[1], step)
+end
+
 -- ── Init ──────────────────────────────────────────────────────────────────────
 function Addon:InitSlotPopouts()
     for slotId in pairs(Addon.db.settings.slotPopouts.buttons) do
@@ -361,12 +435,30 @@ function Addon:InitSlotPopouts()
         if type(slotId) == "number" then Addon:ApplyPopoutAnchor(slotId) end
     end
     if not Addon._popoutEv then
-        Addon._popoutEv = CreateFrame("Frame")
-        Addon._popoutEv:RegisterEvent("UNIT_INVENTORY_CHANGED")
-        Addon._popoutEv:RegisterEvent("PLAYER_EQUIPMENT_CHANGED")
-        Addon._popoutEv:SetScript("OnEvent", function(_, _, unit)
-            if unit == nil or unit == "player" then Addon:UpdateAllSlotPopouts() end
+        local ev = CreateFrame("Frame")
+        Addon._popoutEv = ev
+        for _, e in ipairs(Addon.POPOUT_EVENTS) do ev:RegisterEvent(e) end
+        ev:SetScript("OnEvent", function(_, event, arg1)
+            if event == "PLAYER_ENTERING_WORLD" then
+                -- The loading screen is over; repaint, and if the client has not
+                -- answered for some slot yet, come back for it (see above).
+                Addon:UpdateAllSlotPopouts()
+                Addon:WarmSlotPopouts()
+                return
+            end
+            -- arg1 here is a SLOT NUMBER, so this must be decided BEFORE the
+            -- "player"-only unit filter below, which would drop it.
+            if event == "PLAYER_EQUIPMENT_CHANGED" then
+                Addon:UpdateAllSlotPopouts()
+                return
+            end
+            -- unit-scoped events (UNIT_INVENTORY_CHANGED): only the player's.
+            if arg1 == nil or arg1 == "player" then Addon:UpdateAllSlotPopouts() end
         end)
     end
     Addon:StartBorderWatch()
+    -- PLAYER_ENTERING_WORLD can have fired before this ran (InitSlotPopouts is on
+    -- the PLAYER_LOGIN leg), so the login case gets its ladder here too rather
+    -- than waiting for the next loading screen to supply one.
+    Addon:WarmSlotPopouts()
 end
