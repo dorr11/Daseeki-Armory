@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+### Internal
+
+*Nothing in this section changes anything you can see in the game. It changes what
+the tests are allowed to believe.*
+
+- **The gear-swap test world now behaves like the real client, and the gear-swap
+  engine fails against it.** Armory's headless test harness had a make-believe
+  inventory in which every item move happened instantly, inside the line of code
+  that asked for it, and no slot was ever locked. The real client does not work
+  like that: it releases a slot's *lock* first and rewrites the slot's *contents*
+  a moment later, and anything that reads the world in between reads the world as
+  it was *before* the move. That gap is where a whole family of bugs lives — the
+  same one that produced Daseeki Bags' "Internal Bag Error" gear ping-pong.
+
+  The test world now models the gap: moves lock the slots they touch, locks
+  release on their own tick, contents publish on a later one, an operation aimed
+  at a locked slot is refused and counted, and re-asking the server to apply a
+  move it has already applied raises the client's real error. With that in place,
+  six known defects in the equip engine became visible for the first time and are
+  now recorded, by name, as deliberately-failing tests: a three-way ring exchange
+  finishes with the wrong ring and still marks the set as worn; a two-hander swap
+  leaves your off hand stranded on the cursor; two swaps queued during combat
+  drain as one; and an equip can hang forever on a lock it did not set.
+
+  Those tests are quarantined, not silenced — the suite prints them loudly on
+  every run, names the defect each one proves, and still passes so the rest of
+  the gate keeps working. Repairing the engine is the next piece of work; this
+  one exists so that repair can be proved rather than hoped for.
+
 ### Fixed
 
 - **Dragging a set to reorder it will keep dropping where you point, whatever the
