@@ -68,6 +68,75 @@ local DD_CAP_H    = 18   -- Set-Swapper column-caption height (UI.MakeLabel's fi
 local DD_CAP_GAP  = 2    -- caption -> dropdown gap (the 20px pitch MakeDropdown's own label uses)
 local DD_BTN_H    = 24   -- MakeDropdown button height
 
+-- ── Set-list reorder drag: which slot is the cursor pointing at? (PURE) ───────
+--
+-- Arithmetic over numbers only, no WoW API, so the harness drives the REAL
+-- function — the same treatment goalPicker.lua's row geometry gets (Rows /
+-- Addon.GoalPickerRows), and for the same reason: a hit-test that lives inline
+-- in an OnUpdate closure is a hit-test nothing can test.
+--
+-- TWO COORDINATE SPACES MEET IN A REORDER DRAG, and mixing them is the defect
+-- this seam exists to end:
+--
+--   GetCursorPosition()          -> RAW screen units, no scale applied.
+--   Frame:GetTop()/GetBottom()   -> the FRAME'S OWN effective-scale space.
+--
+-- A cursor Y may therefore only be compared against a frame's edges after
+-- dividing it by THAT frame's effective scale. The set list used to divide by
+-- UIParent's instead, which agrees only while the list's effective scale happens
+-- to equal UIParent's. Nothing scales the options pane today, so the two spaces
+-- coincide and the bug is invisible — but the moment anything in the chain from
+-- UIParent down to the scroll child takes a SetScale (a list-scale slider, a
+-- themed pane scale, a Core window scale), the comparison reads the cursor as
+-- (listScale x) its true height above the screen's bottom edge. That error is
+-- PROPORTIONAL to height, not a constant offset, so the drop bar would drift
+-- further from the pointer the higher up the list you dragged. Daseeki-Raid-Prep
+-- shipped exactly this shape and a player hit it the week a List Scale slider
+-- landed (Raid Prep 1.3.1); this is the same defect, fixed before it can bite.
+--
+-- Every row shares one parent — the scroll child — so ONE conversion covers the
+-- whole list, which is why the seam takes a single `listScale`.
+--
+-- Pure inputs: `childTop` is the scroll child's GetTop() in the LIST's own
+-- space; `rowH` the row pitch (also list space); `count` how many rows are in
+-- play; `cursorY` the RAW GetCursorPosition() Y; `listScale` the scroll child's
+-- effective scale. Returns the insertion line, 1..count+1 (count+1 = "after the
+-- last row"), always a whole number, never nil.
+local Drag = {}
+Addon.SetListDrag = Drag
+
+function Drag.DropLine(childTop, rowH, count, cursorY, listScale)
+    count = tonumber(count)
+    count = count and math.floor(count) or 0
+    if count < 1 then return 1 end
+
+    childTop, cursorY, rowH = tonumber(childTop), tonumber(cursorY), tonumber(rowH)
+    -- An unlaid-out list, a cursor the client has not reported yet, or a zero
+    -- row pitch: answer "the head" rather than divide by zero or return nil into
+    -- an arithmetic caller.
+    if not childTop or not cursorY or not rowH or rowH <= 0 then return 1 end
+
+    -- A scale is never 0 or negative in a live client; refuse to divide by one
+    -- anyway rather than propagate an inf/NaN into the comparison.
+    listScale = tonumber(listScale)
+    if not listScale or listScale <= 0 then listScale = 1 end
+
+    local y    = cursorY / listScale     -- the cursor, in the LIST's space
+    local relY = childTop - y            -- how far below the list's top edge
+    local hRow = math.floor(relY / rowH) -- rows fully above the cursor
+    local frac = relY - hRow * rowH      -- how far into the row under the cursor
+
+    -- Upper half of a row inserts BEFORE it, lower half AFTER it. The comparison
+    -- is strict, so a cursor exactly on a row's midpoint resolves one way only
+    -- and the drop bar cannot flicker between two slots.
+    local line = (frac < rowH / 2) and (hRow + 1) or (hRow + 2)
+
+    if line ~= line then return 1 end    -- NaN in (inf - inf), never out
+    if line < 1 then return 1 end
+    if line > count + 1 then return count + 1 end
+    return line
+end
+
 -- Shared re-tinting FontObjects created by DaseekiUI (theme.lua). Referencing the
 -- global names keeps custom FontStrings themed — they re-color on ThemeChanged.
 local F_BODY, F_SMALL = "DaseekiUIFontBody", "DaseekiUIFontSmall"
@@ -436,9 +505,16 @@ local function buildSetList(flow, panel)
     dragTick:SetScript("OnUpdate", function()
         local srcName = panel._dragSourceName
         if not srcName then dragTick:Hide(); return end
-        local mx, my = GetCursorPosition()
-        local scale = UIParent:GetEffectiveScale()
-        mx, my = mx / scale, my / scale
+        local cx, cy = GetCursorPosition()
+
+        -- UIParent's space is the right one HERE and only here: the movement
+        -- threshold below is a SCREEN gesture ("has the mouse moved far enough
+        -- to mean a drag?"), and the anchor it is measured against was captured
+        -- in this same space in the row's OnMouseDown. Both sides must agree;
+        -- neither may reach the hit-test, which lives in the LIST's space.
+        local uiScale = UIParent:GetEffectiveScale()
+        if not uiScale or uiScale <= 0 then uiScale = 1 end
+        local uiMX, uiMY = cx / uiScale, cy / uiScale
 
         if not IsMouseButtonDown("LeftButton") then
             dragTick:Hide(); dropBar:Hide()
@@ -453,7 +529,7 @@ local function buildSetList(flow, panel)
         end
 
         if not panel._dragging then
-            local dx, dy = mx - (panel._dragClickX or mx), my - (panel._dragClickY or my)
+            local dx, dy = uiMX - (panel._dragClickX or uiMX), uiMY - (panel._dragClickY or uiMY)
             if dx * dx + dy * dy < 25 then return end
             panel._dragging = true
         end
@@ -462,11 +538,12 @@ local function buildSetList(flow, panel)
         if not childTop then return end
         local n = #Addon:GetSetsSorted()
         if n == 0 then return end
-        local relY = childTop - my
-        local hRow = math.floor(relY / SET_ROW_H)
-        local frac = relY - hRow * SET_ROW_H
-        local line = (frac < SET_ROW_H / 2) and (hRow + 1) or (hRow + 2)
-        line = math.max(1, math.min(n + 1, line))
+
+        -- A DIFFERENT SPACE: child:GetTop() and SET_ROW_H are both expressed in
+        -- the scroll child's own effective scale, so the RAW cursor is converted
+        -- with the CHILD's scale — never with uiMY above. See Drag.DropLine.
+        local listScale = child:GetEffectiveScale()
+        local line = Drag.DropLine(childTop, SET_ROW_H, n, cy, listScale)
         panel._dragDropLine = line
 
         dropBar:ClearAllPoints()
@@ -1260,9 +1337,14 @@ function Addon:RefreshSetList()
                 if btn ~= "LeftButton" then return end
                 panel._dragSourceName = self._name
                 panel._dragging = false
-                local mx, my = GetCursorPosition()
-                local scale = UIParent:GetEffectiveScale()
-                panel._dragClickX, panel._dragClickY = mx / scale, my / scale
+                -- UIPARENT SPACE, deliberately, and the ticker's threshold reads
+                -- it back in the SAME space (see buildSetList). This anchor only
+                -- ever answers "did the mouse move 5px?" — it is not a hit-test,
+                -- so it must NOT be converted with the list's scale.
+                local cx, cy = GetCursorPosition()
+                local uiScale = UIParent:GetEffectiveScale()
+                if not uiScale or uiScale <= 0 then uiScale = 1 end
+                panel._dragClickX, panel._dragClickY = cx / uiScale, cy / uiScale
                 if panel._dragTick then panel._dragTick:Show() end
             end)
             panel.rows[i] = r
