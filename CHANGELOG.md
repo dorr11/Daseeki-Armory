@@ -31,7 +31,66 @@ the tests are allowed to believe.*
   the gate keeps working. Repairing the engine is the next piece of work; this
   one exists so that repair can be proved rather than hoped for.
 
+- **That repair has landed, and the quarantine is gone with it.** All six defects
+  above now pass, so the debt ledger and the machinery that tolerated it have been
+  deleted: every check in the suite gates again, and a settle bug can only ever
+  come back as a red run. Five new gate suites hold the line — the same
+  convergence scenarios run at four different client timings (including the one
+  where the old, wrong rule would also have passed, so the fix cannot be an
+  accident of tuning); a mutation gate puts the old "unlocked means finished" rule
+  back and requires the suite to go red; and the combat queue is walked round by
+  round to prove a refused action is still queued afterwards rather than gone.
+  The whole body is 1,703 checks.
+
 ### Fixed
+
+- **Gear sets now equip correctly, completely, and once.** Swapping a set could
+  put the wrong item in a slot, leave an item stuck on your cursor, silently drop
+  half of what you queued during a fight, or leave the addon convinced a swap was
+  still running until you reloaded — and it would mark the set as the one you were
+  wearing either way.
+
+  All of it was one mistake, made in several places. Moving an item is a
+  conversation with the server, not an instruction: the client greys the slot out,
+  asks, and only writes the new contents in when the answer comes back. The engine
+  did not wait for the answer. It planned the whole swap, fired every move in a
+  single instant, and decided what to do next by re-reading slots that were still
+  showing what they held *before* the swap started. So the second move was planned
+  against a world the first move had already changed — which is how a three-way
+  ring exchange ended up undoing itself — and when the engine looked again to see
+  whether it was finished, it read "nothing is locked" as "everything has landed"
+  and re-sent moves the server had already carried out. The client's answer to
+  that is the same "Internal Bag Error" that plagued Daseeki Bags, and the visible
+  result was gear ping-ponging and items left dangling on the cursor with nothing
+  in the addon able to put them back.
+
+  The engine now converges the way the swap actually happens. It does one round
+  at a time: it works out what still needs to change, sends only the moves that
+  touch entirely separate slots, and then *waits until those slots are showing the
+  items it asked for* — not until they stop being greyed out, which is the earlier
+  and misleading signal. Then it looks at the character afresh and works out the
+  next round from what is really there. Nothing is ever re-sent because the addon
+  read the world too early.
+
+  Everything that could hang now has a floor under it. If another addon, or the
+  server, is sitting on a slot the set needs, the swap waits for it, and gives up
+  and tells you if it never frees — rather than leaving the "swap in progress"
+  state set until your next reload. Every path that gives up puts anything left on
+  your cursor back where it came from first, including the ones that used to have
+  no recovery at all. Your own cursor is not touched if the swap refused before it
+  moved anything.
+
+  Swaps queued during combat drain the same careful way. They used to be emptied
+  out of the queue before they were attempted, so the second one — refused because
+  the first was still in flight — was simply gone; queue two trinkets in a fight
+  and one of them arrived. Now an action leaves the queue only once it has actually
+  been sent, anything refused is retried on the next round, and actions that depend
+  on each other are ordered so they cannot steal each other's item. A whole set
+  queued behind them waits for them to land before it plans, so it plans against
+  the character you will actually have.
+
+  And a set is only marked as the one you are wearing when a fresh look at your
+  character confirms it — never merely because a swap was attempted.
 
 - **Dragging a set to reorder it will keep dropping where you point, whatever the
   settings window is scaled to.** Nothing changes for you today: at the scale every

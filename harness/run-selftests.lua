@@ -559,6 +559,11 @@ suite("equip-execution", world(function(ck, w, A)
     w3:settle()
     ck(w3.worn[1] == L(3002), "an occupied cursor blocks the swap")
     ck(w3:output():find("cursor") ~= nil, "the cursor abort is reported to the user")
+    -- CURSOR-CLEAN, the honest form: the engine stranded nothing of its own, and
+    -- because the guard fired BEFORE it touched anything, the item the PLAYER was
+    -- carrying is still theirs. A ClearCursor here would drop the user's item.
+    ck(w3.cursor == L(9999), "an abort before the first move leaves the player's own cursor alone")
+    ck(w3.Addon.db.currentSet == nil, "a run that aborted is NOT stamped as the current set")
     w3:teardown()
 
     -- no free bag slot for the displaced off hand: abort with the room message
@@ -572,7 +577,46 @@ suite("equip-execution", world(function(ck, w, A)
     w4:settle()
     ck(w4.worn[17] == L(4003), "off hand kept when there is nowhere to put it")
     ck(w4:output():find("bag space") ~= nil, "the not-enough-room abort is reported")
+    ck(w4.cursor == nil, "the not-enough-room abort strands nothing on the cursor")
+    ck(w4.Addon._equipping == nil, "…and releases the equipping latch")
+    ck(w4.Addon.db.currentSet == nil, "…and does not claim the set is current")
     w4:teardown()
+
+    ------------------------------------------------------------ the ClearCursor backstop
+    -- ARM-2a: there was no ClearCursor ANYWHERE in equip.lua, so a refused op
+    -- left the item dangling on the player's cursor with no way back. The
+    -- backstop is deliberately unreachable through a healthy flow, so it is
+    -- driven directly here — including the one case where it must NOT fire.
+    local w5 = mock.new(P)
+    w5:setBag(0, 1, L(3001))
+    w5.Addon._run = { name = "x", gen = 99, inflight = {}, progressed = 0, issuedAny = true }
+    C_Container.PickupContainerItem(0, 1)                 -- our item, now on the cursor
+    ck(w5.cursor == L(3001), "an item is on the cursor mid-run")
+    w5.Addon:AbortRun("x", 1)                             -- ABORT_NO_ROOM
+    ck(w5.cursor == nil, "aborting a run that had issued clears OUR item off the cursor")
+    ck(w5:bagTruthOf(0, 1) == L(3001), "…and ClearCursor returns it, never destroys it")
+    ck(w5.Addon._equipping == nil, "…and the latch is released with it")
+    w5:teardown()
+
+    local w6 = mock.new(P)
+    w6.cursor = L(9999)                                   -- the PLAYER's item
+    w6.Addon._run = { name = "y", gen = 99, inflight = {}, progressed = 0, issuedAny = false }
+    w6.Addon:AbortRun("y", 2)                             -- ABORT_CURSOR, before any move
+    ck(w6.cursor == L(9999),
+       "…but a run that never moved anything leaves the PLAYER's cursor alone")
+    w6:teardown()
+
+    -- and the backstop itself, published so every abort path has one thing to
+    -- call rather than each inventing its own recovery.
+    local w7 = mock.new(P)
+    ck(type(w7.Addon.ClearCursorBackstop) == "function", "the ClearCursor backstop is published")
+    w7:setBag(0, 1, L(3001))
+    C_Container.PickupContainerItem(0, 1)
+    ck(w7.cursor == L(3001), "an item is dangling on the cursor")
+    w7.Addon.ClearCursorBackstop()
+    ck(w7.cursor == nil, "the backstop puts it down")
+    ck(w7:bagTruthOf(0, 1) == L(3001), "…back where it came from — it can never destroy an item")
+    w7:teardown()
 end))
 
 -- §4 partial sets: the rest of the set still equips, missing items reported once.
@@ -664,13 +708,15 @@ end))
 
 ----------------------------------------------------------------------
 -- The audit's named Class 1 scenarios (SUITE_ASYNC_AUDIT.md §3, ARM-1/3/4),
--- written as fixtures so BRIEF A has an exact acceptance target. Each one is
--- the failure the audit predicts, spelled out in the smallest world that shows
--- it. They are QUARANTINED below until Brief A lands.
+-- written as fixtures so BRIEF A had an exact acceptance target. Each one is
+-- the failure the audit predicted, spelled out in the smallest world that shows
+-- it. They were the quarantined known-reds; Brief A's settle-aware executor
+-- turned them green and the quarantine went with them. They gate now.
 ----------------------------------------------------------------------
 
--- ARM-1 (equip.lua:526–531 + 439–453). The whole plan runs in one frame, and
--- `OpStillNeeded` re-reads the PRE-operation world between ops.
+-- ARM-1. The whole plan used to run in one frame, with `OpStillNeeded` re-reading
+-- the PRE-operation world between ops. The fix issues only the slot-disjoint
+-- wave and re-derives the plan from the SETTLED world.
 suite("equip-arm1-three-way", world(function(ck, w, A)
     -- The audit's canonical case: a three-way ring exchange. Slot 11 wants the
     -- ring that is currently worn in slot 12; slot 12 wants a ring from the bags.
@@ -687,8 +733,10 @@ suite("equip-arm1-three-way", world(function(ck, w, A)
     ck(w.stats.lockedIssue == 0, "no operation was issued against a locked slot")
 end))
 
--- ARM-3 (equip.lua:654–689). `DrainCombatQueue` empties the queue BEFORE the
--- drain loop, so an action refused on the previous action's locks is lost.
+-- ARM-3. `DrainCombatQueue` used to empty the queue BEFORE the drain loop, so an
+-- action refused on the previous action's locks was lost. It now drains in
+-- settle-paced, dependency-ordered rounds and an action leaves the queue only
+-- once it has been issued.
 suite("equip-arm3-combat-drain", world(function(ck, w, A)
     -- Queue two actions that touch one slot between them: put the bagged trinket
     -- into 13, and move the trinket currently in 13 across to 14.
@@ -708,9 +756,9 @@ suite("equip-arm3-combat-drain", world(function(ck, w, A)
     ck(w.stats.lockedIssue == 0, "no queued action was issued against a locked slot")
 end))
 
--- ARM-4 (equip.lua:549–573). `WatchLocks` has no ceiling: a lock that outlives
--- the event burst leaves `_equipping` set forever, so the pass never finishes
--- and the pending-slot overlays never clear.
+-- ARM-4. `WatchLocks` had no ceiling: a lock that outlived the event burst left
+-- `_equipping` set forever, so the pass never finished and the pending-slot
+-- overlays never cleared. The wait is now per-slot and bounded three ways.
 suite("equip-arm4-lock-ceiling", world(function(ck, w, A)
     w:setBag(0, 1, L(3001))
     w:defineSet("hang", { [1] = L(3001) })
@@ -722,6 +770,358 @@ suite("equip-arm4-lock-ceiling", world(function(ck, w, A)
     ck(A._equipping == nil, "a lock that outlives the event burst cannot hang the pass")
     ck(A._lockWatcher == nil or A._lockWatcher._name == nil,
        "…and the lock watcher is torn down")
+
+    -- ARM-4's LIVE shape, worse than the audited one: a pass whose ops are ALL
+    -- refused fires no ITEM_LOCK_CHANGED at all, so an event-only watcher never
+    -- re-arms and the latch sticks forever. Here the ONE slot the set needs is
+    -- the one held by a foreigner, so nothing is issued and nothing is published.
+    local w2 = mock.new(P)
+    w2:setBag(0, 1, L(3001))
+    w2:defineSet("dead-air", { [1] = L(3001) })
+    w2.locks["w1"] = true                       -- the target slot itself, held
+    local eventsBefore = #w2.events
+    w2.Addon:EquipSet("dead-air")
+    w2:settle()
+    ck(w2.Addon._equipping == nil,
+       "a pass that could issue NOTHING still terminates (no event ever fires)")
+    ck(w2:countEvents("ITEM_LOCK_CHANGED") == 0,
+       "…and it really was dead air: the client published nothing to re-arm on")
+    ck(#w2.events == eventsBefore, "…no event of any kind arrived")
+    ck(w2.stats.lockedIssue == 0, "…and no op was thrown at the locked slot meanwhile")
+    ck(w2.worn[1] == nil, "the foreign lock kept the slot")
+    ck(w2.Addon.db.currentSet == nil, "a set that could not be equipped is not stamped current")
+    w2:teardown()
+
+    -- The whole-run ceiling: a lock that NEVER clears on a slot we are mid-run
+    -- against still releases the latch.
+    local w3 = mock.new(P)
+    w3:setBag(0, 1, L(3001))
+    w3:setBag(0, 2, L(1001))
+    w3:defineSet("half", { [1] = L(3001), [11] = L(1001) })
+    w3.locks["w11"] = true                      -- held before the run starts
+    w3.Addon:EquipSet("half")
+    w3:settle(60)
+    ck(w3.worn[1] == L(3001), "the reachable half of the set still equipped")
+    ck(w3.Addon._equipping == nil, "the unreachable half does not hang the run")
+    ck(w3.cursor == nil, "…and nothing is stranded on the cursor")
+    ck(w3.stats.lockedIssue == 0, "…and the held slot was never issued against")
+    w3:teardown()
+end))
+
+----------------------------------------------------------------------
+-- THE TIMING MATRIX (brief A gate).
+--
+-- A0's report flagged that a settle fix can pass by LUCK: if the executor's own
+-- cadence happens to straddle the client's publish, the wrong rule looks right.
+-- So every convergence scenario runs at four points of the timing space —
+-- including settleLag 0, where the lock and the contents land together and the
+-- broken "unlocked is settled" rule would ALSO pass. Convergence has to be a
+-- property of the executor, not of the profile it was tuned against.
+----------------------------------------------------------------------
+local SETTLE_PROFILES = {
+    { "lag .35",      { settleLag = 0.35 } },                  -- the live window
+    { "lag 0",        { settleLag = 0 } },                     -- lock + contents together
+    { "lag .05",      { settleLag = 0.05 } },                  -- window shorter than the poll
+    { "lag .35/rt.15", { settleLag = 0.35, latency = 0.15 } }, -- a real round trip too
+}
+
+-- Every row asserts the same five things: the gear is right, the set reads worn,
+-- no move was re-issued after landing, nothing was issued at a locked slot, and
+-- nothing was left on the cursor.
+local function convergedRow(ck, tag, what, world_, setName, check)
+    world_.Addon:EquipSet(setName)
+    world_:settle()
+    ck(check(world_) == true,                       tag .. " " .. what .. ": the gear is right")
+    ck(world_.Addon:IsSetEquipped(setName) == true, tag .. " " .. what .. ": …and reads as worn")
+    ck(world_.stats.bagErrors == 0,                 tag .. " " .. what .. ": …no move re-issued after landing")
+    ck(world_.stats.lockedIssue == 0,               tag .. " " .. what .. ": …none issued at a locked slot")
+    ck(world_.cursor == nil,                        tag .. " " .. what .. ": …nothing left on the cursor")
+    ck(world_.Addon._equipping == nil,              tag .. " " .. what .. ": …and the latch is released")
+    world_:teardown()
+end
+
+suite("equip-settle-matrix", world(function(ck, w, A)
+    for _, prof in ipairs(SETTLE_PROFILES) do
+        local tag, opts = prof[1], prof[2]
+
+        -- the audit's canonical three-way ring exchange
+        local a = mock.new(P, opts)
+        a:setWorn(11, L(1003)); a:setWorn(12, L(1001)); a:setBag(0, 1, L(1002))
+        a:defineSet("rings", { [11] = L(1001), [12] = L(1002) })
+        convergedRow(ck, tag, "3-way rings", a, "rings", function(x)
+            return x.worn[11] == L(1001) and x.worn[12] == L(1002)
+        end)
+
+        -- 1H + shield -> two-hander (the off hand has to be stowed first)
+        local b = mock.new(P, opts)
+        b:setWorn(16, L(4002)); b:setWorn(17, L(4003)); b:setBag(0, 1, L(4001))
+        b:defineSet("2h-in", { [16] = L(4001) })
+        convergedRow(ck, tag, "2H in", b, "2h-in", function(x)
+            return x.worn[16] == L(4001) and x.worn[17] == nil
+        end)
+
+        -- two-hander -> 1H + shield (two slots, one of them freshly vacated)
+        local c = mock.new(P, opts)
+        c:setWorn(16, L(4001)); c:setBag(0, 1, L(4002)); c:setBag(0, 2, L(4003))
+        c:defineSet("2h-out", { [16] = L(4002), [17] = L(4003) })
+        convergedRow(ck, tag, "2H out", c, "2h-out", function(x)
+            return x.worn[16] == L(4002) and x.worn[17] == L(4003)
+        end)
+
+        -- explicit-empty strip alongside a real equip
+        local d = mock.new(P, opts)
+        d:setWorn(13, L(2001)); d:setWorn(1, L(3002)); d:setBag(0, 1, L(3001))
+        d:defineSet("strip", { [1] = L(3001), [13] = mock.EMPTY })
+        convergedRow(ck, tag, "strip+equip", d, "strip", function(x)
+            return x.worn[1] == L(3001) and x.worn[13] == nil
+        end)
+
+        -- a whole set that touches half the character at once
+        local e = mock.new(P, opts)
+        e:setWorn(1, L(3002)); e:setWorn(11, L(1003))
+        e:setBag(0, 1, L(3001)); e:setBag(0, 2, L(1001)); e:setBag(0, 3, L(1002))
+        e:setBag(1, 1, L(2001)); e:setBag(1, 2, L(2002)); e:setBag(2, 1, L(4002))
+        e:defineSet("full", { [1] = L(3001), [11] = L(1001), [12] = L(1002),
+                              [13] = L(2001), [14] = L(2002), [16] = L(4002) })
+        convergedRow(ck, tag, "6-slot set", e, "full", function(x)
+            return x.worn[1] == L(3001) and x.worn[11] == L(1001) and x.worn[12] == L(1002)
+               and x.worn[13] == L(2001) and x.worn[14] == L(2002) and x.worn[16] == L(4002)
+        end)
+    end
+
+    ------------------------------------------------------------ the wave is the mechanism
+    -- The bagLocked/slotLocked pre-issue guards are a PERMANENT BACKSTOP, not the
+    -- mechanism — the sim's lockedIssue counter proves they hold, but a design
+    -- that leans on them is still issuing an op it knows will be refused, and in
+    -- the live client that is a wasted round trip and a client error toast.
+    -- The wave must not even ASK for a slot one of our own in-flight ops owns.
+    -- Counting refusals of ANY kind (rather than one abort code) keeps this gate
+    -- independent of the executor's internal constants.
+    local f = mock.new(P)
+    local F, realExec, refusals = f.Addon, nil, 0
+    realExec = F.ExecuteOp
+    F.ExecuteOp = function(self, op, census)
+        local ok, code, pred = realExec(self, op, census)
+        if not ok then refusals = refusals + 1 end
+        return ok, code, pred
+    end
+    -- Three ops that all collide on slot 12: 11 wants what 12 wears, 12 wants a
+    -- bagged ring, and the 2H needs the off hand out first.
+    f:setWorn(11, L(1003)); f:setWorn(12, L(1001))
+    f:setWorn(16, L(4002)); f:setWorn(17, L(4003))
+    f:setBag(0, 1, L(1002)); f:setBag(0, 2, L(4001))
+    f:defineSet("collide", { [11] = L(1001), [12] = L(1002), [16] = L(4001) })
+    F:EquipSet("collide")
+    f:settle()
+    ck(f.worn[11] == L(1001) and f.worn[12] == L(1002) and f.worn[16] == L(4001)
+       and f.worn[17] == nil, "a plan whose ops collide still converges")
+    ck(refusals == 0,
+       "…and NO op was ever issued that had to be refused — the wave is the mechanism, "
+       .. "the lock guards are the backstop")
+    ck(f.stats.lockedIssue == 0, "…so the sim's permanent gate never fired either")
+    F.ExecuteOp = realExec
+    f:teardown()
+
+    -- OpSlotKeys must name every slot an op WRITES, or the disjointness test is
+    -- reasoning about the wrong set.
+    local g = mock.new(P)
+    local G = g.Addon
+    g:setWorn(16, L(4002)); g:setWorn(17, L(4003)); g:setBag(0, 1, L(4001))
+    local keys = G:OpSlotKeys({ slot = 16, twoHand = true,
+                                from = { where = "bag", bag = 0, slot = 1, link = L(4001) } },
+                              G:BuildCensus())
+    local named = {}
+    for _, k in ipairs(keys or {}) do named[k] = true end
+    ck(named["w16"] == true, "a 2H equip names the main hand")
+    ck(named["b0:1"] == true, "…the bag slot the weapon comes out of")
+    ck(named["w17"] == true, "…the off hand it has to clear")
+    ck(named["b4:1"] == true, "…and the free bag slot the off hand goes into")
+    local ukeys = G:OpSlotKeys({ slot = 13, unequip = true }, G:BuildCensus())
+    local un = {}
+    for _, k in ipairs(ukeys or {}) do un[k] = true end
+    ck(un["w13"] == true and un["b4:1"] == true, "an unequip names the slot and its destination")
+    g:teardown()
+end))
+
+----------------------------------------------------------------------
+-- MUTATION GATE for the settle rule.
+--
+-- Addon:OpSettled IS the fix, so the pre-brief-A executor is exactly one mutant
+-- away: "every involved slot is unlocked, therefore the move landed". Put that
+-- rule back and the suite has to go RED, or the gates above are proving nothing.
+-- Same treatment Daseeki-Bags gives Sort.PredSettled.
+----------------------------------------------------------------------
+suite("equip-settle-mutation", world(function(ck, w, A)
+    ck(type(A.OpSettled) == "function", "the settle rule is ONE named, replaceable decision")
+    ck(type(A.SlotKeyLocked) == "function", "…and the lock probe it must NOT be is published beside it")
+    ck(type(A.SlotKeyLink) == "function", "…as is the content probe it MUST be")
+
+    -- The rule reads CONTENT. Walk one real move through the window and watch
+    -- the answer change at the publish, not at the unlock.
+    local w0 = mock.new(P)
+    w0:setBag(0, 1, L(3001))
+    C_Container.PickupContainerItem(0, 1)
+    PickupInventoryItem(1)
+    local pred = { expect = { { key = "w1", link = L(3001) }, { key = "b0:1", link = nil } } }
+    ck(w0.Addon:OpSettled(pred) == false, "in flight and locked is not settled")
+    w0:settle(w0.latency)
+    ck(w0:isLocked("w1") == false and w0:isLocked("b0:1") == false, "the locks have cleared")
+    ck(w0.Addon:OpSettled(pred) == false,
+       "UNLOCKED IS NOT SETTLED — the slot still shows the pre-operation world")
+    w0:settle()
+    ck(w0.Addon:OpSettled(pred) == true, "settled only once the slot SHOWS what was promised")
+    w0:teardown()
+
+    -- The mutant, on the audit's own scenarios.
+    local function mutant(self, p)
+        for _, e in ipairs((p and p.expect) or {}) do
+            if self:SlotKeyLocked(e.key) then return false end
+        end
+        return true                              -- "unlocked is settled" (ARM-2 / Bags 2.0.2)
+    end
+
+    -- CONTROL: the real rule, same world, clean.
+    local c = mock.new(P)
+    c:setWorn(11, L(1003)); c:setWorn(12, L(1001)); c:setBag(0, 1, L(1002))
+    c:defineSet("rings", { [11] = L(1001), [12] = L(1002) })
+    c.Addon:EquipSet("rings")
+    c:settle()
+    ck(c.stats.bagErrors == 0, "CONTROL: the shipped rule re-issues nothing")
+    ck(c.worn[11] == L(1001) and c.worn[12] == L(1002), "CONTROL: …and the exchange converges")
+    c:teardown()
+
+    -- MUTANT: same world, unlock-retirement restored.
+    local m = mock.new(P)
+    local B, real = m.Addon, nil
+    real, B.OpSettled = B.OpSettled, mutant
+    m:setWorn(11, L(1003)); m:setWorn(12, L(1001)); m:setBag(0, 1, L(1002))
+    m:defineSet("rings", { [11] = L(1001), [12] = L(1002) })
+    B:EquipSet("rings")
+    m:settle()
+    ck(m.stats.bagErrors > 0,
+       "MUTANT: unlock-retirement re-issues a move the server already applied (bag error)")
+    B.OpSettled = real
+    ck(B.OpSettled == real, "the real settle rule is restored afterwards")
+    m:teardown()
+
+    -- MUTANT, second shape: the 2H swap, whose stow is the ARM-5 re-issue.
+    local m2 = mock.new(P)
+    local B2, real2 = m2.Addon, nil
+    real2, B2.OpSettled = B2.OpSettled, mutant
+    m2:setWorn(16, L(4002)); m2:setWorn(17, L(4003)); m2:setBag(0, 1, L(4001))
+    m2:defineSet("2h", { [16] = L(4001) })
+    B2:EquipSet("2h")
+    m2:settle()
+    ck(m2.stats.bagErrors > 0, "MUTANT: the 2H stow is re-issued on the stale re-plan too")
+    B2.OpSettled = real2
+    m2:teardown()
+
+    -- And the shipped rule is untouched on the suite's own Addon.
+    ck(A.OpSettled ~= mutant, "the mutation never leaked out of its own world")
+end))
+
+----------------------------------------------------------------------
+-- THE COMBAT DRAIN, round by round (ARM-3's fix, spelled out).
+--
+-- The queue is no longer destroyed before it is walked. An action leaves it only
+-- once it has been ISSUED; anything refused stays and is retried on a later,
+-- settle-paced round; the rounds are bounded; and the whole-set request waits
+-- for the per-slot queue so it plans against the world the queue produced.
+----------------------------------------------------------------------
+suite("equip-drain-retry", world(function(ck, w, A)
+    -- ROW 1: the deferred action is still in the queue after round one.
+    w:setWorn(13, L(2001))
+    w:setBag(0, 1, L(2002))
+    w.combat = true
+    A:EquipContainerItemToSlot(0, 1, 13)     -- bag trinket -> slot 13
+    A:SwapEquippedSlots(13, 14)              -- and the one in 13 across to 14
+    w.combat = false
+    w:fireEvent("PLAYER_REGEN_ENABLED")
+    ck(A._combatQueue ~= nil and A._combatQueue[13] ~= nil,
+       "the action that could not go out in round one is STILL QUEUED")
+    ck(A._combatQueue and A._combatQueue[14] == nil,
+       "…while the one that did go out has left the queue")
+    w:settle()
+    ck(w.worn[13] == L(2002) and w.worn[14] == L(2001), "both actions land across the rounds")
+    ck(A._combatQueue == nil, "…and the queue is empty at the end")
+    ck(w.stats.lockedIssue == 0, "…with nothing issued at a locked slot")
+    ck(w.stats.bagErrors == 0, "…and nothing re-issued after it landed")
+
+    -- ROW 2: a FOREIGN lock refuses an action — it is re-queued, then retried.
+    local w2 = mock.new(P)
+    w2:setBag(0, 1, L(2001))
+    w2.combat = true
+    w2.Addon:EquipContainerItemToSlot(0, 1, 13)
+    w2.combat = false
+    w2.locks["w13"] = true                   -- somebody else is holding the target
+    w2:fireEvent("PLAYER_REGEN_ENABLED")
+    w2:settle(0.5)
+    ck(w2.Addon._combatQueue and w2.Addon._combatQueue[13] ~= nil,
+       "an action refused on a foreign lock stays queued")
+    ck(w2.worn[13] == nil, "…and nothing was forced into the held slot")
+    ck(w2.stats.lockedIssue == 0, "…and it was never thrown at the locked slot")
+    w2.locks["w13"] = nil                    -- the foreigner lets go
+    w2:settle()
+    ck(w2.worn[13] == L(2001), "the retry lands once the lock clears")
+    ck(w2.Addon._combatQueue == nil, "…and the queue drains")
+    w2:teardown()
+
+    -- ROW 3: the retry is BOUNDED. A lock that never clears ends the drain.
+    local w3 = mock.new(P)
+    w3:setBag(0, 1, L(2001))
+    w3.combat = true
+    w3.Addon:EquipContainerItemToSlot(0, 1, 13)
+    w3.combat = false
+    w3.locks["w13"] = true
+    w3:fireEvent("PLAYER_REGEN_ENABLED")
+    w3:settle(120)
+    ck(w3.Addon._combatQueue == nil, "an action that can never go out is not retried forever")
+    ck(w3.Addon._drain == nil, "…the drain itself terminates")
+    ck(w3:output():find("could not finish") ~= nil, "…and it says so rather than going quiet")
+    ck(w3.stats.lockedIssue == 0, "…having never issued against the locked slot")
+    ck(w3.cursor == nil, "…and stranding nothing on the cursor")
+    w3:teardown()
+
+    -- ROW 4: combat resuming mid-drain HOLDS the remainder instead of losing it.
+    local w4 = mock.new(P)
+    w4:setWorn(13, L(2001))
+    w4:setBag(0, 1, L(2002))
+    w4.combat = true
+    w4.Addon:EquipContainerItemToSlot(0, 1, 13)
+    w4.Addon:SwapEquippedSlots(13, 14)
+    w4.combat = false
+    w4:fireEvent("PLAYER_REGEN_ENABLED")     -- round 1 issues the 13 -> 14 move
+    w4.combat = true                         -- the next pull starts
+    w4:settle()
+    ck(w4.Addon._combatQueue and w4.Addon._combatQueue[13] ~= nil,
+       "combat resuming mid-drain holds the rest of the queue")
+    ck(w4.worn[13] == nil, "…the un-drained action really has not run")
+    w4.combat = false
+    w4:fireEvent("PLAYER_REGEN_ENABLED")
+    w4:settle()
+    ck(w4.worn[13] == L(2002), "…and it drains when combat ends again")
+    ck(w4.worn[14] == L(2001), "…with the first action's result intact")
+    w4:teardown()
+
+    -- ROW 5: the whole-set request runs AFTER the per-slot queue, so it plans
+    -- against the world the queue actually produced, not the pre-drain one.
+    local w5 = mock.new(P)
+    w5:setWorn(13, L(2001))
+    w5:setBag(0, 1, L(2002))
+    w5:setBag(0, 2, L(3001))
+    w5:defineSet("after", { [1] = L(3001) })
+    w5.combat = true
+    w5.Addon:EquipContainerItemToSlot(0, 1, 13)
+    w5.Addon:EquipSet("after")
+    w5.combat = false
+    w5:fireEvent("PLAYER_REGEN_ENABLED")
+    ck(w5.Addon._pendingSet == "after", "the whole-set request is not consumed in the drain's first round")
+    w5:settle()
+    ck(w5.worn[13] == L(2002), "the queued action landed")
+    ck(w5.worn[1] == L(3001), "…and the set equipped after it")
+    ck(w5.Addon._pendingSet == nil, "…the pending set was consumed")
+    ck(w5.stats.bagErrors == 0, "…with no move planned against a stale world")
+    w5:teardown()
 end))
 
 -- §2.8 / TRINKETMENU §2.3 the combat and really-dead queue contract.
@@ -907,6 +1307,8 @@ suite("equip-explicit-empty", world(function(ck, w, A)
     w3:settle()
     ck(w3.worn[13] == L(2001), "with no bag space the slot keeps its item")
     ck(w3:output():find("bag space") ~= nil, "the not-enough-room abort is reported")
+    ck(w3.cursor == nil, "the refused strip strands nothing on the cursor")
+    ck(w3.Addon._equipping == nil, "…and the equipping latch is released")
     w3:teardown()
 
     -- mixed set: the sentinel slot empties while the rest still equips
@@ -4662,77 +5064,19 @@ suite("loadfile-all-files", function(ck)
 end)
 
 ----------------------------------------------------------------------
--- KNOWN-RED QUARANTINE  (SUITE_ASYNC_AUDIT.md — brief A0 hands these to brief A)
+-- THE KNOWN-RED QUARANTINE IS RETIRED (brief A, 2026-08-07).
 --
--- Brief A0 replaced harness/equip-mock.lua's kind, instantaneous world with the
--- UNKIND lock-then-settle contract the live client actually has. That made the
--- Class 1 defects in equip.lua observable headless for the first time. Fixing
--- the executor is BRIEF A and is explicitly OUT of A0's scope, so the checks
--- those defects break are quarantined here rather than weakened or deleted:
--- they print in full on every run, they are counted and named, and they do not
--- fail the gate.
+-- Brief A0 made the Class 1 defects in equip.lua observable headless for the
+-- first time and ledgered the eight checks they broke — ARM-1 (three-way
+-- exchange), ARM-2 (unlock-retirement re-issuing landed moves), ARM-3 (the
+-- combat queue eating its own second action), ARM-4 (the pass that never
+-- finishes) and ARM-5 (multi-op sequences stranding items on the cursor).
 --
---   finding — the audit id this check proves.
---   brief   — who owns the fix.
---   expect  — the EXACT check messages tolerated. Any OTHER failure in a
---             quarantined suite is a real failure and still turns the run red;
---             an expected failure that starts PASSING is called out loudly so
---             the entry is retired with the fix rather than rotting here.
---
--- THE QUARANTINE IS A DEBT LEDGER, NOT A MUTE BUTTON. It is empty when Brief A
--- lands, and this whole block goes with it.
-local QUARANTINE = {
-    ["equip-arm1-three-way"] = {
-        finding = "ARM-1", brief = "BRIEF A",
-        why = "the whole plan runs in one frame and OpStillNeeded re-reads the "
-           .. "pre-op world, so op 2 is planned against gear op 1 already moved; "
-           .. "it aborts on op 1's locks and the set finishes WRONG while still "
-           .. "being marked the current set",
-        expect = {
-            "slot 12 wears the ring that came from the bags",
-            "the three-way exchange converges",
-        },
-    },
-    ["equip-convergence"] = {
-        finding = "ARM-2", brief = "BRIEF A",
-        why = "WatchLocks retires the pass wait on census.locked == false, which "
-           .. "the client reports BEFORE it rewrites the slot contents; the next "
-           .. "pass re-censuses the pre-move world and re-issues moves the server "
-           .. "already applied (ERR_INTERNAL_BAG_ERROR)",
-        expect = { "no move was re-issued after it had already landed" },
-    },
-    ["equip-arm3-combat-drain"] = {
-        finding = "ARM-3", brief = "BRIEF A",
-        why = "DrainCombatQueue empties _combatQueue BEFORE the drain loop, so the "
-           .. "second queued action — refused on the first action's still-set "
-           .. "locks — is LOST instead of re-queued",
-        expect = { "slot 14 received the trinket moved out of slot 13" },
-    },
-    ["equip-arm4-lock-ceiling"] = {
-        finding = "ARM-4", brief = "BRIEF A",
-        why = "WatchLocks has no ceiling: a lock that outlives the ITEM_LOCK_CHANGED "
-           .. "burst leaves _equipping set forever, so FinishEquip never runs and "
-           .. "the pending-slot overlays never clear",
-        expect = {
-            "a lock that outlives the event burst cannot hang the pass",
-            "…and the lock watcher is torn down",
-        },
-    },
-    ["equip-execution"] = {
-        finding = "ARM-5 (+ARM-2)", brief = "BRIEF A",
-        why = "stow() early-outs on wornLink(invSlot), which still reads occupied "
-           .. "after the stow landed, so pass 2 re-issues it; every drop of the "
-           .. "re-issue is refused and the off hand is left dangling on the "
-           .. "player's CURSOR, with no ClearCursor anywhere to recover it",
-        expect = { "nothing stranded on the cursor after the 2H swap" },
-    },
-    ["equip-explicit-empty"] = {
-        finding = "ARM-5 (+ARM-2)", brief = "BRIEF A",
-        why = "same shape as equip-execution: the explicit-empty stow is re-issued "
-           .. "on the stale pass and the stripped trinket is stranded on the cursor",
-        expect = { "nothing is stranded on the cursor" },
-    },
-}
+-- Brief A rebuilt the executor settle-aware and all eight are green, so the
+-- debt ledger and its whole split-the-failures apparatus are GONE with them:
+-- every check in this file now gates. Nothing here may fail. If a settle
+-- defect ever comes back, it comes back as RED, not as a tolerated entry.
+----------------------------------------------------------------------
 
 ----------------------------------------------------------------------
 -- Run
@@ -4741,8 +5085,7 @@ print("=== Daseeki-Armory stat-formula self-tests (real Lua 5.1) ===")
 print("    repo: " .. ARMORY_DIR)
 print("")
 
-local totalFail, totalCheck, knownRed = 0, 0, 0
-local quarantined, stale = {}, {}
+local totalFail, totalCheck = 0, 0
 for _, name in ipairs(ORDER) do
     local fails, checks = {}, 0
     local function ck(cond, msg)
@@ -4752,79 +5095,15 @@ for _, name in ipairs(ORDER) do
     local sok, serr = pcall(SUITES[name], ck)
     if not sok then fails[#fails + 1] = "SUITE RAISED: " .. tostring(serr) end
     totalCheck = totalCheck + checks
+    totalFail  = totalFail + #fails
 
-    -- Split the failures into the ones this suite is allowed to owe (named in
-    -- the quarantine) and the ones that are simply broken.
-    local q = QUARANTINE[name]
-    local hard, known = {}, {}
-    if q then
-        local seen = {}
-        for _, m in ipairs(q.expect) do seen[m] = 0 end
-        for _, f in ipairs(fails) do
-            if seen[f] ~= nil then seen[f] = seen[f] + 1; known[#known + 1] = f
-            else hard[#hard + 1] = f end
-        end
-        for _, m in ipairs(q.expect) do
-            if seen[m] == 0 then stale[#stale + 1] = name .. "  ::  " .. m end
-        end
-        if #known > 0 then
-            quarantined[#quarantined + 1] = { suite = name, q = q, n = #known }
-            knownRed = knownRed + #known
-        end
-    else
-        hard = fails
-    end
-    totalFail = totalFail + #hard
-
-    local tag = "PASS"
-    if #hard > 0 then tag = "FAIL"
-    elseif #known > 0 then tag = "KNOWN-RED" end
-    print(string.format("  [%s] %-24s (%d checks)", tag, name, checks))
-    for _, f in ipairs(hard) do print("        FAIL :: " .. tostring(f)) end
-    for _, f in ipairs(known) do
-        print(string.format("        KNOWN-RED [%s -> %s] :: %s", q.finding, q.brief, tostring(f)))
-    end
-end
-
-----------------------------------------------------------------------
--- The quarantine has to shout, or it is just a mute button.
-----------------------------------------------------------------------
-if #quarantined > 0 then
-    local ids, seenId = {}, {}
-    for _, e in ipairs(quarantined) do
-        if not seenId[e.q.finding] then seenId[e.q.finding] = true; ids[#ids + 1] = e.q.finding end
-    end
-    print("")
-    print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-    print(string.format("!! KNOWN-RED QUARANTINE : %d checks across %d suites",
-          knownRed, #quarantined))
-    print("!! findings: " .. table.concat(ids, ", ") .. "   owner: BRIEF A (equip executor rebuild)")
-    print("!! These are NOT passing. They are the audit's Class 1 defects,")
-    print("!! made visible by the UNKIND equip mock (brief A0), and deliberately")
-    print("!! left broken so the gate stays runnable while telling the truth.")
-    print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-    for _, e in ipairs(quarantined) do
-        print(string.format("!!  %-26s %-14s %d check(s)", e.suite, e.q.finding, e.n))
-        print("!!      " .. e.q.why)
-    end
-    print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-end
-
-if #stale > 0 then
-    print("")
-    print("************************************************************")
-    print("* QUARANTINE IS STALE : the checks below are GREEN again.")
-    print("* Delete their entries from QUARANTINE so they gate properly.")
-    for _, s in ipairs(stale) do print("*   " .. s) end
-    print("************************************************************")
+    print(string.format("  [%s] %-24s (%d checks)", #fails > 0 and "FAIL" or "PASS", name, checks))
+    for _, f in ipairs(fails) do print("        FAIL :: " .. tostring(f)) end
 end
 
 print("")
 print("############################################################")
-local verdict = "ALL PASS"
-if totalFail > 0 then verdict = "RED"
-elseif knownRed > 0 then verdict = "PASS (WITH " .. knownRed .. " KNOWN-RED)" end
-print(string.format("# Daseeki-Armory self-tests : %s  (%d checks, %d failures, %d known-red)",
-      verdict, totalCheck, totalFail, knownRed))
+print(string.format("# Daseeki-Armory self-tests : %s  (%d checks, %d failures)",
+      totalFail > 0 and "RED" or "ALL PASS", totalCheck, totalFail))
 print("############################################################")
 os.exit(totalFail == 0 and 0 or 1)
