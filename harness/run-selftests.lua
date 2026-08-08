@@ -245,14 +245,31 @@ suite("defense-block-ranged", function(ck)
     ck(M.DefenseValue(5, -50) == 0, "defense never renders below 0")
     ck(M.DefenseValue(nil, nil) == 0, "nil-safe")
 
-    -- Gap analysis: a 220-strength warrior is understated by ~11 without the
-    -- Strength/20 term.
-    ck(near(M.BlockValue(0, 220, 0, 0), 11), "Strength 220 contributes 11 block value")
+    -- ── RE-BASED, brief O (SUITE_DATA_HONESTY_AUDIT.md §5, 2026-08-07) ────────
+    -- These two assertions USED TO READ:
+    --     ck(near(M.BlockValue(0,   220, 0, 0), 11), "Strength 220 contributes 11…")
+    --     ck(near(M.BlockValue(nil, nil, nil, nil), 0), "nil-safe")
+    -- and they were the only coverage the block-value path had. Between them they
+    -- certified the ARM-1 defect: the audit names the first as PINNING THE COLD-READ
+    -- ANSWER AS CORRECT — a gear scan of a title-only tooltip sums to 0, and 11 is
+    -- exactly what a protection warrior in a 46-block shield was shown at login —
+    -- while the second said an ABSENT scan renders as a number too. A test that
+    -- codifies a divergence has to say so or be fixed; these are fixed.
+    --
+    -- The formula layer now separates the two facts, and both are asserted:
+    --   0   — a scan that RAN and proved every slot, and found no block value.
+    --   nil — a scan that could not prove a slot warm. There is no answer to render.
+    ck(near(M.BlockValue(0, 220, 0, 0), 11),
+       "a PROVEN zero gear sum still contributes Strength/20 (0 is an answer)")
+    ck(M.BlockValue(nil, 220, 0, 0) == nil,
+       "an UNPROVEN gear sum has no block value at all — nil is absence, not 0")
+    ck(M.BlockValue(nil, 220, 3, 2) == nil,
+       "…and no later term can resurrect it: the set bonus and the enchants stay unread")
     ck(near(M.BlockValue(46, 220, 0, 0), 57), "gear-scanned block value adds on top")
     ck(near(M.BlockValue(46, 220, 3, 0), 87), "Battlegear of Might 3-piece adds 30")
     ck(near(M.BlockValue(46, 220, 2, 0), 57), "2 pieces is below the set threshold")
     ck(near(M.BlockValue(46, 220, 3, 2), 117), "two warrior ZG enchants add 15 each")
-    ck(near(M.BlockValue(nil, nil, nil, nil), 0), "nil-safe")
+    ck(near(M.BlockValue(0, nil, nil, nil), 0), "nil-safe on every term BUT the sum")
 
     ck(M.RangedHit(4, true) == 7, "the ranged scope enchant adds +3 hit")
     ck(M.RangedHit(4, false) == 4, "no scope, no bonus")
@@ -5486,6 +5503,563 @@ suite("keybind-collision-order", function(ck)
     end
 end)
 
+-- =====================================================================
+-- THE COLD CLIENT (audit brief O, 2026-08-07)
+--
+-- equip-mock.lua's axis is SETTLEMENT — "the operation has not landed yet".
+-- cold-mock.lua's axis is WARMTH — "the ANSWER has not arrived yet", which is
+-- where CLIENT_ASYNC_LESSONS.md Class 4 and Class 5 live, and which nothing in
+-- this repo modelled before. SUITE_DATA_HONESTY_AUDIT.md §5 recorded the gap in
+-- one line: "ABSENT — stats.lua has no coverage of any kind."
+--
+-- The COLD profile is the default and it is the unkind one: item data is absent,
+-- tooltips render title-only, the talent tree answers 0 tabs, the spellbook
+-- answers 0 tabs, and asking for an item is not the same as receiving it.
+-- =====================================================================
+local cold = dofile(HARNESS_DIR .. "/cold-mock.lua")
+
+local function coldWorld(opts, fnc)
+    if type(opts) == "function" then opts, fnc = nil, opts end
+    return function(ck)
+        local w = cold.new(P, opts)
+        local ok, err = pcall(fnc, ck, w, w.Addon)
+        w:teardown()
+        if not ok then error(err, 0) end
+    end
+end
+
+-- Read a shipped file as one string (CRLF-safe: every pin below is single-line).
+local function slurp(rel)
+    local h = io.open(P(rel), "r")
+    if not h then return nil end
+    local s = h:read("*a"); h:close()
+    return s
+end
+
+----------------------------------------------------------------------
+-- THE SIMULATOR'S OWN CONTRACT.
+--
+-- Same discipline brief A0 established for equip-mock: everything after this
+-- suite grades the ADDON against the cold world, so this suite grades the WORLD.
+-- A simulator that is unkind in the wrong way proves nothing — it just moves the
+-- lie. The properties asserted here are the ones CLIENT_ASYNC_LESSONS.md Class 4
+-- names and Nexus tracker.lua's ClassifyBoonRead is built around: a title-only
+-- render, an empty read that is not an empty answer, and a request that is not a
+-- delivery.
+----------------------------------------------------------------------
+suite("cold-mock-contract", coldWorld(function(ck, w, A)
+    ------------------------------------------------------------ the default
+    ck(w.profile == "cold", "the mock defaults to the COLD profile")
+    ck(w.talentsReadable == false, "…which includes an unreadable talent tree")
+    ck(w.spellbookReadable == false, "…and an unreadable spellbook")
+
+    local SHIELD, HELM = 5001, 5010
+    w:equip(1,  HELM)
+    w:equip(17, SHIELD)
+    local shieldLink = GetInventoryItemLink("player", 17)
+
+    ------------------------------------------------------------ the link is not the answer
+    ck(shieldLink ~= nil, "a COLD slot still hands out its item LINK")
+    ck(select(4, GetItemInfoInstant(shieldLink)) == "INVTYPE_SHIELD",
+       "…and GetItemInfoInstant still answers offline, warm or not")
+    ck(GetItemInfo(shieldLink) == nil, "…but GetItemInfo answers nil")
+    ck(GetItemStats(shieldLink) == nil, "…and GetItemStats answers nil, not an empty table")
+    ck(C_Item.IsItemDataCachedByID(SHIELD) == false, "…and the client says the data is not cached")
+
+    ------------------------------------------------------------ title-only
+    local tip = w:scanTip()
+    ck(tip:NumLines() == 0, "a fresh tooltip has no lines")
+    tip:SetInventoryItem("player", 17)
+    ck(tip:NumLines() == 1, "a COLD item renders EXACTLY ONE line")
+    ck(tip:GetLine(1) == "Aegis of the Scarlet Commander", "…and that line is the title")
+    ck(_G.ColdMockScanTooltipTextLeft1:GetText() == "Aegis of the Scarlet Commander",
+       "…readable through the global fontstring a scraper actually uses")
+    ck(_G.ColdMockScanTooltipTextLeft2:GetText() == nil, "…with nothing at all behind it")
+    ck(w.stats.coldScans == 1, "the sim counts the title-only render")
+
+    ------------------------------------------------------------ empty is not cold
+    tip:SetInventoryItem("player", 5)
+    ck(tip:NumLines() == 0, "an EMPTY slot renders zero lines — absence, not coldness")
+    ck(w.stats.coldScans == 1, "…and is not counted as a cold read")
+
+    ------------------------------------------------------------ requesting ≠ receiving
+    C_Item.RequestLoadItemDataByID(SHIELD)
+    ck(w:loadsFor(SHIELD) == 1, "a load request is counted")
+    ck(w:isWarm(SHIELD) == false, "…and does NOT warm the item by itself")
+    ck(w:countEvents("GET_ITEM_INFO_RECEIVED") == 0, "…and announces nothing")
+
+    ------------------------------------------------------------ delivery is an event
+    w:warmItem(SHIELD)
+    ck(w:countEvents("GET_ITEM_INFO_RECEIVED") == 1, "warming fires GET_ITEM_INFO_RECEIVED")
+    local last = w.events[#w.events]
+    ck(last.a == SHIELD and last.b == true, "…carrying (itemID, success)")
+    w:warmItem(SHIELD)
+    ck(w:countEvents("GET_ITEM_INFO_RECEIVED") == 1, "…once, on the transition only")
+    w:warmItem(HELM, true)
+    ck(w:isWarm(HELM) and w:countEvents("GET_ITEM_INFO_RECEIVED") == 1,
+       "a SILENT delivery warms without announcing — how a fixture proves a re-READ")
+
+    ------------------------------------------------------------ the warm body
+    tip:ClearLines()
+    ck(tip:NumLines() == 0, "ClearLines empties the readback")
+    tip:SetInventoryItem("player", 17)
+    ck(tip:NumLines() > 1, "a WARM item renders a body")
+    ck(GetItemInfo(shieldLink) == "Aegis of the Scarlet Commander", "…and GetItemInfo answers")
+    local stats = GetItemStats(shieldLink)
+    ck(type(stats) == "table", "…and GetItemStats hands back a table")
+    -- The body is rendered through the CLIENT'S OWN localization globals, so the
+    -- scraper under test is graded against text it did not choose.
+    local wantBlock, sawBlock = string.format(_G.ITEM_MOD_BLOCK_VALUE, 46), false
+    for i = 1, tip:NumLines() do if tip:GetLine(i) == wantBlock then sawBlock = true end end
+    ck(sawBlock, "…including a block-value line built from _G.ITEM_MOD_BLOCK_VALUE itself")
+
+    ------------------------------------------------------------ the tree and the book
+    ck(GetNumTalentTabs() == 0, "a cold tree answers 0 tabs — a NUMBER, truthy, and wrong")
+    ck(GetNumTalents(1) == 0 and GetTalentInfo(1, 1) == nil, "…and names no talents")
+    ck(GetTalentTabInfo(1) == nil, "…and no trees")
+    w:warmTalents()
+    ck(GetNumTalentTabs() == 3, "a readable tree answers three tabs")
+    ck(GetTalentTabInfo(1) == "Arcane", "…named")
+    ck(select(5, GetTalentInfo(1, 3)) == 3, "…with Arcane Instability at rank 3")
+    ck(w:countEvents("CHARACTER_POINTS_CHANGED") == 0,
+       "NOTHING announces a newly-readable tree — the client has no such event")
+
+    ck(GetNumSpellTabs() == 0, "a cold spellbook answers 0 tabs")
+    ck(GetSpellBookItemName(1) == nil, "…and names no spells")
+    w:warmSpellbook()
+    ck(GetNumSpellTabs() == 2 and GetSpellBookItemName(3) == "Arcane Missiles",
+       "a readable book walks by absolute index across tabs")
+    w:learnSpell("Recklessness")
+    ck(w:countEvents("LEARNED_SPELL_IN_TAB") == 1, "a trainer visit DOES fire an event")
+
+    ------------------------------------------------------------ the clock
+    local fired = false
+    C_Timer.After(0.5, function() fired = true end)
+    ck(fired == false, "a timer does not run inside the call that scheduled it")
+    w:settle()
+    ck(fired == true, "…and runs when the world settles")
+
+    ------------------------------------------------------------ a build with NO C_Item
+    -- The TOC spans three interface versions. A world with no C_Item at all is the
+    -- one where the tooltip-body proof has to carry the whole warmth question.
+    local w2 = cold.new(P, { noCItem = true })
+    ck(_G.C_Item == nil, "the noCItem profile removes C_Item entirely")
+    w2:equip(17, SHIELD)
+    local t2 = w2:scanTip("ColdMockNoCItemTip")
+    t2:SetInventoryItem("player", 17)
+    ck(t2:NumLines() == 1, "…and a cold item is still title-only, provable without it")
+    w2:warmItem(SHIELD)
+    t2:ClearLines(); t2:SetInventoryItem("player", 17)
+    ck(t2:NumLines() > 1, "…and warm is still a body")
+    w2:teardown()
+    ck(_G.C_Item ~= nil, "tearing the inner world down restores the outer world's C_Item")
+    ck(_G.ColdMockScanTooltipTextLeft1 ~= nil,
+       "…and does not take the outer world's tooltip fontstrings with it")
+
+    ------------------------------------------------------------ the WARM opt-in
+    local w3 = cold.new(P, cold.WARM)
+    ck(w3.profile == "warm", "the warm profile has to be asked for by name")
+    ck(w3:isWarm(SHIELD) and w3.talentsReadable and w3.spellbookReadable,
+       "…and it warms the items, the tree and the book together")
+    w3:teardown()
+end))
+
+----------------------------------------------------------------------
+-- ARM-1 — the scanning tooltip has to PROVE it read something (Class 4)
+--
+-- SUITE_DATA_HONESTY_AUDIT.md: "Cold item data renders a title-only tooltip …
+-- A protection warrior logs in; equipped item data lands a beat after the first
+-- stat-panel paint; the block-value sum is 0 and the panel shows Strength/20
+-- only." GET_ITEM_INFO_RECEIVED appeared nowhere in stats.lua, so the one event
+-- announcing "the data you could not read has arrived" could not invalidate the
+-- memoized cache, and the wrong number stood until a gear change or a loading
+-- screen.
+----------------------------------------------------------------------
+suite("stats-cold-block-value", coldWorld(function(ck, w, A)
+    local SHIELD = 5001          -- 46 block value, rendered through the long string
+    w.class = "WARRIOR"
+    w:equip(1,  5010)            -- head
+    w:equip(17, SHIELD)          -- off hand
+
+    ------------------------------------------------------------ RED CONTROL
+    -- The pre-fix chain, in shape: point a tooltip at the slot, walk NumLines,
+    -- believe whatever comes back. No IsItemDataCachedByID, no NumLines() > 1, and
+    -- `return 0` for a tooltip that rendered nothing.
+    local rtip = w:scanTip("ColdMockPreFixTip")
+    local function preFixSum(slotId)
+        local sum = 0
+        local ok = pcall(rtip.SetInventoryItem, rtip, "player", slotId)
+        if not ok then return 0 end                       -- …and a raise is a zero too
+        for i = 1, rtip:NumLines() do
+            local text = rtip:GetLine(i) or ""
+            local n = text:match("shield by (%d+)") or text:match("%+(%d+) Block Rating")
+            if n then sum = sum + tonumber(n) end
+        end
+        return sum
+    end
+
+    ck(preFixSum(17) == 0, "RED CONTROL: the pre-fix walk sums a COLD shield to 0")
+    ck(near(M.BlockValue(0, 220, 0, 0), 11),
+       "RED CONTROL: …and 0 + Strength/20 is the 11 the audit describes")
+    w:warmItem(SHIELD, true)                              -- silent: no repaint, just truth
+    ck(preFixSum(17) == 46, "RED CONTROL: the TRUE gear sum, once the body is there, is 46")
+    ck(near(M.BlockValue(46, 220, 0, 0), 57),
+       "RED CONTROL: …so the honest answer was 57 and the panel said 11")
+
+    ------------------------------------------------------------ GREEN, from cold
+    local w2 = cold.new(P)
+    local B  = w2.Addon
+    w2.class = "WARRIOR"
+    w2:equip(1,  5010)
+    w2:equip(17, SHIELD)
+    B:InitStats()
+
+    ck(w2:isRegistered("GET_ITEM_INFO_RECEIVED"),
+       "stats.lua registers GET_ITEM_INFO_RECEIVED — it appeared NOWHERE in the file before")
+
+    ck(w2:read("Defense", "Block Value") == "—",
+       "a cold gear scan renders Block Value as UNKNOWN, not as 11")
+    ck((B._statGearUnproven or 0) == 2, "…both equipped slots are counted unproven")
+    ck(w2:loadsFor(SHIELD) > 0, "…and the client was ASKED for the data it could not read")
+
+    -- The memo refusal. Warm SILENTLY: no event fires, so the only thing that can
+    -- produce the right answer is a scan that was never cached in the first place.
+    w2:warmItem(SHIELD, true)
+    w2:warmItem(5010, true)
+    ck(w2:read("Defense", "Block Value") == "57",
+       "a scan built from an unproven slot is NEVER memoized — the next read is correct")
+    ck((B._statGearUnproven or 0) == 0, "…and the counter falls to 0 once every slot proved warm")
+
+    ------------------------------------------------------------ the event repaints
+    local w3 = cold.new(P)
+    local C  = w3.Addon
+    w3.class = "WARRIOR"
+    w3:equip(17, SHIELD)
+    C:InitStats()
+    ck(w3:read("Defense", "Block Value") == "—", "cold again")
+    local paints = w3:countEvents("GET_ITEM_INFO_RECEIVED")
+    w3:warmItem(SHIELD)                                   -- the client answers, loudly
+    w3:settle()
+    ck(w3:countEvents("GET_ITEM_INFO_RECEIVED") == paints + 1, "the delivery event fired")
+    ck(w3:read("Defense", "Block Value") == "57", "…and the row healed on it, with no gear change")
+
+    ------------------------------------------------------------ the wait is BOUNDED
+    -- Class 4's fix shape is "event-driven wait with a bounded ceiling". An id that
+    -- never resolves must not re-scan eighteen tooltips on every burst for the rest
+    -- of the session — and spending the budget cannot make the panel lie, because
+    -- the honest answer while unproven is "—" either way.
+    local w7 = cold.new(P)
+    local F  = w7.Addon
+    w7.class = "WARRIOR"
+    w7:equip(17, SHIELD)
+    F:InitStats()
+    w7:read("Defense", "Block Value")
+    local budget = F._statWarmBudget
+    ck(type(budget) == "number" and budget > 0, "there is a repaint budget")
+    for _ = 1, budget + 20 do w7:fireEvent("GET_ITEM_INFO_RECEIVED", 999999, false) end
+    w7:settle()
+    ck(F._statWarmBudget == 0, "a stream that never resolves the gear spends the budget and stops")
+    ck(w7:read("Defense", "Block Value") == "—", "…and the row is still honest, not a short number")
+    w7:fireEvent("PLAYER_EQUIPMENT_CHANGED", 17)
+    ck(F._statWarmBudget == budget, "new gear re-arms the budget — a new warmth question")
+    w7:warmItem(SHIELD)
+    w7:settle()
+    ck(w7:read("Defense", "Block Value") == "57", "…and the repair works again")
+    w7:teardown()
+
+    ------------------------------------------------------------ a PROVEN zero is an answer
+    local w4 = cold.new(P, cold.WARM)
+    w4.class = "WARRIOR"
+    w4:equip(17, 5003)                                    -- Plain Buckler: no block value
+    w4.Addon:InitStats()
+    ck(w4:read("Defense", "Block Value") == "11",
+       "a warm shield with NO block value on it renders Strength/20 — 0 is an answer")
+    ck((w4.Addon._statGearUnproven or 0) == 0, "…with nothing unproven")
+    -- The short-form string is matched too, on the same proof.
+    w4:equip(17, 5002)                                    -- Drillborer Disk: +7 Block Rating
+    w4.Addon:InvalidateStatGearCache()
+    ck(w4:read("Defense", "Block Value") == "18", "the short 'Block Rating' form scrapes as well")
+    w4:teardown()
+
+    ------------------------------------------------------------ the MP5 half
+    local w5 = cold.new(P)
+    local D  = w5.Addon
+    w5.class = "PRIEST"
+    w5.hasMana = true
+    w5:equip(5, 5020)                                     -- Robe of Insight: 8 MP5
+    D:InitStats()
+    ck(w5:read("Spell", "MP5 Casting") == "—",
+       "GetItemStats carries the same exposure: a cold MP5 read renders UNKNOWN")
+    w5:warmItem(5020)
+    w5:settle(); w5:tick()
+    ck(w5:read("Spell", "MP5 Not Casting") ~= "—", "…and answers once the item lands")
+    w5:teardown()
+
+    ------------------------------------------------------------ no C_Item at all
+    local w6 = cold.new(P, { noCItem = true })
+    local E  = w6.Addon
+    w6.class = "WARRIOR"
+    w6:equip(17, SHIELD)
+    E:InitStats()
+    ck(w6:read("Defense", "Block Value") == "—",
+       "on a build with NO C_Item the tooltip-body proof carries the whole question")
+    w6:warmItem(SHIELD, true)
+    ck(w6:read("Defense", "Block Value") == "57", "…and still heals without it")
+    w6:teardown()
+
+    w3:teardown()
+    w2:teardown()
+
+    ------------------------------------------------------------ REGRESSION PINS
+    local s = slurp("stats.lua")
+    ck(s ~= nil, "stats.lua is readable")
+    if s then
+        ck(s:find("GET_ITEM_INFO_RECEIVED") ~= nil,
+           "PIN: GET_ITEM_INFO_RECEIVED is in stats.lua (the audit's headline absence)")
+        ck(s:find("_statGearUnproven") ~= nil, "PIN: the unproven counter exists")
+        ck(s:find("local ok = pcall%(tip%.SetInventoryItem, tip, \"player\", slotId%)\r?\n%s*if not ok then return 0 end") == nil,
+           "PIN: a pcall failure is no longer answered with 0")
+    end
+    local sm = slurp("statmath.lua")
+    if sm then
+        ck(sm:find("if tooltipSum == nil then return nil end") ~= nil,
+           "PIN: the formula layer refuses an absent gear sum rather than reading it as 0")
+    end
+end))
+
+----------------------------------------------------------------------
+-- ARM-2 — a cold miss must not latch (Class 5)
+--
+-- The audit's finding is an ASYMMETRY, not a missing check: TalentRank already
+-- nils its cache entry on a name MISMATCH so the next read re-resolves, while a
+-- cold miss wrote `false` and held it for the session. Disagreement re-learns; a
+-- cold miss latched. A character who logs in and reads their stat sheet without
+-- zoning never gets the PLAYER_ENTERING_WORLD rebuild that heals it.
+----------------------------------------------------------------------
+suite("stats-cold-talents", coldWorld(function(ck, w, A)
+    w.class = "MAGE"                     -- Arcane Instability: +3% crit to every school
+    local KEY = "Arcane|Arcane Instability"
+
+    ck(GetNumTalentTabs() == 0, "the tree is unreadable at t=0")
+
+    ------------------------------------------------------------ RED CONTROL
+    -- What the pre-fix code wrote into the cache after one cold read.
+    A._talentSlots     = { [KEY] = false }
+    A._talentRemapCold = nil
+    w:warmTalents()
+    ck(A:TalentRank("Arcane", "Arcane Instability") == 0,
+       "RED CONTROL: a cached `false` survives a fully readable tree — the latch IS the defect")
+    w:coolTalents()
+    A._talentSlots, A._talentRemap, A._talentRemapCold = nil, nil, nil
+
+    ------------------------------------------------------------ GREEN
+    ck(A:BuildTalentRemap() == false, "an unreadable tree reports that it could not be read")
+    ck(A._talentRemap == nil, "…leaves the remap UNKNOWN rather than writing `false`")
+    ck(A._talentRemapCold == true, "…and raises the cold flag")
+
+    ck(A:TalentRank("Arcane", "Arcane Instability") == 0,
+       "a cold read still contributes 0 — understated is the safe direction")
+    ck(A._talentSlots[KEY] == nil,
+       "…but writes NO negative cache: the key is left unresolved for the next read")
+    ck(w:read("Spell", "Spell Crit") == "0.00%", "…so the panel understates while cold")
+
+    -- The tree becomes readable. Nothing announces it; the next READ has to notice.
+    w:warmTalents()
+    ck(w:countEvents("CHARACTER_POINTS_CHANGED") == 0, "no event announced the readable tree")
+    ck(A:TalentRank("Arcane", "Arcane Instability") == 3,
+       "the next read heals it — no event, no loading screen, no zoning")
+    ck(A._talentRemapCold == nil, "…and the cold flag clears once the tree answers")
+    ck(A._talentRemap ~= nil, "…with a real remap behind it")
+    w:tick()
+    ck(w:read("Spell", "Spell Crit") == "3.00%", "the panel now carries the talent's 3%")
+
+    ------------------------------------------------------------ a PROVEN negative IS cached
+    ck(A:TalentRank("Fire", "Nonexistent Talent") == 0, "a talent no warm tree holds reads 0")
+    ck(A._talentSlots["Fire|Nonexistent Talent"] == false,
+       "…and THAT negative is cached: a tree that enumerated every tab has answered")
+    local before = w.stats.talentReads
+    A:TalentRank("Fire", "Nonexistent Talent")
+    ck(w.stats.talentReads == before, "…so the second read costs nothing (the cache still works)")
+
+    ------------------------------------------------------------ the asymmetry it extends
+    ck(A._talentSlots[KEY] ~= nil and A._talentSlots[KEY] ~= false, "the real talent is resolved")
+    w.talents[1].talents[3].name = "Arcane Instability (moved)"
+    ck(A:TalentRank("Arcane", "Arcane Instability") == 0, "a name MISMATCH contributes 0")
+    ck(A._talentSlots[KEY] == nil,
+       "…and clears the entry so it re-resolves — the discipline a cold miss now shares")
+
+    ------------------------------------------------------------ a partial tree is cold too
+    local w2 = cold.new(P)
+    local B  = w2.Addon
+    w2.class = "MAGE"
+    w2:warmTalents()
+    w2.talents[2].talents = {}                    -- tab 2 names zero talents: a cold read
+    ck(B:TalentRank("Arcane", "Arcane Instability") == 3, "a talent found in a readable tab resolves")
+    ck(B:TalentRank("Fire", "Critical Mass") == 0, "a talent in the EMPTY tab reads 0")
+    ck(B._talentSlots["Fire|Critical Mass"] == nil,
+       "…and is not cached false: a tab enumerating zero talents has not answered")
+    w2:teardown()
+
+    ------------------------------------------------------------ REGRESSION PINS
+    local s = slurp("stats.lua")
+    if s then
+        ck(s:find("if nTabs == 0 then Addon%._talentRemap = false; return end") == nil,
+           "PIN: the unreadable tree no longer writes `_talentRemap = false`")
+        ck(s:find("_talentRemapCold") ~= nil, "PIN: the cold flag exists")
+        ck(s:find("if not answered then") ~= nil, "PIN: resolveTalent gates its negative cache")
+    end
+end))
+
+----------------------------------------------------------------------
+-- ARM-3 — the secure weapon macro's unresolved-name counter (Class 4/5)
+--
+-- "A player has an imported Tank set whose main hand sits in the bank. At login
+-- the server has never sent that item, so GetItemInfo is nil at t=0 and still nil
+-- at t=10; `_macroWarmed` is now true forever. The player retrieves the item an
+-- hour later … then presses the keybind mid-pull expecting an in-combat weapon
+-- swap. Nothing happens — and no error is printed, because the secure path fails
+-- silently in lockdown."
+--
+-- goalPicker.lua's `_goalPvPMissing` is this discipline done correctly in the
+-- same repo, and it is what the fix copies.
+----------------------------------------------------------------------
+suite("keybind-macro-warmth",
+      coldWorld({ files = { "statmath.lua", "sets.lua", "equip.lua", "keybind.lua" } },
+                function(ck, w, A)
+    local MH, RANGED = 6001, 6003                 -- Quel'Serrar (banked), a bow
+    w:defineSet("Tank", { [16] = MH, [18] = RANGED }, "CTRL-1")
+
+    ck(GetItemInfo("item:" .. MH) == nil, "the set's main hand is COLD at login")
+
+    A:ApplySetBindings()
+    local btn = A._bindButtons and A._bindButtons[1]
+    ck(btn ~= nil, "a bound set gets a secure button")
+    if not btn then return end
+    local body = btn:GetAttribute("macrotext")
+
+    ------------------------------------------------------------ RED CONTROL
+    ck(body:find("/run ArmEquipSecure") ~= nil, "the body always carries the ordinary equip call")
+    ck(body:find("/equipslot %[combat%]16") == nil,
+       "RED CONTROL: the [combat] main-hand line is ABSENT while the name is cold")
+    ck(body:find("/equipslot %[combat%]18") == nil, "RED CONTROL: …as is the ranged line")
+
+    -- The pre-fix repair in full: one 10-second timer behind a session latch.
+    w:settle(11)
+    ck(A._macroWarmed == true, "RED CONTROL: the 10s backstop has fired and its latch is spent")
+    ck(GetItemInfo("item:" .. MH) == nil, "RED CONTROL: …and the name is STILL not here")
+    ck(btn:GetAttribute("macrotext"):find("/equipslot %[combat%]16") == nil,
+       "RED CONTROL: …so the latch repaired nothing, and there is no repair left")
+
+    ------------------------------------------------------------ GREEN
+    ck((A._macroMissing or 0) == 2, "both cold weapon slots are COUNTED")
+    ck(w:isRegistered("GET_ITEM_INFO_RECEIVED"), "…and a warm watcher is up while the count is > 0")
+    ck(w:loadsFor(MH) > 0,
+       "…and the client was ASKED for the item it never sent — nothing would fire otherwise")
+
+    -- An hour later, the player retrieves the weapon from the bank.
+    w:warmItem(MH)
+    w:settle()
+    body = btn:GetAttribute("macrotext")
+    ck(body:find("/equipslot %[combat%]16 Quel'Serrar") ~= nil,
+       "GET_ITEM_INFO_RECEIVED rewrites the body — long after the one-shot latch was spent")
+    ck((A._macroMissing or 0) == 1, "…and the counter drops to the one still cold")
+    ck(w:isRegistered("GET_ITEM_INFO_RECEIVED"), "…with the watcher still up for it")
+
+    w:warmItem(RANGED)
+    w:settle()
+    ck((A._macroMissing or 0) == 0, "the counter reaches 0 when every name has landed")
+    ck(w:isRegistered("GET_ITEM_INFO_RECEIVED") == false,
+       "…and the watcher UNREGISTERS at 0, so a warm client pays nothing")
+    ck(btn:GetAttribute("macrotext"):find("/equipslot %[combat%]18 Larvae") ~= nil,
+       "…with both weapon lines present")
+    ck(A:SetHasCombatWeapons("Tank") == true, "…and the set now reports itself combat-swappable")
+
+    ------------------------------------------------------------ a warm login pays nothing
+    local w2 = cold.new(P, { profile = "warm",
+                             files = { "statmath.lua", "sets.lua", "equip.lua", "keybind.lua" } })
+    local B = w2.Addon
+    w2:defineSet("Tank", { [16] = MH }, "CTRL-1")
+    B:ApplySetBindings()
+    ck((B._macroMissing or 0) == 0, "a warm client resolves every name on the first pass")
+    ck(w2:isRegistered("GET_ITEM_INFO_RECEIVED") == false, "…and never arms the watcher")
+    ck(B._bindButtons[1]:GetAttribute("macrotext"):find("/equipslot %[combat%]16 Quel'Serrar") ~= nil,
+       "…with the line present from the start")
+    w2:teardown()
+
+    ------------------------------------------------------------ REGRESSION PINS
+    local k = slurp("keybind.lua")
+    if k then
+        ck(k:find("_macroMissing") ~= nil, "PIN: the unresolved counter exists")
+        ck(k:find("UpdateMacroWarmWatch") ~= nil, "PIN: …with a watcher driven off it")
+        ck(k:find("GET_ITEM_INFO_RECEIVED") ~= nil, "PIN: …listening to the delivery event")
+    end
+    local e = slurp("equip.lua")
+    if e then
+        ck(e:find("return lines, missing") ~= nil,
+           "PIN: WeaponMacroLines hands its skip count back rather than swallowing it")
+        ck(e:find("RequestLoadItemDataByID") ~= nil,
+           "PIN: …and asks for the item it could not name")
+    end
+end))
+
+----------------------------------------------------------------------
+-- ARM-4 — the spellbook latch has to be EARNED (Class 5/6)
+--
+-- "`_spellbookIndexed = true` is set BEFORE the API-availability guard and before
+-- the walk, so any early call burns it. Learn a spell at a trainer, reopen the
+-- icon picker, search for it — no result, for the rest of the session." The
+-- file's own header says this index exists precisely because those class
+-- abilities are otherwise unsearchable by name.
+----------------------------------------------------------------------
+suite("icon-spellbook-latch", coldWorld({ files = { "iconData.lua" } }, function(ck, w, A)
+    ck(GetNumSpellTabs() == 0, "a cold spellbook answers 0 tabs, not nil")
+
+    ------------------------------------------------------------ RED CONTROL / GREEN
+    A:IndexSpellbook()
+    ck(A._spellbookIndexed == nil,
+       "a walk against a cold book does NOT burn the latch (the pre-fix line set it first)")
+    ck(#(A.ItemSearch or {}) == 0, "…and indexes nothing, which is the honest outcome")
+
+    w:warmSpellbook()
+    A:IndexSpellbook()
+    ck(A._spellbookIndexed == true, "a walk that ENUMERATED spells earns the latch")
+    ck(#A:SearchIcons("evocation") >= 1, "…and the spell is searchable by name")
+
+    ------------------------------------------------------------ the trainer
+    ck(w:isRegistered("LEARNED_SPELL_IN_TAB"), "the latch is watched for spell learns")
+    ck(w:isRegistered("SPELLS_CHANGED"), "…on both events")
+    ck(#A:SearchIcons("reckless") == 0, "nothing named Recklessness is indexed yet")
+    w:learnSpell("Recklessness")
+    ck(A._spellbookIndexed == nil, "LEARNED_SPELL_IN_TAB clears the latch")
+    A:IndexSpellbook()                                   -- reopening the picker
+    ck(#A:SearchIcons("reckless") >= 1,
+       "reopening the picker finds the newly-trained ability — the audit's exact scenario")
+
+    ------------------------------------------------------------ a degraded build
+    A._spellbookIndexed = nil
+    local savedFn = _G.GetNumSpellTabs
+    _G.GetNumSpellTabs = nil
+    A:IndexSpellbook()
+    ck(A._spellbookIndexed == nil,
+       "a build without the spellbook API leaves the latch unspent (the guard runs first now)")
+    _G.GetNumSpellTabs = savedFn
+    A:IndexSpellbook()
+    ck(A._spellbookIndexed == true, "…and the next call on a working build indexes normally")
+
+    ------------------------------------------------------------ REGRESSION PINS
+    local s = slurp("iconData.lua")
+    if s then
+        ck(s:find("Addon%._spellbookIndexed = true\r?\n%s*if not %(GetNumSpellTabs") == nil,
+           "PIN: the latch is no longer set before the availability guard")
+        ck(s:find("if seen > 0 then Addon%._spellbookIndexed = true end") ~= nil,
+           "PIN: …it is earned by a walk that enumerated a spell")
+        ck(s:find("SPELLS_CHANGED") ~= nil and s:find("LEARNED_SPELL_IN_TAB") ~= nil,
+           "PIN: …and cleared on both spell-learn events")
+        ck(s:find("if nTabs == 0 then return end") ~= nil,
+           "PIN: 0 tabs is treated as unreadable, not as an empty spellbook")
+    end
+end))
+
 ----------------------------------------------------------------------
 -- Every shipped file compiles (loadfile gate)
 ----------------------------------------------------------------------
@@ -5518,7 +6092,8 @@ suite("loadfile-all-files", function(ck)
 
     -- The harness's own files are not shipped either, but a mock that does not
     -- compile takes the whole equip gate with it.
-    for _, rel in ipairs({ "harness/equip-mock.lua", "harness/run-selftests.lua" }) do
+    for _, rel in ipairs({ "harness/equip-mock.lua", "harness/cold-mock.lua",
+                           "harness/run-selftests.lua" }) do
         local h, he = loadfile(P(rel))
         ck(h ~= nil, "compiles: " .. rel .. (h and "" or (" -> " .. tostring(he))))
     end

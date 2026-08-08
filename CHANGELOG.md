@@ -62,6 +62,30 @@ the tests are allowed to believe.*
   demonstrate the bug rather than merely restate the fix. The body is 1,790
   checks.
 
+- **A second test world, this one for a game that has not answered yet — and the
+  stat panel had never been tested at all.** The gear-swap world above models a
+  game that is *slow*: things happen, just not when you asked. This new one models
+  a game that is *silent*: you can see that you are wearing a shield, and the game
+  cannot yet tell you anything about it. Item tooltips come up with a title and an
+  empty body, the talent tree reports that you have no talents, the spellbook
+  reports that you know no spells — all of it briefly true at login, none of it
+  actually true.
+
+  Nothing in Armory's tests had ever put the addon in that position, and the stat
+  panel in particular had no tests of any kind. Worse, one existing test asserted
+  that the answer produced by reading a blank tooltip was the *right* answer, so
+  the suite was not merely quiet about the four defects below — it certified one of
+  them. That assertion has been rewritten to say what it actually means, and it now
+  sits beside its opposite: a scan that ran and genuinely found nothing is an
+  answer, a scan that could not read anything is not.
+
+  The new world is graded before anything is graded against it: a suite of its own
+  checks that a cold tooltip really does come up title-only, that asking the game
+  for an item is not the same as receiving it, and that nothing quietly warms up on
+  its own. Each of the four fixes below is proved twice — once by running the old
+  code against the cold world and watching it produce the wrong number, and once by
+  running the new code and watching it refuse to. The body is 1,938 checks.
+
 ### Fixed
 
 - **Gear sets now equip correctly, completely, and once.** Swapping a set could
@@ -160,6 +184,69 @@ the tests are allowed to believe.*
   them in a fixed order, so the same question always reads the same way. (What
   actually happens when you confirm has not changed: every set holding that key
   gives it up, as it always did.)
+
+- **Block Value and MP5 no longer show a number the game had not finished telling
+  us.** Armory works out your block value by reading the tooltip of every piece you
+  are wearing and adding up what it finds. At login the game has often sent you the
+  *item* but not yet the *description of the item*, and a tooltip in that state
+  comes up with the item's name and a blank body. Reading a blank body finds no
+  block value — which is indistinguishable from a shield that grants none. A
+  protection warrior in a 46-block shield would open the sheet and see 11: their
+  Strength divided by 20, and nothing else. And that wrong number was then
+  remembered, so it stood for the rest of the session unless you changed gear or
+  took a loading screen.
+
+  Armory now requires proof that it actually read something before it believes an
+  answer. A slot it cannot prove is treated as *unknown*, not as zero; a total built
+  from an unknown slot is never remembered; and Block Value and the two MP5 rows
+  show "—" for the moment rather than a figure that is quietly short. Armory also
+  now asks the game for the missing descriptions and listens for them arriving — an
+  event it previously ignored entirely — so the rows fill in on their own within a
+  second or two of login, with no gear change and no reload. A shield that genuinely
+  grants no block value still reads as zero, because that is a real answer.
+
+- **Talent-derived stats no longer read zero for the whole session if you log in
+  and go straight to your character sheet.** Meditation, Defiance, Improved Blessing
+  of Wisdom, the spell-crit talents the game never reports — Armory looks each one
+  up by name in your talent tree. If the tree was not readable yet when it first
+  looked, it wrote down "that talent does not exist" and never asked again, so every
+  stat that depends on one contributed nothing for the rest of your play session.
+  Zoning cured it, which is why it mostly went unnoticed; sitting down and reading
+  your sheet at the character-select screen's other side did not.
+
+  Armory already had the right rule for a different failure in the very same
+  function — if a talent's name does not match what it expected, it throws the
+  lookup away and re-resolves next time. That rule now covers this case too. A tree
+  that could not be read is recorded as unread rather than as empty, and the next
+  time anything asks, it looks again. A tree that *was* read and genuinely does not
+  contain the talent is still remembered, so nothing got slower.
+
+- **A set keybind will swap a weapon mid-fight even if the weapon was in your bank
+  at login.** Set keybinds carry a hidden instruction for each weapon slot, and that
+  instruction has to name the weapon in plain text — which means Armory needs the
+  item's name from the game before it can write it. If the weapon was sitting in
+  your bank, the game had never sent its name, so the instruction was silently left
+  out. Armory tried once more ten seconds after login and then stopped trying
+  forever. Take the weapon out of the bank an hour later, press the set's key in the
+  opening seconds of a pull, and nothing happened — with no error, because that path
+  cannot report one.
+
+  Armory now counts how many weapon names it could not resolve, asks the game for
+  each of them, and rewrites the instructions every time one arrives, for as long as
+  any are outstanding. Once every name has landed it stops listening, so a normal
+  login costs nothing.
+
+- **Newly learned spells are searchable in the set icon picker without a reload.**
+  The picker lets you find an icon by typing a spell's name, which works because
+  Armory indexes your spellbook the first time you open it. That index was marked
+  "done" before it had read anything — so if you opened the picker at a moment the
+  spellbook was not readable, it recorded no spells and never tried again. Visit a
+  trainer, learn a new ability, reopen the picker and search for it: no result, for
+  the rest of the session.
+
+  The index is now only marked done once it has actually read spells out of the
+  book, and it is thrown away and rebuilt whenever you learn something — so a
+  freshly trained ability is searchable the next time you open the picker.
 
 ## 1.3.1 — 2026-08-05
 

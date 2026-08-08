@@ -160,19 +160,47 @@ end
 -- the client harvest as nameless fileIDs (see harvest() above) are otherwise only
 -- searchable by numeric ID — typing e.g. "Recklessness" would never match its icon.
 -- The player's known spells are guaranteed to be name-resolvable, so seed those.
+--
+-- ARM-4 (SUITE_DATA_HONESTY_AUDIT, Class 5/6). THE LATCH IS EARNED, NOT SPENT.
+-- `_spellbookIndexed = true` used to be set BEFORE the API-availability guard and
+-- before the walk, so any early or degraded call burned it: a spellbook answering
+-- 0 tabs indexed nothing and was indistinguishable from "the player knows no
+-- spells". Visit a trainer, learn Recklessness, reopen the picker, search
+-- "reckless" — no result, for the rest of the session, which is precisely what this
+-- index exists to prevent (see the header above).
+--
+-- Now: the guard runs first, 0 tabs is treated as unreadable rather than empty, the
+-- latch is only set once a walk actually enumerated a spell, and SPELLS_CHANGED /
+-- LEARNED_SPELL_IN_TAB clear it so a newly-trained ability re-indexes on the next
+-- picker open.
+local function watchSpellbook()
+    if Addon._spellbookWatch or not CreateFrame then return end
+    local f = CreateFrame("Frame")
+    -- RegisterEvent raises on an event a build does not know; the TOC spans three
+    -- interface versions, so each one is guarded.
+    pcall(f.RegisterEvent, f, "SPELLS_CHANGED")
+    pcall(f.RegisterEvent, f, "LEARNED_SPELL_IN_TAB")
+    f:SetScript("OnEvent", function() Addon._spellbookIndexed = nil end)
+    Addon._spellbookWatch = f
+end
+
 function Addon:IndexSpellbook()
     if Addon._spellbookIndexed then return end
-    Addon._spellbookIndexed = true
     if not (GetNumSpellTabs and GetSpellTabInfo and GetSpellBookItemName and GetSpellBookItemTexture) then return end
+    watchSpellbook()
     Addon._iconNameSeen = Addon._iconNameSeen or {}
     Addon.ItemSearch = Addon.ItemSearch or {}
     local book = BOOKTYPE_SPELL or "spell"
-    for tab = 1, GetNumSpellTabs() do
+    local nTabs = GetNumSpellTabs() or 0
+    if nTabs == 0 then return end          -- unreadable, not empty: no latch
+    local seen = 0
+    for tab = 1, nTabs do
         local _, _, offset, numSpells = GetSpellTabInfo(tab)
         for i = (offset or 0) + 1, (offset or 0) + (numSpells or 0) do
             local name = GetSpellBookItemName(i, book)
             local tex = GetSpellBookItemTexture(i, book)
             if name and tex then
+                seen = seen + 1
                 local key = name:lower()
                 if not Addon._iconNameSeen[key] then
                     Addon._iconNameSeen[key] = true
@@ -181,6 +209,10 @@ function Addon:IndexSpellbook()
             end
         end
     end
+    -- Latch on what the walk PROVED it read, not on the fact that it ran. `seen`
+    -- rather than "newly added": a book whose every spell was already indexed by
+    -- the icon harvest still answered, and re-walking it every open is waste.
+    if seen > 0 then Addon._spellbookIndexed = true end
 end
 
 function Addon:IndexOwnedItems()

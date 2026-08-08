@@ -1274,9 +1274,19 @@ end
 -- now. Skipped: slots the set does not govern, slots the set marks explicitly
 -- empty (there is no secure "take this off" command), and items whose name the
 -- client has not cached yet.
+--
+-- ARM-3 (SUITE_DATA_HONESTY_AUDIT, Class 4/5). THE SKIPS ARE COUNTED AND RETURNED.
+-- A set whose main hand sits in the bank has never had its name sent this session,
+-- so the `[combat]` line silently does not exist and the keybind does nothing
+-- mid-pull, with no error — the secure path fails silently in lockdown. The count
+-- is the unresolved-counter keybind.lua watches (goalPicker.lua's _goalPvPMissing
+-- shape), and the load request below is what makes GET_ITEM_INFO_RECEIVED fire at
+-- all for an item the server has never sent.
+--
+-- Returns: lines, missing
 function Addon:WeaponMacroLines(name)
-    local set, lines = Addon:GetSet(name), {}
-    if not set then return lines end
+    local set, lines, missing = Addon:GetSet(name), {}, 0
+    if not set then return lines, 0 end
     for _, slotId in ipairs(Addon.SECURE_COMBAT_SLOTS) do
         local entry = Addon:IsSlotActive(set, slotId) and set.equip[slotId] or nil
         if entry and not Addon:IsEmptyEntry(entry) then
@@ -1284,19 +1294,28 @@ function Addon:WeaponMacroLines(name)
             local itemName = link and GetItemInfo and GetItemInfo(link) or nil
             if itemName then
                 lines[#lines + 1] = "/equipslot [combat]" .. slotId .. " " .. itemName
+            else
+                missing = missing + 1
+                local id = tonumber(entry.id) or (link and tonumber(tostring(link):match("item:(%d+)")))
+                if id and id > 0 and _G.C_Item and _G.C_Item.RequestLoadItemDataByID then
+                    pcall(_G.C_Item.RequestLoadItemDataByID, id)
+                end
             end
         end
     end
-    return lines
+    return lines, missing
 end
 
 -- Full macro body for a set's secure button: the weapon lines (which only fire in
 -- combat) followed by the ordinary equip call, flagged so the queue knows the
 -- weapon slots are already being handled.
+--
+-- Returns: text, missing  (the second return carries WeaponMacroLines' skip count
+-- through to keybind.lua, which sums it across every bound set).
 function Addon:BuildSetMacroText(name)
-    local lines = Addon:WeaponMacroLines(name)
+    local lines, missing = Addon:WeaponMacroLines(name)
     lines[#lines + 1] = '/run ArmEquipSecure("' .. escapeMacroArg(name) .. '")'
-    return table.concat(lines, "\n")
+    return table.concat(lines, "\n"), missing
 end
 
 -- Does this set govern any slot the secure path can swap mid-combat?
