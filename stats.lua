@@ -56,10 +56,21 @@ end
 -- the talent resolves to nil, and its contribution is skipped. That is the safe
 -- direction — understated, never wrong-talent.
 
+-- ARM-2 (SUITE_DATA_HONESTY_AUDIT, Class 5): "the tree answered and there is no
+-- remap" and "the tree could not be read" used to write the same `false`, which is
+-- a calibration learned once from a cold client and held for the session. They are
+-- separated now: an unreadable tree leaves _talentRemap NIL (unknown) and raises
+-- _talentRemapCold, which TalentRank retries against on every read until the tree
+-- answers. Returns true when the tree answered, false when it could not be read.
 function Addon:BuildTalentRemap()
     Addon._talentSlots = nil
     local nTabs = (GetNumTalentTabs and GetNumTalentTabs()) or 0
-    if nTabs == 0 then Addon._talentRemap = false; return end
+    if nTabs == 0 then
+        -- 0 tabs is not "this character has no talents" — every character has three.
+        Addon._talentRemap     = nil
+        Addon._talentRemapCold = true
+        return false
+    end
 
     local tabs = {}
     for tab = 1, nTabs do
@@ -72,7 +83,11 @@ function Addon:BuildTalentRemap()
         end
         tabs[tab] = list
     end
-    Addon._talentRemap = SM.BuildTalentRemap(tabs) or false
+    -- Every tab enumerated at least one talent, so a nil from SM.BuildTalentRemap
+    -- here is a genuine "this layout needs no remap", not a cold read.
+    Addon._talentRemap     = SM.BuildTalentRemap(tabs) or false
+    Addon._talentRemapCold = nil
+    return true
 end
 
 local function talentTabByName(treeName)
@@ -96,8 +111,13 @@ local function resolveTalent(tree, talentName)
     if preferred then order[#order + 1] = preferred end
     for tab = 1, nTabs do if tab ~= preferred then order[#order + 1] = tab end end
 
+    -- ARM-2: the tree has only "answered" if it named tabs AND every tab it named
+    -- enumerated talents. A tab reporting zero talents is a cold read, not an empty
+    -- tree — and a negative learned from one latches for the session.
+    local answered = (nTabs > 0)
     for _, tab in ipairs(order) do
         local n = (GetNumTalents and GetNumTalents(tab)) or 0
+        if n == 0 then answered = false end
         for legacy = 1, n do
             local live = SM.RemapTalentIndex(map, tab, legacy)
             if GetTalentInfo(tab, live) == talentName then
@@ -105,6 +125,14 @@ local function resolveTalent(tree, talentName)
                 return Addon._talentSlots[key]
             end
         end
+    end
+
+    if not answered then
+        -- NO CACHE WRITE. The same function already re-resolves on a name mismatch
+        -- (TalentRank below); this is the other half of that discipline — a miss we
+        -- cannot prove is a miss leaves the key unresolved so the next read retries.
+        Addon:StatDebug("talent tree not readable yet — '" .. talentName .. "' left unresolved")
+        return nil
     end
 
     Addon._talentSlots[key] = false
@@ -116,6 +144,12 @@ end
 -- Returns 0 when unresolvable or when the name check fails.
 function Addon:TalentRank(tree, talentName)
     if not (GetTalentInfo and GetNumTalents) then return 0 end
+    -- ARM-2: a remap that could not be built because the tree was unreadable is
+    -- UNKNOWN, not "there is no remap". Retry before every read until it answers —
+    -- one GetNumTalentTabs() call, and only while the flag is up. PLAYER_ENTERING_WORLD
+    -- rebuilds too, but a character who logs in and reads their sheet without zoning
+    -- never gets that event, which is the whole finding.
+    if Addon._talentRemapCold then Addon:BuildTalentRemap() end
     local slot = resolveTalent(tree, talentName)
     if not slot then return 0 end
     local live = SM.RemapTalentIndex(Addon._talentRemap or nil, slot.tab, slot.legacy)
@@ -133,9 +167,31 @@ end
 -- ── Equipped-gear scan (MP5, block value, tier-set tallies) ───────────────────
 -- Cached and only rebuilt when equipment changes; the tooltip scrape is far too
 -- expensive to run on every UNIT_AURA-driven refresh.
+--
+-- ARM-1 (SUITE_DATA_HONESTY_AUDIT, Class 4). THE CACHE IS ONLY WRITTEN FROM A
+-- PROVEN SCAN. Equipped item data lands a beat after the first stat-panel paint;
+-- a scanning tooltip pointed at a cold slot renders its TITLE and nothing else, so
+-- the block-value walk sums to 0 — indistinguishable from "this gear grants no
+-- block value" — and memoizing that made the wrong number stand until the player
+-- changed gear or took a loading screen. Now: an unproven slot is UNKNOWN, the
+-- whole scan is marked unproven, nothing is memoized, a warm load is requested for
+-- every cold id, and GET_ITEM_INFO_RECEIVED repaints (see EVENTS at the bottom).
 local gearCache
 
 function Addon:InvalidateStatGearCache() gearCache = nil end
+
+-- Count of equipped slots the last scan could not prove warm. > 0 means the
+-- streaming item-info events are worth a repaint; 0 is the settled state.
+Addon._statGearUnproven = 0
+
+-- The wait is event-driven WITH A CEILING (Class 4 fix shape). GET_ITEM_INFO_RECEIVED
+-- arrives in bursts for every item any addon touches, and an id that never resolves
+-- would otherwise re-scan eighteen tooltips on each one for the rest of the session.
+-- Spending the budget does not make the panel lie: the rows stay "—", which is still
+-- the honest answer. Any equipment change or loading screen re-arms it.
+local WARM_REPAINT_CEILING = 40
+Addon._statWarmBudget = WARM_REPAINT_CEILING
+function Addon:RearmStatWarmBudget() Addon._statWarmBudget = WARM_REPAINT_CEILING end
 
 local scanTip
 local function ensureScanTip()
@@ -164,25 +220,50 @@ local function blockValuePatterns()
         end
     end
     table.sort(bodies, function(a, b) return #a > #b end)
-    blockPatterns = {}
+    local out = {}
     for _, body in ipairs(bodies) do
         local e = escapePattern(body)
-        blockPatterns[#blockPatterns + 1] = "%+?(%d+)%s+" .. e
-        blockPatterns[#blockPatterns + 1] = e .. "%s*:?%s*%+?(%d+)"
+        out[#out + 1] = "%+?(%d+)%s+" .. e
+        out[#out + 1] = e .. "%s*:?%s*%+?(%d+)"
     end
-    return blockPatterns
+    -- Class 5: an EMPTY result is not memoized. These globals are static, but a
+    -- pattern table learned once from a client that had not published them yet
+    -- would be an empty answer held for the rest of the session.
+    if #out > 0 then blockPatterns = out end
+    return out
 end
 
-local function scanBlockValueOnSlot(slotId)
+-- ARM-1. Returns the block-value sum for one equipped slot, or NIL when the slot
+-- could not be proven warm — because a cold slot's sum is 0 and a shield with no
+-- block value on it also sums to 0, and those are different facts.
+--
+-- Two independent proofs, per the audit's fix shape. Either is sufficient:
+--   * C_Item.IsItemDataCachedByID(id) — the client's own answer, where the build
+--     has it (the TOC spans three interface versions, so it is not assumed);
+--   * tip:NumLines() > 1 — a tooltip that rendered its title and nothing else is
+--     exactly the proven Class 4 shape, and it is the ONLY proof available on a
+--     build with no C_Item. It also catches an item the client thinks it has
+--     cached but whose tooltip has not been built yet.
+local function scanBlockValueOnSlot(slotId, itemId)
     local pats = blockValuePatterns()
-    if #pats == 0 then return 0 end
+    -- No stat strings to match means no answer, not a zero.
+    if #pats == 0 then return nil end
+
+    if itemId and _G.C_Item and _G.C_Item.IsItemDataCachedByID then
+        local okC, cached = pcall(_G.C_Item.IsItemDataCachedByID, itemId)
+        if okC and not cached then return nil end
+    end
+
     local tip = ensureScanTip()
     tip:ClearLines()
     tip:SetOwner(_G.WorldFrame or UIParent, "ANCHOR_NONE")
     local ok = pcall(tip.SetInventoryItem, tip, "player", slotId)
-    if not ok then return 0 end
+    if not ok then return nil end                       -- a raise is not a zero
+    local lines = tip:NumLines() or 0
+    if lines <= 1 then return nil end                   -- title-only: the body is not here yet
+
     local sum = 0
-    for i = 1, tip:NumLines() do
+    for i = 1, lines do
         local fs = _G["DaseekiArmoryStatScanTooltipTextLeft" .. i]
         local text = fs and fs:GetText()
         if text then
@@ -195,23 +276,46 @@ local function scanBlockValueOnSlot(slotId)
     return sum
 end
 
+-- Ask the client for an item whose data we could not read. Same ask goalPicker.lua
+-- makes, and the reason GET_ITEM_INFO_RECEIVED will fire for gear the server has
+-- never sent this session.
+local function requestWarm(itemId)
+    if not itemId then return end
+    if _G.C_Item and _G.C_Item.RequestLoadItemDataByID then
+        pcall(_G.C_Item.RequestLoadItemDataByID, itemId)
+    end
+end
+
 local function scanGear()
     if gearCache then return gearCache end
     local _, class = UnitClass("player")
     local mp5Values, blockSum, battlegear, zgBlock, tierPieces = {}, 0, 0, 0, 0
+    local unproven = 0
 
     for slotId = 1, 18 do
         local link = GetInventoryItemLink("player", slotId)
         if link then
-            local okStats, stats = pcall(GetItemStats, link)
-            if okStats and type(stats) == "table" then
-                local v = stats["ITEM_MOD_POWER_REGEN0_SHORT"]
-                if v and v ~= 0 then mp5Values[#mp5Values + 1] = v end
+            local id = tonumber(link:match("item:(%d+)"))
+
+            -- The block walk is the warmth oracle for the whole slot: nil means the
+            -- tooltip body was not there, and GetItemStats is cold in the same breath.
+            local slotBlock = scanBlockValueOnSlot(slotId, id)
+            if slotBlock == nil then
+                unproven = unproven + 1
+                requestWarm(id)
+            else
+                blockSum = blockSum + slotBlock
+
+                local okStats, stats = pcall(GetItemStats, link)
+                if okStats and type(stats) == "table" then
+                    local v = stats["ITEM_MOD_POWER_REGEN0_SHORT"]
+                    if v and v ~= 0 then mp5Values[#mp5Values + 1] = v end
+                end
             end
 
-            blockSum = blockSum + scanBlockValueOnSlot(slotId)
-
-            local id = tonumber(link:match("item:(%d+)"))
+            -- Link-derived facts (set ids, enchant ids) need no item data at all —
+            -- they are in the link the client already handed us, so they stay exact
+            -- even while the body is cold.
             if id then
                 if SM.BATTLEGEAR_OF_MIGHT_IDS[id] then battlegear = battlegear + 1 end
                 if SM.CASTING_REGEN_SET_IDS[id]   then tierPieces = tierPieces + 1 end
@@ -237,10 +341,21 @@ local function scanGear()
         if slotEnchant(7) == SM.MP5_ENCHANTS.PRIEST_LEGS.id then mp5 = mp5 + SM.MP5_ENCHANTS.PRIEST_LEGS.mp5 end
     end
 
-    gearCache = {
-        mp5 = mp5, blockValue = blockSum, battlegear = battlegear,
-        zgBlockEnchants = zgBlock, tierPieces = tierPieces, class = class,
+    Addon._statGearUnproven = unproven
+
+    local scan = {
+        -- nil, not 0: the two tooltip-derived sums have no answer while any slot is
+        -- cold, and their consumers render "—" rather than a number that is short.
+        mp5 = (unproven == 0) and mp5 or nil,
+        blockValue = (unproven == 0) and blockSum or nil,
+        battlegear = battlegear, zgBlockEnchants = zgBlock,
+        tierPieces = tierPieces, class = class, unproven = unproven,
     }
+    if unproven > 0 then
+        Addon:StatDebug(unproven .. " equipped slot(s) not warm yet — gear scan not cached")
+        return scan                        -- DELIBERATELY NOT MEMOIZED
+    end
+    gearCache = scan
     return gearCache
 end
 
@@ -370,6 +485,12 @@ local function computeManaRegen()
     if base and base >= 1 then lastSeenBase = base end
 
     local g = scanGear()
+    -- ARM-1: a cold gear scan has no MP5 answer. Both rows read "—" until the item
+    -- data lands, rather than quoting a sum that is missing whole pieces.
+    if g.mp5 == nil then
+        regenMemo, regenMemoSerial = false, Addon._statsSerial
+        return false
+    end
     local gearMP5 = g.mp5 + temporaryMainHandMP5()
 
     local impWisdom = (class == "PALADIN")
@@ -444,7 +565,12 @@ local function blockValue()
     end
     local g = scanGear()
     local strength = select(2, UnitStat("player", 1))
-    return N(SM.BlockValue(g.blockValue, strength, g.battlegear, g.zgBlockEnchants))
+    -- ARM-1: SM.BlockValue refuses a nil gear sum. Strength/20 alone is not a block
+    -- value — it is the one term that survived a cold read, and rendering it was
+    -- how a protection warrior's 57 showed as 11.
+    local v = SM.BlockValue(g.blockValue, strength, g.battlegear, g.zgBlockEnchants)
+    if v == nil then return NA end
+    return N(v)
 end
 -- Resistance indices: 0 Armor, 1 Holy (never itemized), 2 Fire, 3 Nature, 4 Frost,
 -- 5 Shadow, 6 Arcane. select(2) is the effective value shown on the sheet.
@@ -726,6 +852,11 @@ function Addon:InitStats()
         "SPELL_POWER_CHANGED", "PLAYER_EQUIPMENT_CHANGED", "UNIT_INVENTORY_CHANGED",
         "SKILL_LINES_CHANGED", "UNIT_AURA", "PLAYER_ENTERING_WORLD",
         "CHARACTER_POINTS_CHANGED",
+        -- ARM-1: the one event that announces "the data you could not read has
+        -- arrived". Without it a cold login's gear scan stood until the player
+        -- changed gear or took a loading screen. Both spellings are watched (the
+        -- register call is pcall-guarded above, so a build lacking one is fine).
+        "GET_ITEM_INFO_RECEIVED", "ITEM_DATA_LOAD_RESULT",
     }
     for _, e in ipairs(EVENTS) do
         -- guard: a patch level that lacks a given event should not abort the rest
@@ -736,6 +867,7 @@ function Addon:InitStats()
             -- The talent remap must exist before any talent-derived number is read.
             Addon:BuildTalentRemap()
             Addon:InvalidateStatGearCache()
+            Addon:RearmStatWarmBudget()
             Addon:MarkStatsDirty()
             return
         end
@@ -744,12 +876,25 @@ function Addon:InitStats()
             Addon:MarkStatsDirty()
             return
         end
+        -- ARM-1: item info streaming in. arg1 is an ITEM ID here, not a unit, so it
+        -- has to be handled before the "player"-only filter below. Gated on the
+        -- unresolved counter (goalPicker.lua's _goalPvPMissing discipline): these
+        -- arrive in bursts, and at 0 there is nothing cold left to repaint for.
+        if event == "GET_ITEM_INFO_RECEIVED" or event == "ITEM_DATA_LOAD_RESULT" then
+            if (Addon._statGearUnproven or 0) > 0 and (Addon._statWarmBudget or 0) > 0 then
+                Addon._statWarmBudget = Addon._statWarmBudget - 1
+                Addon:InvalidateStatGearCache()
+                Addon:MarkStatsDirty()
+            end
+            return
+        end
         -- Equipment changes invalidate the cached gear scan (MP5 / block value /
         -- tier tallies). PLAYER_EQUIPMENT_CHANGED's first arg is a SLOT NUMBER, so
         -- it must be handled before the "player"-only filter below.
         if event == "PLAYER_EQUIPMENT_CHANGED"
            or (event == "UNIT_INVENTORY_CHANGED" and arg1 == "player") then
             Addon:InvalidateStatGearCache()
+            Addon:RearmStatWarmBudget()     -- new gear is a new warmth question
             Addon:MarkStatsDirty()
             return
         end

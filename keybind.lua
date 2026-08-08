@@ -37,6 +37,43 @@ local function whenOutOfCombat(key, fn)
     Addon._bindRegen:RegisterEvent("PLAYER_REGEN_ENABLED")
 end
 
+-- ── ARM-3: the unresolved-name counter (SUITE_DATA_HONESTY_AUDIT, Class 4/5) ──
+-- `WeaponMacroLines` omits a slot's `/equipslot [combat]<slot> <name>` line when
+-- GetItemInfo has not cached the item's name. The only repair used to be a single
+-- 10-second timer behind a session latch: a set whose main hand sits in the bank is
+-- nil at t=0 and still nil at t=10, the latch burns, and the player presses the
+-- keybind mid-pull an hour later to nothing at all — silently, because the secure
+-- path fails without an error in lockdown.
+--
+-- The repair is now the discipline goalPicker.lua's `_goalPvPMissing` already uses
+-- in this repo: count what could not be resolved, and while that count is > 0 watch
+-- GET_ITEM_INFO_RECEIVED and rewrite on every hit. At 0 the watcher unregisters, so
+-- a fully-warm client pays nothing.
+Addon._macroMissing = 0
+
+function Addon:UpdateMacroWarmWatch()
+    local want = (Addon._macroMissing or 0) > 0
+    if want then
+        if not Addon._macroWarmFrame then
+            local f = CreateFrame("Frame")
+            f:SetScript("OnEvent", function()
+                if (Addon._macroMissing or 0) > 0 then Addon:QueueMacroRefresh() end
+            end)
+            Addon._macroWarmFrame = f
+        end
+        if not Addon._macroWatching then
+            -- RegisterEvent raises on an event a build does not know, and the TOC
+            -- spans three interface versions, so each one is guarded.
+            pcall(Addon._macroWarmFrame.RegisterEvent, Addon._macroWarmFrame, "GET_ITEM_INFO_RECEIVED")
+            pcall(Addon._macroWarmFrame.RegisterEvent, Addon._macroWarmFrame, "ITEM_DATA_LOAD_RESULT")
+            Addon._macroWatching = true
+        end
+    elseif Addon._macroWatching then
+        Addon._macroWarmFrame:UnregisterAllEvents()
+        Addon._macroWatching = false
+    end
+end
+
 -- Rewrite the macro body of every existing set button (no re-binding). Cheap, so
 -- it is safe to call after any set edit.
 function Addon:RefreshSetMacros()
@@ -44,11 +81,16 @@ function Addon:RefreshSetMacros()
         whenOutOfCombat("macros", function() Addon:RefreshSetMacros() end)
         return
     end
+    local missing = 0
     for _, btn in ipairs(Addon._bindButtons or {}) do
         if btn._setName and Addon.db.sets[btn._setName] then
-            btn:SetAttribute("macrotext", Addon:BuildSetMacroText(btn._setName))
+            local text, miss = Addon:BuildSetMacroText(btn._setName)
+            btn:SetAttribute("macrotext", text)
+            missing = missing + (miss or 0)
         end
     end
+    Addon._macroMissing = missing
+    Addon:UpdateMacroWarmWatch()
 end
 
 -- Coalesce a burst of set edits into one rewrite on the next frame.
@@ -72,7 +114,7 @@ function Addon:ApplySetBindings()
     if not owner then owner = CreateFrame("Frame", "DaseekiArmoryBindOwner"); Addon._bindOwner = owner end
     ClearOverrideBindings(owner)
     Addon._bindButtons = Addon._bindButtons or {}
-    local i = 0
+    local i, missing = 0, 0
     for name, set in pairs(Addon.db.sets) do
         if type(set.key) == "string" and set.key ~= "" then
             i = i + 1
@@ -84,15 +126,24 @@ function Addon:ApplySetBindings()
             end
             btn._setName = name
             btn:SetAttribute("type", "macro")
-            btn:SetAttribute("macrotext", Addon:BuildSetMacroText(name))
+            local text, miss = Addon:BuildSetMacroText(name)
+            btn:SetAttribute("macrotext", text)
+            missing = missing + (miss or 0)
             SetOverrideBindingClick(owner, true, set.key, btn:GetName())
         end
     end
     -- Buttons past the last bound set keep stale text otherwise.
     for j = i + 1, #Addon._bindButtons do Addon._bindButtons[j]._setName = nil end
 
-    -- Item names are not always cached at login; re-resolve shortly after so a
-    -- weapon whose name arrived late still gets its /equipslot line.
+    -- ARM-3: item names are not always cached at login. The COUNTER above is the
+    -- repair — while it is > 0 every GET_ITEM_INFO_RECEIVED rewrites the bodies, for
+    -- as long as it takes, including an item retrieved from the bank an hour later.
+    Addon._macroMissing = missing
+    Addon:UpdateMacroWarmWatch()
+
+    -- The 10-second re-resolve survives as a BACKSTOP ONLY, for a client that
+    -- resolves a name without ever firing the event. It is no longer the repair, so
+    -- its one-shot latch can no longer strand anything.
     if not Addon._macroWarmed and C_Timer and C_Timer.After then
         Addon._macroWarmed = true
         C_Timer.After(10, function() Addon:RefreshSetMacros() end)

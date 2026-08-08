@@ -312,8 +312,15 @@ M.WARRIOR_ZG_BLOCK_ENCHANT_VALUE = 15
 -- tooltipSum: every block-value number scraped off equipped slots 1..18.
 -- The Strength/20 term is part of the default (own-calculation) source; the
 -- Blizzard alternative (GetShieldBlock) carries no strength, set or enchant terms.
+--
+-- ARM-1 / Class 5 (SUITE_DATA_HONESTY_AUDIT 2026-08-07): tooltipSum NIL means the
+-- gear scan could not prove a single slot warm, and there is no block value to
+-- report — this returns nil and the row renders "—". A tooltipSum of 0 is the
+-- opposite: a scan that ran, proved every slot, and found no block value on any of
+-- them. 0 is an answer; nil is absence, and they used to render the same number.
 function M.BlockValue(tooltipSum, strength, battlegearPieces, warriorZGEnchantCount)
-    local v = (tooltipSum or 0) + (strength or 0) / 20
+    if tooltipSum == nil then return nil end
+    local v = tooltipSum + (strength or 0) / 20
     if (battlegearPieces or 0) >= M.BATTLEGEAR_SET_BONUS_PIECES then
         v = v + M.BATTLEGEAR_SET_BONUS_VALUE
     end
