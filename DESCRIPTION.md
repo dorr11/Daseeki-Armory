@@ -1,7 +1,7 @@
 # CurseForge Description — Daseeki Armory
 
 <!-- Canonical CurseForge project description. Update here first, then paste to
-     the CurseForge project (1592412). Last synced: 2026-08-03 (v1.3.0). -->
+     the CurseForge project (1592412). Last synced: 2026-08-08 (v1.3.2). -->
 
 Per-character equipment set manager for WoW Classic Era: save full gear loadouts, swap between them instantly, and track the gear you're still hunting.
 

@@ -7,7 +7,7 @@
 ## SavedVariablesPerCharacter: DaseekiArmoryDB
 ## SavedVariables: DaseekiArmoryScanDB
 ## OptionalDeps: Daseeki-Core, Daseeki-Bags, ItemRack, OPie
-## Version: 1.3.1
+## Version: 1.3.2
 
 # DaseekiArmoryScanDB is RETIRED as of 1.3.1 and is still declared on purpose.
 # Nothing in normal play reads, writes or creates it — the item database is shipped
