@@ -665,11 +665,13 @@ function Addon:EquipSlot(slotId, entry)
     local census = Addon:BuildCensus()
     local loc = resolve(census, entry, nil, slotId)
     if not loc then return false end
-    local ok, code = Addon:ExecuteOp({
-        slot    = slotId,
-        from    = loc,
-        twoHand = (slotId == 16) and (equipLocOf(loc.link) == "INVTYPE_2HWEAPON") or false,
-    }, census)
+    local ok, code = withIssueLatch(function()
+        return Addon:ExecuteOp({
+            slot    = slotId,
+            from    = loc,
+            twoHand = (slotId == 16) and (equipLocOf(loc.link) == "INVTYPE_2HWEAPON") or false,
+        }, census)
+    end)
     if not ok then
         if code ~= ABORT_CURSOR then clearCursorBackstop() end
         return false
@@ -694,6 +696,65 @@ end
 local function now() return (GetTime and GetTime()) or 0 end
 local function canDefer() return (C_Timer and C_Timer.After) and true or false end
 
+-- ── THE ISSUING LATCH (CLIENT_ASYNC_LESSONS.md Class 9) ──────────────────────
+-- The client does not always SCHEDULE the event a mutating call causes. Taking
+-- an item locks its slots CLIENT-SIDE, immediately, and the client announces
+-- that with ITEM_LOCK_CHANGED dispatched from INSIDE PickupContainerItem /
+-- PickupInventoryItem — every handler registered by every addon in the session
+-- runs to completion before the pickup returns (Nexus 1.1.8, live, 2026-08-10).
+--
+-- A wave is not one call, it is a SEQUENCE of them, and its predictions are
+-- recorded as each op returns. So there is a window, inside every wave, where
+-- the world is half-written and `run.inflight` does not yet describe it. A
+-- settle check that runs in that window sees an empty in-flight list, calls the
+-- wave settled, and re-plans against a world that is mid-operation — which is
+-- ARM-2 exactly: it re-issues moves that already landed, and the server answers
+-- with ERR_INTERNAL_BAG_ERROR.
+--
+-- Today nothing in this addon re-enters there, because our own handler only ever
+-- SCHEDULES a check. That is an accident of C_Timer's behaviour and of what the
+-- other handlers in the session happen to do — and Class 9's proven incident had
+-- a third-party addon as the deepest frame purely for listening to the same
+-- dispatch. So the guard may not depend on it.
+--
+-- ARMED BEFORE THE FIRST CLIENT CALL of the wave and released when the wave
+-- returns, pcall-protected so a raise inside a handler cannot wedge it up, and
+-- counted rather than set so nesting is safe. Every entry point that could
+-- observe a half-issued world reads it: the settle check and the drain step wait
+-- instead, and a re-entered pass refuses outright and records the refusal.
+local issuing = 0
+
+-- Published so a peer module's handler can tell OUR echo from a real one.
+function Addon:InEquipIssue() return issuing > 0 end
+
+-- The depth fuse. One legitimate level (a wave); anything deeper is a
+-- composition nobody foresaw, and it degrades to a refusal with a record rather
+-- than to an overflow.
+local MAX_ISSUE_DEPTH = 1
+
+-- The record the fuse leaves behind. Build-stamped, because "which client did
+-- this to us" is the first question an unforeseen composition raises and the
+-- interface version is the only part of the answer we can write down ourselves.
+function Addon:RecordEquipReentry(where)
+    Addon._equipReentries = (Addon._equipReentries or 0) + 1
+    Addon._equipReentryAt = where
+    if GetBuildInfo then
+        local ok, _, build = pcall(GetBuildInfo)
+        if ok then Addon._equipReentryBuild = build end
+    end
+end
+
+-- Run `fn` with the latch up. Returns the function's value, or nil if it raised
+-- — the raise is re-thrown AFTER the latch comes down.
+local function withIssueLatch(fn)
+    issuing = issuing + 1
+    local ok, a, b, c = pcall(fn)
+    issuing = issuing - 1
+    if issuing < 0 then issuing = 0 end
+    if not ok then error(a, 0) end
+    return a, b, c
+end
+
 -- Everything the client publishes when a move lands. ITEM_LOCK_CHANGED alone is
 -- the ARM-2 trap: it is the EARLY signal, and the contents follow it.
 local SETTLE_EVENTS = {
@@ -702,6 +763,16 @@ local SETTLE_EVENTS = {
 }
 
 function Addon:EquipPass(name, attempt)
+    -- THE DEPTH FUSE (Class 9). A pass re-entered from inside its own wave would
+    -- plan against a half-written world; there is no depth at which that is
+    -- legitimate, so it refuses and leaves a build-stamped count behind rather
+    -- than recursing. The wave that is already running still finishes, and its
+    -- settle check still takes the next step from a settled world.
+    if issuing >= MAX_ISSUE_DEPTH then
+        Addon:RecordEquipReentry("EquipPass")
+        return
+    end
+
     local set = Addon:GetSet(name)
     if not set then Addon:FinishEquip(name, false); return end
 
@@ -746,12 +817,26 @@ function Addon:EquipPass(name, attempt)
         run.stall = run.stall + 1
     end
 
+    -- ARM THE WATCHER BEFORE THE FIRST CLIENT CALL (Class 9). It used to be armed
+    -- after the whole wave had gone out, so under a client that dispatches from
+    -- inside the pickup the sequence's own first echoes arrived at a watcher that
+    -- did not exist yet — on the first step of every run — and the wait fell back
+    -- to being poll-only, which is the one thing the design says it must never be.
+    -- The issuing latch below is what makes arming this early safe.
+    Addon:ArmSettleWatcher(run)
+
     -- ── Issue the wave ────────────────────────────────────────────────────────
     -- Only ops whose involved slots are disjoint from everything already going
     -- out this step. An op that overlaps is not skipped forever — it is simply
     -- left for a later step, by which time its dependency has SETTLED and it is
     -- planned against a world that really contains the earlier op's result.
+    --
+    -- THE WHOLE WAVE RUNS UNDER THE ISSUING LATCH: every echo the client
+    -- dispatches from inside these calls lands while the latch is up, and every
+    -- reader of the latch treats what it sees as this wave's own half-written
+    -- world rather than as an answer.
     local claimed, issued, abort = {}, 0, nil
+    withIssueLatch(function()
     for _, op in ipairs(plan) do
         if issued >= MAX_IN_FLIGHT then break end
         if Addon:OpStillNeeded(op) then
@@ -779,6 +864,7 @@ function Addon:EquipPass(name, attempt)
             end
         end
     end
+    end)
 
     if abort then Addon:AbortRun(name, abort); return end
 
@@ -792,11 +878,12 @@ function Addon:EquipPass(name, attempt)
     Addon:WatchSettle()
 end
 
--- Arm the wait: the client's own publish events, plus a bounded backstop poll so
--- the wait is NEVER event-only (ARM-4's live shape — a pass whose ops were all
--- refused fires nothing at all and the old watcher never re-armed).
-function Addon:WatchSettle()
-    local run = Addon._run
+-- Arm the watcher. Idempotent, and called BEFORE the wave's first client call so
+-- that a client which dispatches from inside that call is heard by the run that
+-- caused it (Class 9). The handler only ever SCHEDULES — it never checks inline,
+-- and the issuing latch means the scheduled check cannot run early either.
+function Addon:ArmSettleWatcher(run)
+    run = run or Addon._run
     if not run then return end
 
     if CreateFrame and not Addon._lockWatcher then
@@ -816,6 +903,16 @@ function Addon:WatchSettle()
             pcall(function() Addon._lockWatcher:RegisterEvent(e) end)
         end
     end
+end
+
+-- Arm the wait: the client's own publish events, plus a bounded backstop poll so
+-- the wait is NEVER event-only (ARM-4's live shape — a pass whose ops were all
+-- refused fires nothing at all and the old watcher never re-armed).
+function Addon:WatchSettle()
+    local run = Addon._run
+    if not run then return end
+
+    Addon:ArmSettleWatcher(run)
 
     -- No way to defer at all (a bare environment): we cannot wait for a settle,
     -- so finish honestly instead of leaving the latch set.
@@ -850,6 +947,18 @@ end
 function Addon:SettleCheck(gen)
     local run = Addon._run
     if not (run and run.gen == gen) then return end
+
+    -- CLASS 9. A wave is being issued right now and this check is standing inside
+    -- one of its own client calls. What it would see is the half-written world of
+    -- an operation that has not returned yet, over an in-flight list that does not
+    -- describe it — so it would call the wave settled, re-plan from mid-operation
+    -- state, and re-issue moves that already landed. Wait for the wave instead;
+    -- the caller's own schedule is still coming, and this one re-arms regardless.
+    if Addon:InEquipIssue() then
+        Addon._settleDeferrals = (Addon._settleDeferrals or 0) + 1
+        Addon:ScheduleSettleCheck(gen, SETTLE_POLL)
+        return
+    end
 
     local t, still = now(), {}
     for _, p in ipairs(run.inflight) do
@@ -1022,6 +1131,16 @@ function Addon:DrainStep(gen)
     local d = Addon._drain
     if not (d and d.gen == gen) then return end
 
+    -- CLASS 9, same reason as SettleCheck: a round's own client calls can dispatch
+    -- an echo that lands here mid-wave, where `d.inflight` does not yet describe
+    -- what has been issued. Retiring there would roll straight to the next round
+    -- and re-issue a queued action that is already in the air.
+    if Addon:InEquipIssue() then
+        Addon._settleDeferrals = (Addon._settleDeferrals or 0) + 1
+        Addon:ScheduleDrainStep(gen, SETTLE_POLL)
+        return
+    end
+
     -- Retire on CONTENT, exactly as the equip run does.
     local t, still = now(), {}
     for _, p in ipairs(d.inflight) do
@@ -1080,6 +1199,12 @@ end
 function Addon:DrainWave(d)
     local q = Addon._combatQueue
     if not q then return 0 end
+    -- The wave is a sequence of client calls; nothing that reads the issuing
+    -- latch may run a second one inside it (Class 9).
+    if issuing >= MAX_ISSUE_DEPTH then
+        Addon:RecordEquipReentry("DrainWave")
+        return 0
+    end
 
     local slots = {}
     for slot in pairs(q) do slots[#slots + 1] = slot end
@@ -1095,6 +1220,7 @@ function Addon:DrainWave(d)
     for _, slot in ipairs(slots) do if not sourcedBy[slot] then anyFree = true end end
 
     local census, claimed, issued = Addon:BuildCensus(), {}, 0
+    withIssueLatch(function()
     for _, slot in ipairs(slots) do
         if issued >= MAX_IN_FLIGHT then break end
         local a = q[slot]
@@ -1127,6 +1253,7 @@ function Addon:DrainWave(d)
             end
         end
     end
+    end)
 
     if not next(q) then Addon._combatQueue = nil end
     return issued
@@ -1184,7 +1311,11 @@ end
 function Addon:IssueAction(invSlot, a)
     local op = Addon:ActionToOp(invSlot, a)
     if not op then return false end
-    local ok, code = Addon:ExecuteOp(op, Addon:BuildCensus())
+    -- One op is still a sequence of client calls (pickup, place, put the
+    -- displaced item down), so it goes out under the issuing latch too: an echo
+    -- dispatched from inside it must not be mistaken for an answer (Class 9).
+    local census = Addon:BuildCensus()
+    local ok, code = withIssueLatch(function() return Addon:ExecuteOp(op, census) end)
     if ok then return true end
     if code ~= ABORT_CURSOR then clearCursorBackstop() end
     Addon:ChatMsg(ABORT_TEXT[code] or "the swap was interrupted.")

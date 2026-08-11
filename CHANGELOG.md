@@ -1,5 +1,55 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **A stat row could get stuck on "—" after the client had already sent the
+  data.** When Armory finds an equipped item it cannot read, it asks the client
+  for it and repaints when the answer arrives. For an item the client *already
+  holds*, that answer comes back *instantly — inside the same line of code that
+  asked for it*, before the scan has finished counting what it could not read.
+  Armory's repaint check was reading that count, and mid-scan the count still
+  described the *previous* scan: on the ordinary path it said "nothing was
+  unreadable", so the one answer the client was ever going to volunteer was
+  thrown away. Block Value (and the MP5 rows) then rendered "—" for gear whose
+  data had in fact arrived, and nothing repainted them until the next gear change
+  or loading screen. The scan now knows when an answer arrives inside its own
+  question, and acts on it once it has finished counting.
+
+- **A gear swap could finish with the gear on but the set not marked as
+  worn.** The client announces a slot lock from inside the very call that takes
+  the item, so any handler in the game — Armory's own, or another addon's — runs
+  half way through a swap, while some of the moves have gone out and the rest
+  have not. Anything that asked "is this swap finished?" at that instant was told
+  yes, and the run ended on a verdict drawn from a half-written world: the gear
+  landed, but the set was left looking un-equipped in the sidebar and the
+  character pane. Swaps are now issued behind a latch, and every question asked
+  from inside one waits for the swap to finish instead of answering from the
+  middle of it.
+
+### Internal
+
+*Nothing in this section changes anything you can see in the game. It changes what
+the tests are allowed to believe.*
+
+- **The test client now interrupts, the way the real one does.** Both simulators
+  used to deliver every event *after* the call that caused it returned — that is,
+  with every safety catch already in place. The real client does not wait: it
+  announces a slot lock from inside the pickup, and answers a data request for an
+  item it already holds from inside the request. Every test that depends on
+  timing was therefore testing the fix and never the hazard. Both simulators now
+  default to interrupting, the polite behaviour is a named opt-in, and the whole
+  suite runs twice — once each way. Three defects were invisible before this and
+  are covered by tests that fail without their fix and pass with it.
+
+- **The macro rewrite can no longer start a macro rewrite.** The keybind macro
+  bodies are rebuilt in a loop that asks the client for item names; a reply
+  arriving from inside that loop could ask for another rebuild, and on a client
+  with nothing to defer with that ran immediately — a rebuild inside a rebuild,
+  without limit. It is now refused, counted, and folded into a single follow-up
+  with a hard ceiling.
+
 ## 1.3.2 — 2026-08-08
 
 ### Internal
