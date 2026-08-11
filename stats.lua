@@ -193,6 +193,33 @@ local WARM_REPAINT_CEILING = 40
 Addon._statWarmBudget = WARM_REPAINT_CEILING
 function Addon:RearmStatWarmBudget() Addon._statWarmBudget = WARM_REPAINT_CEILING end
 
+-- ── THE SCAN LATCH (CLIENT_ASYNC_LESSONS.md Class 9) ─────────────────────────
+-- requestWarm is a CLIENT CALL, and for an item the client already holds it
+-- answers from INSIDE that call: ITEM_DATA_LOAD_RESULT / GET_ITEM_INFO_RECEIVED
+-- dispatches to every handler in the session before RequestLoadItemDataByID
+-- returns. The scan makes that call from inside its own loop — so the echo
+-- arrives while `Addon._statGearUnproven` still holds the PREVIOUS scan's count.
+--
+-- That is what the gate below reads. On the common path the previous scan was
+-- clean, the counter is 0, and the handler drops the one and only answer the
+-- client was ever going to volunteer: the panel keeps rendering "—" for a slot
+-- whose data has in fact arrived, and nothing repaints it until the next gear
+-- change or loading screen. It is ARM-1 exactly, re-opened by WHEN the answer
+-- came rather than by whether it came. (Async-only sims cannot see this: with
+-- the echo on a later tick the counter is already published and the gate opens.)
+--
+-- ARMED BEFORE THE FIRST CLIENT CALL of the scan and released when the scan
+-- returns, pcall-protected so a raise cannot wedge it up. While it is up, an
+-- arriving answer is OUR OWN ECHO: it still spends one repaint credit — that
+-- ceiling is the whole reason the budget exists — but it does not invalidate a
+-- cache the scan is in the middle of writing, and it does not schedule a repaint
+-- the scan is about to make a liar of. The scan acts on it once, on the way out,
+-- when its unproven count has actually been published.
+local scanning = false
+
+-- Published so a peer module's handler can tell OUR echo from a real one.
+function Addon:InStatGearScan() return scanning end
+
 local scanTip
 local function ensureScanTip()
     if scanTip then return scanTip end
@@ -286,8 +313,11 @@ local function requestWarm(itemId)
     end
 end
 
-local function scanGear()
-    if gearCache then return gearCache end
+-- The scan proper. Never called directly: scanGear() below wraps it in the
+-- Class 9 latch, because the latch has to be up before the first requestWarm and
+-- has to come down even if a handler somewhere in the dispatch chain raises.
+local scanGear
+local function scanGearInner()
     local _, class = UnitClass("player")
     local mp5Values, blockSum, battlegear, zgBlock, tierPieces = {}, 0, 0, 0, 0
     local unproven = 0
@@ -357,6 +387,29 @@ local function scanGear()
     end
     gearCache = scan
     return gearCache
+end
+
+scanGear = function()
+    if gearCache then return gearCache end
+    -- Arm BEFORE the first client call, release however the scan ends.
+    local wasScanning = scanning           -- save/restore, so nesting is safe
+    scanning = true
+    Addon._statScanEcho = nil
+    local ok, scan = pcall(scanGearInner)
+    scanning = wasScanning
+    if not ok then error(scan, 0) end
+
+    -- The client answered from inside our own scan. Now — and only now, with the
+    -- unproven count published and the cache decision made — is that answer
+    -- worth acting on: drop whatever the scan just concluded and repaint from a
+    -- world that includes what arrived. Bounded by the repaint budget the echo
+    -- already spent, so an item that never renders cannot loop forever.
+    if Addon._statScanEcho then
+        Addon._statScanEcho = nil
+        Addon:InvalidateStatGearCache()
+        Addon:MarkStatsDirty()
+    end
+    return scan
 end
 
 -- Temporary main-hand weapon enchant (Brilliant Mana Oil) is not gear-cached: it
@@ -881,6 +934,18 @@ function Addon:InitStats()
         -- unresolved counter (goalPicker.lua's _goalPvPMissing discipline): these
         -- arrive in bursts, and at 0 there is nothing cold left to repaint for.
         if event == "GET_ITEM_INFO_RECEIVED" or event == "ITEM_DATA_LOAD_RESULT" then
+            -- CLASS 9. The gear scan is standing in the client call that caused
+            -- this, so the counter the gate below reads is the PREVIOUS scan's —
+            -- reading it here is reading the wrong scan. Spend the credit (the
+            -- ceiling is the point of the budget) and hand the answer to the scan
+            -- to act on when it comes out, where the count is real.
+            if Addon:InStatGearScan() then
+                if (Addon._statWarmBudget or 0) > 0 then
+                    Addon._statWarmBudget = Addon._statWarmBudget - 1
+                    Addon._statScanEcho = true
+                end
+                return
+            end
             if (Addon._statGearUnproven or 0) > 0 and (Addon._statWarmBudget or 0) > 0 then
                 Addon._statWarmBudget = Addon._statWarmBudget - 1
                 Addon:InvalidateStatGearCache()

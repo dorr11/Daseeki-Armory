@@ -51,11 +51,49 @@
 -- contents and locks move together, inline, with no round trip — for the tests
 -- that legitimately need a settled world and are not testing the executor.
 --
+-- ── THE DISPATCH AXIS (2026-08-10, Class 9) ──────────────────────────────────
+-- CLIENT_ASYNC_LESSONS.md Class 9: the client does not always SCHEDULE the event
+-- a mutating API causes. It can DISPATCH it from inside the call, and every
+-- handler in the session runs to completion before the call returns. Anything
+-- armed at or after the sequence's first client call is armed too late, and the
+-- sequence's own first echo walks past it.
+--
+-- The UNKIND profile was blind to that: `instant = false` meant every echo
+-- arrived on a later tick — i.e. with every latch already up. That is the blind
+-- spot Class 9 names verbatim ("the sims delivered events AFTER the setter
+-- returned … the async posture tested the fix and never the hazard"). So the
+-- profile now carries a SECOND, orthogonal axis:
+--
+--   dispatch = "sync"   (THE DEFAULT) — the CLIENT-SIDE half of a move happens
+--       inside the call. Taking an item locks its slots immediately — that lock
+--       is client-side, it needs no server — and the client ANNOUNCES it with
+--       ITEM_LOCK_CHANGED dispatched to every registered frame before
+--       PickupContainerItem / PickupInventoryItem returns. The locks then STAY
+--       SET and the server half (unlock, then contents, BAG_UPDATE,
+--       PLAYER_EQUIPMENT_CHANGED) lands later exactly as before, because that
+--       half really is a round trip. Sync is therefore strictly UNKINDER than
+--       async: the same lock window, plus an echo at the worst possible moment.
+--   dispatch = "async"  — the lock is set but not announced until the round trip
+--       comes back, i.e. every echo lands with every latch already up. Retained
+--       as a NAMED variant, never as the default; both postures must be run.
+--
+-- `mock.SYNC_ALL` is the paranoid upper bound: sync dispatch AND the whole round
+-- trip collapsed into the call, so BAG_UPDATE / PLAYER_EQUIPMENT_CHANGED — and
+-- therefore every PEER module's handler, not just the equip watcher — also run
+-- inside the pickup. That is not the observed live shape for a server-applied
+-- equip; it is the composition the fix may not depend on being impossible.
+--
 -- Returns a factory:
 --   local mock = dofile("equip-mock.lua")
---   local w = mock.new(P)                 -- UNKIND (the default)
+--   local w = mock.new(P)                 -- UNKIND + SYNC (the default)
+--   local w = mock.new(P, mock.ASYNC)     -- unkind, echoes on a later tick
+--   local w = mock.new(P, mock.SYNC_ALL)  -- contents dispatch in-call as well
 --   local w = mock.new(P, mock.KIND)      -- opt-in kind profile
 --   local w = mock.new(P, { settleLag = 0.05 })
+--
+-- `mock.DEFAULT_DISPATCH` is the module-level default every `mock.new` that does
+-- not name a dispatch inherits, so the runner can re-run an entire suite under
+-- the other posture without touching a single fixture.
 -- =====================================================================
 
 local Mock = {}
@@ -95,9 +133,24 @@ Mock.DEFAULT_SETTLE_LAG = 0.35
 Mock.BAG_ERROR_ID   = 44
 Mock.BAG_ERROR_TEXT = "Internal Bag Error"
 
+-- ── Dispatch (Class 9) ────────────────────────────────────────────────────────
+-- The module-level default. SYNC by doctrine: a sim for anything that mutates
+-- client state defaults to synchronous in-call dispatch, with async retained
+-- only as a named variant. The runner flips this to re-run a suite under the
+-- other posture; every mock.new that does not name a dispatch inherits it.
+Mock.DEFAULT_DISPATCH = "sync"
+
 -- The explicit opt-in kind profile: contents and locks move together, inline.
 Mock.KIND   = { profile = "kind" }
 Mock.UNKIND = { profile = "unkind" }
+
+-- Named dispatch variants.
+Mock.SYNC     = { dispatch = "sync" }
+Mock.ASYNC    = { dispatch = "async" }
+-- The paranoid upper bound: sync dispatch AND the whole round trip inside the
+-- call, so every peer module's PLAYER_EQUIPMENT_CHANGED / BAG_UPDATE handler
+-- runs inside the pickup too.
+Mock.SYNC_ALL = { dispatch = "sync", instant = true, settleLag = 0 }
 
 -- Build an item link. enchant/suffix default to 0.
 function Mock.link(id, enchant, suffix)
@@ -131,16 +184,26 @@ end
 
 function Mock.new(P, opts)
     opts = opts or {}
-    local profile = opts.profile or "unkind"
-    local kind    = (profile == "kind")
+    local profile  = opts.profile or "unkind"
+    local kind     = (profile == "kind")
+    local dispatch = opts.dispatch or (kind and "sync") or Mock.DEFAULT_DISPATCH
 
+    -- `instant` collapses the whole round trip into the call. Kind only, plus the
+    -- explicit SYNC_ALL upper bound — it is NOT what sync dispatch means.
+    local instant = kind
+    if opts.instant ~= nil then instant = opts.instant and true or false end
+
+    -- `syncLock` IS what sync dispatch means: the client-side lock is announced
+    -- from inside the call that took the item, while the lock itself stays set
+    -- until the server answers.
     local w = {
-        profile = profile,
+        profile  = profile,
+        dispatch = dispatch,
+        syncLock = (dispatch == "sync") and not instant,
         -- ── the two-phase settle ──────────────────────────────────────────
         latency   = opts.latency   or (kind and 0 or Mock.DEFAULT_LATENCY),
         settleLag = opts.settleLag or (kind and 0 or Mock.DEFAULT_SETTLE_LAG),
-        -- `instant` collapses the round trip into the call itself. Kind only.
-        instant   = (opts.instant ~= nil) and opts.instant or kind,
+        instant   = instant,
 
         bags    = {},   -- [bag] = { size = n, items = {visible}, truth = {server} }
         worn    = {},   -- [slotId] = link   (VISIBLE)
@@ -167,8 +230,10 @@ function Mock.new(P, opts)
         --                 the server no longer holds where the addon thought.
         -- `lockedIssue` — THE PERMANENT GATE: an op issued against a slot the
         --                 client itself reports LOCKED. Asserted by the SIM.
+        inCall  = 0,    -- depth of client calls we are currently inside
         stats   = { pickups = 0, drops = 0, refused = 0, applied = 0,
-                    bagErrors = 0, lockedIssue = 0, lockEvents = 0, publishes = 0 },
+                    bagErrors = 0, lockedIssue = 0, lockEvents = 0, publishes = 0,
+                    inCallEvents = 0 },
     }
     for id, def in pairs(DEFAULT_ITEMS) do
         w.items[id] = { name = def[1], equipLoc = def[2], icon = "icon" .. id }
@@ -226,14 +291,19 @@ function Mock.new(P, opts)
         if o.profile then
             self.profile = o.profile
             local k = (o.profile == "kind")
+            self.dispatch  = o.dispatch or (k and "sync") or Mock.DEFAULT_DISPATCH
             self.latency   = o.latency   or (k and 0 or Mock.DEFAULT_LATENCY)
             self.settleLag = o.settleLag or (k and 0 or Mock.DEFAULT_SETTLE_LAG)
-            self.instant   = (o.instant ~= nil) and o.instant or k
+            self.instant   = k
+            if o.instant ~= nil then self.instant = o.instant and true or false end
+            self.syncLock  = (self.dispatch == "sync") and not self.instant
             return
         end
+        if o.dispatch  ~= nil then self.dispatch  = o.dispatch end
         if o.latency   ~= nil then self.latency   = o.latency   end
         if o.settleLag ~= nil then self.settleLag = o.settleLag end
-        if o.instant   ~= nil then self.instant   = o.instant   end
+        if o.instant   ~= nil then self.instant   = o.instant and true or false end
+        self.syncLock = (self.dispatch == "sync") and not self.instant
     end
 
     -- Fill every bag slot except `keepFree` slots in bag 0, so "no room" is testable.
@@ -261,7 +331,16 @@ function Mock.new(P, opts)
     end
 
     function w:fireEvent(evt, a, b)
-        self.events[#self.events + 1] = { evt = evt, a = a, b = b, at = self.clock }
+        -- Class 9 bookkeeping: `inCall` is the depth of client calls we are
+        -- inside. An event fired at depth > 0 is one the addon's own call
+        -- dispatched — the hazard — and it is counted separately so a fixture
+        -- can prove the posture it is running under rather than assume it.
+        local inCall = (self.inCall or 0) > 0
+        self.events[#self.events + 1] = { evt = evt, a = a, b = b, at = self.clock, inCall = inCall }
+        if inCall then self.stats.inCallEvents = self.stats.inCallEvents + 1 end
+        -- A witness the fixture installs to grade what the ADDON's state looked
+        -- like at echo time, which is the only moment the hazard is visible.
+        if self.onEvent then self.onEvent(evt, a, b, inCall) end
         -- Snapshot: a handler may create a frame, and a frame created during
         -- dispatch has not registered for the event being dispatched.
         local snap = {}
@@ -270,6 +349,9 @@ function Mock.new(P, opts)
             if f._events[evt] and f._script then f._script(f, evt, a, b) end
         end
     end
+
+    -- How many events were dispatched from INSIDE a client call.
+    function w:inCallEventCount() return self.stats.inCallEvents end
 
     -- How many times an event has been fired (sim-suite bookkeeping).
     function w:countEvents(evt)
@@ -319,6 +401,22 @@ function Mock.new(P, opts)
         w.stats.publishes = w.stats.publishes + 1
     end
 
+    -- CLASS 9. The lock going ON is client-side: it needs no server, it happens
+    -- the instant the item is taken, and the client announces it from INSIDE the
+    -- call that took it. Every handler registered by every addon in the session
+    -- runs to completion here, before PickupContainerItem / PickupInventoryItem
+    -- returns — so anything the caller arms after that call is armed too late for
+    -- its own first echo, and anything that re-enters the client here re-enters
+    -- the call it is standing in.
+    local function announceLocks(touched)
+        for _, k in ipairs(touched) do
+            local kind_, a, b = parseKey(k)
+            w.stats.lockEvents = w.stats.lockEvents + 1
+            if kind_ == "bag" then w:fireEvent("ITEM_LOCK_CHANGED", a, b)
+            else w:fireEvent("ITEM_LOCK_CHANGED", a, nil) end
+        end
+    end
+
     -- The lock clears BEFORE the contents are rewritten. This is the whole
     -- point of the profile: anything that treats "unlocked" as "settled" reads
     -- the pre-operation world here.
@@ -349,11 +447,18 @@ function Mock.new(P, opts)
         w:fireEvent("BAG_UPDATE_DELAYED")
     end
 
-    -- The round-trip landing. With settleLag <= 0 this is the KIND model:
-    -- contents and lock move together. With a settle lag it is the LIVE model —
-    -- the lock clears first (ITEM_LOCK_CHANGED) and the contents catch up later
+    -- The round-trip landing. With settleLag <= 0 the lock and the contents land
+    -- together. With a settle lag it is the two-phase LIVE model — the lock
+    -- clears first (ITEM_LOCK_CHANGED) and the contents catch up later
     -- (BAG_UPDATE), and the window between them is where a lock-only "is it
     -- settled?" test reads a stale world.
+    --
+    -- `w.instant` is the CLASS 9 axis and it decides WHEN, relative to the call
+    -- that issued the move, all of that happens. Sync dispatch (the default):
+    -- inside the call, so every registered handler runs to completion before
+    -- PickupContainerItem / PickupInventoryItem returns, and anything the caller
+    -- arms AFTER the call is armed too late for its own first echo. Async: on a
+    -- later tick, i.e. with every latch already up — the blind spot.
     local function commit(touched)
         local function land()
             if (w.settleLag or 0) <= 0 then
@@ -368,6 +473,8 @@ function Mock.new(P, opts)
                 announceContents(touched)
             end)
         end
+        -- The in-call half first (Class 9), then the round trip.
+        if w.syncLock then announceLocks(touched) end
         if w.instant then land() else w:after(w.latency, land) end
     end
 
@@ -476,6 +583,19 @@ function Mock.new(P, opts)
     ---------------------------------------------------------------- API install
     local G = _G
 
+    -- Every mutating client API the addon can call goes through here, so the
+    -- "are we inside a client call?" depth is maintained in ONE place and an
+    -- error raised by a handler can never leave it stuck up (which would silently
+    -- turn every later event into a false in-call reading).
+    local function clientCall(fn)
+        return function(...)
+            w.inCall = (w.inCall or 0) + 1
+            local ok, err = pcall(fn, ...)
+            w.inCall = w.inCall - 1
+            if not ok then error(err, 0) end
+        end
+    end
+
     -- Remember every global we are about to shadow so the harness's own output
     -- (and any later suite) is never affected by the mock.
     local INSTALLED = {
@@ -518,13 +638,13 @@ function Mock.new(P, opts)
             end
             return n, 0   -- family 0 = generic container
         end,
-        PickupContainerItem = function(bag, slot)
+        PickupContainerItem = clientCall(function(bag, slot)
             if not w.bags[bag] or slot < 1 or slot > w.bags[bag].size then return end
             touchSlot(bkey(bag, slot))
-        end,
+        end),
     }
 
-    G.PickupInventoryItem = function(slot) touchSlot(wkey(slot)) end
+    G.PickupInventoryItem = clientCall(function(slot) touchSlot(wkey(slot)) end)
 
     G.GetInventoryItemLink    = function(_, slot) return w.worn[slot] end
     G.GetInventoryItemTexture = function(_, slot)
@@ -537,7 +657,7 @@ function Mock.new(P, opts)
     G.CursorHasItem    = function() return w.cursor ~= nil end
     -- Putting the cursor down returns the held item to where it came from, so
     -- nothing can ever be destroyed by a belt-and-suspenders ClearCursor().
-    G.ClearCursor      = function()
+    G.ClearCursor      = clientCall(function()
         if not w.cursor then w.holdKey, w.heldTouched = nil, nil; return end
         local k, held, detached = w.holdKey, w.cursor, w.heldDetached
         w.cursor, w.holdKey, w.heldDetached, w.heldTouched = nil, nil, false, nil
@@ -562,7 +682,7 @@ function Mock.new(P, opts)
                 end
             end
         end
-    end
+    end)
     G.SpellIsTargeting = function() return w.targeting or false end
 
     G.UnitAffectingCombat = function() return w.combat end

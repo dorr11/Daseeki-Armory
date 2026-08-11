@@ -47,6 +47,15 @@ end
 local SUITES, ORDER = {}, {}
 local function suite(name, fnc) SUITES[name] = fnc; ORDER[#ORDER + 1] = name end
 
+-- ── BOTH DISPATCH POSTURES (CLIENT_ASYNC_LESSONS.md Class 9, 2026-08-10) ──────
+-- Any suite whose body builds a client world is registered here by the world()
+-- / coldWorld() constructors, and the runner replays every one of them under the
+-- OTHER dispatch posture at the end. Class 9's blind spot is not "the sim does
+-- not echo" — it is "the sim echoes at the wrong time" — so a suite that runs
+-- under one posture only has tested half the client.
+local POSTURE_SUITES = {}
+local function posture(fnc) POSTURE_SUITES[fnc] = true; return fnc end
+
 local function near(a, b, tol)
     return math.abs((a or 0) - (b or 0)) <= (tol or 1e-9)
 end
@@ -319,6 +328,10 @@ end)
 ----------------------------------------------------------------------
 local mock = dofile(HARNESS_DIR .. "/equip-mock.lua")
 local L = mock.link
+-- What the mock SHIPS as its dispatch default, captured before the runner's
+-- second pass re-points it. Class 9's doctrine is about the default, not about
+-- which postures are reachable.
+local SHIPPED_DISPATCH = mock.DEFAULT_DISPATCH
 
 -- ── THE SETTLE DISCIPLINE (2026-08-07, audit brief A0) ───────────────────────
 -- The mock defaults to the UNKIND profile: a move locks its slots, the locks
@@ -331,13 +344,19 @@ local L = mock.link
 -- A settle is NOT a way to make a red test green: it runs the client's round
 -- trips and every pass the engine re-arms off them. Whatever is still wrong
 -- after a settle is wrong in the game too.
+--
+-- CLASS 9 (2026-08-10): the mock now also defaults to SYNCHRONOUS IN-CALL
+-- dispatch — the client's lock and its ITEM_LOCK_CHANGED happen INSIDE the
+-- pickup call, before it returns. Every fixture below therefore runs against a
+-- client that echoes at the worst possible moment, and the runner replays the
+-- whole set under the async posture afterwards.
 local function world(fnc)
-    return function(ck)
+    return posture(function(ck)
         local w = mock.new(P)
         local ok, err = pcall(fnc, ck, w, w.Addon)
         w:teardown()
         if not ok then error(err, 0) end
-    end
+    end)
 end
 
 ----------------------------------------------------------------------
@@ -356,7 +375,27 @@ suite("equip-mock-unkind-contract", world(function(ck, w, A)
     ck(w.profile == "unkind", "the mock defaults to the UNKIND profile")
     ck(w.settleLag > 0.2,
        "the default settle lag (" .. tostring(w.settleLag) .. ") exceeds equip.lua's 0.2s pass debounce")
-    ck(w.instant == false, "an unkind world never lands a move inside the call that issued it")
+    ck(w.instant == false, "an unkind world never LANDS a move inside the call that issued it")
+
+    -- ── RE-BASED, Class 9 (2026-08-10) ───────────────────────────────────────
+    -- This block used to assert only `w.instant == false` and read it as "nothing
+    -- happens inside the call". That is the blind spot CLIENT_ASYNC_LESSONS.md
+    -- Class 9 names verbatim: the sims delivered every event AFTER the mutating
+    -- call returned, i.e. with every latch already up, so the async posture
+    -- tested the fix and never the hazard. LANDING and ANNOUNCING are two
+    -- different questions, and only the first one was ever asked here.
+    --
+    -- The move still lands on a round trip. What is new is that the CLIENT-SIDE
+    -- half — the lock, which needs no server — is announced from inside the call,
+    -- which is what the live client does and what every arm-ordering defect in
+    -- the suite needs in order to be visible at all.
+    -- (The runner replays this suite under async, where the same world is built
+    --  with the other posture; the DEFAULT is what is being asserted.)
+    ck(SHIPPED_DISPATCH == "sync",
+       "…and the shipped default is SYNCHRONOUS IN-CALL dispatch, never async")
+    ck(w.dispatch == mock.DEFAULT_DISPATCH, "…which every world inherits unless it names one")
+    ck(w.syncLock == (w.dispatch == "sync"),
+       "…and sync dispatch announces the lock it takes before the call returns")
 
     ------------------------------------------------------------ lock, then settle
     w:setBag(0, 1, L(3001))
@@ -371,12 +410,28 @@ suite("equip-mock-unkind-contract", world(function(ck, w, A)
     ck(w:isLocked("w1") and w:isLocked("b0:1"), "both touched slots are locked")
     ck(GetInventoryItemLink("player", 1) == nil, "GetInventoryItemLink reads the pre-op world")
     ck(IsInventoryItemLocked(1) == true, "IsInventoryItemLocked reports the in-flight lock")
-    ck(w:countEvents("ITEM_LOCK_CHANGED") == 0, "no lock event has fired yet")
+
+    -- ── RE-BASED, Class 9 (2026-08-10) ───────────────────────────────────────
+    -- This assertion read `w:countEvents("ITEM_LOCK_CHANGED") == 0` — "no lock
+    -- event has fired yet". It was the blind spot itself, written down as a
+    -- requirement: it demanded that the client stay silent through the very call
+    -- in which it takes the lock. Under sync dispatch the lock is announced
+    -- inside PickupInventoryItem, and everything armed after that call is armed
+    -- too late for it.
+    local lockEvents = w:countEvents("ITEM_LOCK_CHANGED")
+    if w.dispatch == "sync" then
+        ck(lockEvents == 2, "the lock going ON is announced INSIDE the call, once per touched slot")
+        ck(w.stats.inCallEvents == 2, "…and both echoes are counted as in-call")
+    else
+        ck(lockEvents == 0, "async dispatch says nothing until the round trip")
+        ck(w.stats.inCallEvents == 0, "…so nothing was dispatched inside the call")
+    end
 
     -- the lock releases FIRST …
     w:settle(w.latency)
     ck(w:isLocked("w1") == false and w:isLocked("b0:1") == false, "the locks clear on the round trip")
-    ck(w:countEvents("ITEM_LOCK_CHANGED") == 2, "ITEM_LOCK_CHANGED fires once per touched slot")
+    ck(w:countEvents("ITEM_LOCK_CHANGED") == lockEvents + 2,
+       "ITEM_LOCK_CHANGED fires once per touched slot as the lock comes off too")
     ck(w.worn[1] == nil, "THE CONTENTS ARE STILL PRE-OP after the locks released")
     ck(w:bagOf(0, 1) == L(3001), "…the source slot still shows the item it no longer holds")
     ck(w:countEvents("BAG_UPDATE_DELAYED") == 0, "…and no bag event has landed")
@@ -1446,6 +1501,206 @@ suite("equip-combat-weapon-split", world(function(ck, w, A)
     ck(w2.Addon._pendingSkip ~= nil and w2.Addon._pendingSkip[16] == true,
        "ArmEquipSecure() marks the weapon slots as secure-handled")
     w2:teardown()
+end))
+
+----------------------------------------------------------------------
+-- CLASS 9 — SYNCHRONOUS IN-CALL EVENT DISPATCH (audit 2026-08-10)
+--
+-- CLIENT_ASYNC_LESSONS.md Class 9: the client does not always SCHEDULE the event
+-- a mutating call causes. Taking an item locks its slots client-side and the
+-- client announces that from inside PickupContainerItem / PickupInventoryItem,
+-- so every handler in the session runs to completion before the call returns.
+--
+-- A wave is a SEQUENCE of those calls whose predictions are recorded as each one
+-- returns. So there is a window inside every wave where the world is half-written
+-- and `run.inflight` does not describe it, and the whole question is what a
+-- handler standing in that window is allowed to conclude.
+----------------------------------------------------------------------
+suite("class9-equip-in-call-dispatch", world(function(ck, w, A)
+    -- A three-slot set, so the wave really is a sequence and there is an inside
+    -- to be caught in.
+    local function threeWay(world_)
+        world_:setWorn(1,  L(3002)); world_:setBag(0, 1, L(3001))
+        world_:setWorn(11, L(1002)); world_:setBag(0, 2, L(1001))
+        world_:setWorn(12, L(1003)); world_:setBag(0, 3, L(1002))
+        world_:defineSet("S", { [1] = L(3001), [11] = L(1001), [12] = L(1002) })
+    end
+
+    ------------------------------------------------------------ the posture
+    ck(w.dispatch == "sync" or w.dispatch == "async", "the world names its dispatch posture")
+
+    ------------------------------------------------------------ RC-A: the watcher
+    -- ARM BEFORE THE FIRST CLIENT CALL. The watcher used to be created inside
+    -- WatchSettle, which runs AFTER the whole wave has gone out — so on the first
+    -- step of every run the frame did not exist yet and the run's own first
+    -- echoes were dispatched to nobody. RED CONTROL: at the first echo of a fresh
+    -- run, the watcher must already exist and already carry THIS run's gen.
+    threeWay(w)
+    local firstEcho = nil
+    w.onEvent = function(evt, a, b, inCall)
+        if evt ~= "ITEM_LOCK_CHANGED" or firstEcho ~= nil then return end
+        local r, lw = A._run, A._lockWatcher
+        firstEcho = {
+            inCall  = inCall,
+            armed   = (lw ~= nil) and (r ~= nil) and (lw._gen == r.gen),
+            inflight = r and #r.inflight or -1,
+        }
+    end
+    A:EquipSet("S")
+    if w.dispatch == "sync" then
+        ck(firstEcho ~= nil, "the run's first move produces a lock echo inside the call itself")
+        ck(firstEcho and firstEcho.inCall == true,
+           "…and under sync dispatch that echo arrives INSIDE the client call")
+    end
+    w:settle()
+    ck(firstEcho ~= nil, "the run's first move produces a lock echo")
+    ck(firstEcho and firstEcho.armed == true,
+       "RED CONTROL: the settle watcher is armed for THIS run before its first echo lands")
+    ck(A:IsSetEquipped("S"), "the set converges")
+    ck(A.db.currentSet == "S", "…and the census marks it current")
+    ck(w.stats.bagErrors == 0 and w.stats.lockedIssue == 0, "…with no refusal of any kind")
+    w.onEvent = nil
+
+    ------------------------------------------------------------ RC-B: re-entry
+    -- SettleCheck is PUBLIC. Under sync dispatch a peer handler that asks "has the
+    -- wave settled?" from the client's own echo is standing INSIDE the wave, over
+    -- an in-flight list that does not yet describe what has been issued.
+    --
+    -- RED CONTROL. Without the issuing latch this check retires an empty in-flight
+    -- list, calls the half-issued wave settled, takes the next step against a
+    -- mid-operation world and finishes the run on a plan derived from it: the gear
+    -- lands anyway (the sim applies what was issued) but the run ENDS UNCONVERGED
+    -- and `db.currentSet` is left nil — the set the player just equipped does not
+    -- read as equipped.
+    local w2 = mock.new(P)
+    local B  = w2.Addon
+    threeWay(w2)
+    local probes = 0
+    w2.onEvent = function(evt, a, b, inCall)
+        if evt ~= "ITEM_LOCK_CHANGED" then return end
+        local r = B._run
+        if not r then return end
+        probes = probes + 1
+        B:SettleCheck(r.gen)               -- the peer's question, at the worst moment
+    end
+    B:EquipSet("S")
+    w2:settle()
+    ck(probes > 0, "the peer handler did ask, repeatedly")
+    ck(B:IsSetEquipped("S"), "RED CONTROL: the set still converges under a re-entrant settle check")
+    ck(B.db.currentSet == "S",
+       "RED CONTROL: …and is still marked current — the run's verdict is not lost")
+    ck(w2.stats.bagErrors == 0,
+       "RED CONTROL: …and no landed move is re-issued (no ERR_INTERNAL_BAG_ERROR)")
+    if w2.dispatch == "sync" then
+        ck((B._settleDeferrals or 0) > 0,
+           "…because the checks that landed mid-wave were REFUSED and re-armed, not answered")
+    end
+    w2:teardown()
+
+    ------------------------------------------------------------ RC-C: the fuse
+    -- A pass re-entered from inside its own wave has no legitimate depth. It
+    -- refuses and leaves a count behind rather than planning against a world that
+    -- is half written.
+    local w3 = mock.new(P)
+    local C  = w3.Addon
+    threeWay(w3)
+    w3.onEvent = function(evt, a, b, inCall)
+        if evt ~= "ITEM_LOCK_CHANGED" or not inCall then return end
+        local r = C._run
+        if r then C:EquipPass(r.name, (r.step or 1) + 1) end
+    end
+    C:EquipSet("S")
+    w3:settle()
+    ck(C:IsSetEquipped("S"), "RED CONTROL: a pass re-entered from inside its own wave still converges")
+    ck(C.db.currentSet == "S", "…and still marks the set current")
+    ck(w3.stats.bagErrors == 0, "…with no re-issued move")
+    if w3.dispatch == "sync" then
+        ck((C._equipReentries or 0) > 0, "…because the depth fuse REFUSED the nested pass and recorded it")
+        ck(C._equipReentryAt == "EquipPass", "…naming WHERE the refusal happened")
+    end
+    w3:teardown()
+
+    ------------------------------------------------------------ RC-D: the cursor
+    -- ClearCursorBackstop is itself a client call, and under sync dispatch it
+    -- dispatches from inside itself. Nothing may be lost or left held.
+    local w4 = mock.new(P)
+    local D  = w4.Addon
+    threeWay(w4)
+    local function itemCount(world_)
+        local n = 0
+        for _, bag in ipairs({ 0, 1, 2, 3, 4 }) do
+            for slot = 1, world_.bags[bag].size do
+                if world_.bags[bag].truth[slot] then n = n + 1 end
+            end
+        end
+        for _, link in pairs(world_.wornTruth) do if link then n = n + 1 end end
+        return n
+    end
+    local before = itemCount(w4)
+    D:EquipSet("S")
+    w4:settle()
+    ck(itemCount(w4) == before, "no item is created or destroyed across a whole swap")
+    ck(w4.cursor == nil, "the cursor is empty when the run ends")
+    ck(D:IsSetEquipped("S"), "…and the set is on")
+    w4:teardown()
+
+    ------------------------------------------------------------ THE COMPOSED LEG
+    -- plan -> pickup -> place -> settle -> verify, under BOTH postures, with the
+    -- client calls counted. The posture may change WHEN the client speaks; it may
+    -- not change WHAT the engine does, and the call counts are how that is stated
+    -- without appealing to the engine's own opinion of itself.
+    local function leg(opts)
+        local x = mock.new(P, opts)
+        local X = x.Addon
+        threeWay(x)
+        local plan = X:PlanSet(X:GetSet("S"), X:BuildCensus())
+        X:EquipSet("S")
+        x:settle()
+        local out = {
+            planned  = #plan,
+            pickups  = x.stats.pickups,
+            drops    = x.stats.drops,
+            refused  = x.stats.refused,
+            bagErr   = x.stats.bagErrors,
+            locked   = x.stats.lockedIssue,
+            applied  = x.stats.applied,
+            inCall   = x.stats.inCallEvents,
+            equipped = X:IsSetEquipped("S"),
+            current  = X.db.currentSet,
+            worn     = { x.worn[1], x.worn[11], x.worn[12] },
+            cursor   = x.cursor,
+        }
+        x:teardown()
+        return out
+    end
+
+    local s, a = leg(mock.SYNC), leg(mock.ASYNC)
+    ck(s.planned == 3 and a.planned == 3, "the plan is three ops in both postures")
+    ck(s.equipped and a.equipped, "the composed leg converges in both postures")
+    ck(s.current == "S" and a.current == "S", "…and marks the set current in both")
+    ck(s.cursor == nil and a.cursor == nil, "…leaving nothing on the cursor in either")
+    ck(s.bagErr == 0 and a.bagErr == 0, "…and raising no bag error in either")
+    ck(s.locked == 0 and a.locked == 0, "…and never issuing against a locked slot in either")
+    ck(s.pickups == a.pickups,
+       "SAME CALL COUNT: " .. s.pickups .. " pickups either way — dispatch timing is not a behaviour")
+    ck(s.drops == a.drops, "SAME CALL COUNT: " .. s.drops .. " drops either way")
+    ck(s.refused == a.refused, "SAME CALL COUNT: " .. s.refused .. " refusals either way")
+    ck(s.applied == a.applied, "SAME LANDINGS: " .. s.applied .. " round trips either way")
+    for i, slot in ipairs({ 1, 11, 12 }) do
+        ck(s.worn[i] == a.worn[i], "slot " .. slot .. " ends identical in both postures")
+    end
+    ck(s.inCall > 0, "the sync leg really did dispatch inside the client's calls")
+    ck(a.inCall == 0, "…and the async leg really did not — the postures are distinguishable")
+
+    ------------------------------------------------------------ the upper bound
+    -- SYNC_ALL: the whole round trip inside the call, so a peer module's
+    -- PLAYER_EQUIPMENT_CHANGED handler also runs mid-gesture. Not the observed
+    -- live shape for a server-applied equip — the composition the fix may not
+    -- depend on being impossible.
+    local u = leg(mock.SYNC_ALL)
+    ck(u.equipped, "the set converges even with the whole round trip inside the call")
+    ck(u.current == "S", "…and is marked current")
+    ck(u.cursor == nil and u.bagErr == 0 and u.locked == 0, "…with nothing held and nothing refused")
 end))
 
 -- SavedVariables additivity: a set written by the released build must load, plan
@@ -5518,14 +5773,19 @@ end)
 -- =====================================================================
 local cold = dofile(HARNESS_DIR .. "/cold-mock.lua")
 
+-- CLASS 9 (2026-08-10): the cold world has a dispatch axis too. Its mutating
+-- client call is C_Item.RequestLoadItemDataByID, and on a build that already
+-- holds the data the client answers it from INSIDE the request — every
+-- GET_ITEM_INFO_RECEIVED handler in the session runs before the request returns.
+-- Sync is the default; the runner replays every cold suite under async.
 local function coldWorld(opts, fnc)
     if type(opts) == "function" then opts, fnc = nil, opts end
-    return function(ck)
+    return posture(function(ck)
         local w = cold.new(P, opts)
         local ok, err = pcall(fnc, ck, w, w.Addon)
         w:teardown()
         if not ok then error(err, 0) end
-    end
+    end)
 end
 
 -- Read a shipped file as one string (CRLF-safe: every pin below is single-line).
@@ -6003,6 +6263,197 @@ suite("keybind-macro-warmth",
 end))
 
 ----------------------------------------------------------------------
+-- CLASS 9 (cold side) — THE ANSWER THAT ARRIVES INSIDE THE ASK
+--
+-- The item-data axis has a mutating client call too: C_Item.RequestLoadItemDataByID.
+-- For an item the client does NOT hold it sends a query and answers later. For
+-- one it ALREADY HOLDS it answers immediately — and immediately means from inside
+-- the request, with every GET_ITEM_INFO_RECEIVED / ITEM_DATA_LOAD_RESULT handler
+-- in the session running to completion before the call returns.
+--
+-- Both callers that matter make that request from inside a loop whose RESULT —
+-- the counter their own handler gates on — is only published when the loop ends.
+-- So the echo is read against the PREVIOUS pass's count, which on the common path
+-- is zero, and the one answer the client was ever going to volunteer is dropped.
+----------------------------------------------------------------------
+suite("class9-cold-in-call-dispatch", coldWorld(function(ck, w, A)
+    local SHIELD = 5001
+    w.class = "WARRIOR"
+    w:equip(17, SHIELD)
+    A:InitStats()
+
+    -- STATE 3a: the client HOLDS the shield — so it will answer our load request
+    -- from inside the call — but its tooltip is not built, so the body walk still
+    -- reads title-only and the scan cannot prove the slot. This is the state
+    -- stats.lua's own comment names, and the only one in which the addon asks the
+    -- client for something it can answer in-call.
+    w:residentButUnrendered(SHIELD)
+    ck(C_Item.IsItemDataCachedByID(SHIELD) == true, "the client says it holds the item")
+    ck(GetItemInfo("item:" .. SHIELD) ~= nil, "…and can name it")
+
+    ------------------------------------------------------------ RED CONTROL
+    -- A settled prior scan: nothing unproven, which is the ordinary state and the
+    -- one that makes the stale gate read false.
+    A:InvalidateStatGearCache()
+    A._statGearUnproven = 0
+    A._statsDirty       = false
+    local budget0 = A._statWarmBudget
+
+    ck(w:read("Defense", "Block Value") == "—", "the unrendered slot cannot be proven: the row is UNKNOWN")
+    ck(w:loadsFor(SHIELD) > 0, "…and the client was asked for it")
+    ck((A._statGearUnproven or 0) == 1, "…and the scan published its unproven count")
+
+    if w.dispatch == "sync" then
+        ck(w.stats.inCallEvents > 0, "the client answered from INSIDE the request")
+        -- Without the scan latch the handler reads the PREVIOUS scan's counter —
+        -- 0 — drops the answer, spends no credit and schedules no repaint. The
+        -- panel then renders "—" for a slot whose data has in fact arrived, and
+        -- nothing repaints it until the next gear change or loading screen.
+        ck(A._statWarmBudget == budget0 - 1,
+           "RED CONTROL: the in-call answer is CONSUMED, not dropped (a repaint credit was spent)")
+        ck(A._statsDirty == true,
+           "RED CONTROL: …and a repaint is scheduled, so the row can heal without a gear change")
+    else
+        ck(w.stats.inCallEvents == 0, "async dispatch answers on a later tick")
+    end
+    w:settle()
+
+    ------------------------------------------------------------ …and it heals
+    -- The tooltip is finally built. The client does NOT announce again — it
+    -- already said it had the item — so the ONLY thing that can produce the right
+    -- number is the repaint the in-call answer earned.
+    w:renderTooltip(SHIELD, true)
+    w:settle()
+    ck(w:read("Defense", "Block Value") == "57",
+       "once the body renders, the honest answer is 57 — and the scan was never memoized short")
+    ck((A._statGearUnproven or 0) == 0, "…with nothing left unproven")
+
+    ------------------------------------------------------------ THE BOUND
+    -- The credit ceiling is what keeps an item that never renders from re-scanning
+    -- eighteen tooltips forever. Our own echo must spend it like any other.
+    local w2 = cold.new(P)
+    local B  = w2.Addon
+    w2.class = "WARRIOR"
+    w2:equip(17, SHIELD)
+    B:InitStats()
+    w2:residentButUnrendered(SHIELD)
+    local start = B._statWarmBudget
+    for _ = 1, start + 10 do
+        B:InvalidateStatGearCache()
+        w2:read("Defense", "Block Value")
+        w2:settle()
+    end
+    ck(B._statWarmBudget == 0, "a slot that never renders spends the budget and STOPS")
+    ck(w2:read("Defense", "Block Value") == "—", "…and the row is still honest, not a short number")
+    w2:fireEvent("PLAYER_EQUIPMENT_CHANGED", 17)
+    ck(B._statWarmBudget == start, "new gear re-arms it — a new warmth question")
+    w2:teardown()
+
+    ------------------------------------------------------------ the latch itself
+    ck(A:InStatGearScan() == false, "the scan latch is down outside a scan")
+    ck(type(A.InStatGearScan) == "function",
+       "…and is PUBLISHED, so a peer module's handler can tell our echo from a real one")
+
+    ------------------------------------------------------------ REGRESSION PINS
+    local s = slurp("stats.lua")
+    if s then
+        ck(s:find("InStatGearScan") ~= nil, "PIN: the gear-scan latch exists and is published")
+        ck(s:find("_statScanEcho") ~= nil, "PIN: …and an echo during a scan is recorded, not acted on")
+        ck(s:find("local ok, scan = pcall%(scanGearInner%)") ~= nil,
+           "PIN: …with the scan pcall-wrapped so a raising handler cannot wedge the latch up")
+    end
+
+    ------------------------------------------------------------ THE CLEAN SITES
+    -- Two call sites audited clean under sync dispatch, pinned so they stay that
+    -- way. Both are clean for the SAME reason, which is the whole fix shape: the
+    -- record the echo's handler reads is written BEFORE the client call is made.
+    local sc = slurp("itemScan.lua")
+    if sc then
+        -- itemScan's dispatch loop: inflight is armed, THEN the request goes out,
+        -- and ScanItemLoaded refuses anything not in inflight — so an answer that
+        -- arrives inside requestLoad finds its own record already there.
+        local dispatchBlock = sc:match("ST%.inflight%[id%] = now.-requestLoad%(id%)")
+        ck(dispatchBlock ~= nil,
+           "PIN: itemScan arms ST.inflight BEFORE requestLoad — the echo finds its own record")
+        ck(sc:find("if not ST%.inflight%[itemID%] then return end") ~= nil,
+           "PIN: …and ScanItemLoaded refuses an answer it has no record for")
+    end
+    local gp = slurp("goalPicker.lua")
+    if gp then
+        -- goalPicker's row loop: the handler latches _refreshPending on entry,
+        -- before it does anything, so a burst of in-call answers costs one requery.
+        ck(gp:find("self%._refreshPending = true") ~= nil,
+           "PIN: goalPicker's item-info handler latches on ENTRY, before any work")
+        ck(gp:find("if not self:IsShown%(%) or self%._refreshPending then return end") ~= nil,
+           "PIN: …and re-entry inside the same burst is refused")
+    end
+end))
+
+----------------------------------------------------------------------
+-- CLASS 9 — the macro rewrite may not start a macro rewrite
+--
+-- RefreshSetMacros / ApplySetBindings publish `_macroMissing` only when their
+-- rewrite loop ends, and that loop is what makes the client calls. A handler
+-- that fires from inside one of them and asks for another rewrite used to be
+-- coalesced ONLY on the C_Timer path; the no-C_Timer fallback rewrote inline,
+-- with no latch, so the ask recursed without bound — the C-stack overflow shape
+-- Class 9's proven incident ends in.
+----------------------------------------------------------------------
+suite("class9-macro-rewrite-latch",
+      coldWorld({ files = { "statmath.lua", "sets.lua", "equip.lua", "keybind.lua" } },
+                function(ck, w, A)
+    local MH = 6001
+    w:defineSet("Tank", { [16] = MH }, "CTRL-1")
+
+    ck(A:InMacroRewrite() == false, "the rewrite latch is down outside a rewrite")
+    ck(type(A.InMacroRewrite) == "function",
+       "…and is PUBLISHED, so a peer module's handler can tell our rewrite from a real event")
+
+    A:ApplySetBindings()
+    ck((A._macroMissing or 0) == 1, "the cold main hand is counted")
+    ck(A:InMacroRewrite() == false, "…and the latch came back down when the rewrite returned")
+
+    ------------------------------------------------------------ RED CONTROL
+    -- Stand in for any handler that reacts to an in-call echo by asking for
+    -- another rewrite, on the client where there is nothing to defer with. Before
+    -- the latch this recursed: QueueMacroRefresh -> RefreshSetMacros ->
+    -- BuildSetMacroText -> (echo) -> QueueMacroRefresh -> … to a stack overflow.
+    local realTimer = _G.C_Timer
+    _G.C_Timer = nil
+    local realBuild, depth, maxDepth = A.BuildSetMacroText, 0, 0
+    A.BuildSetMacroText = function(self, name)
+        depth = depth + 1
+        if depth > maxDepth then maxDepth = depth end
+        if depth > 50 then depth = depth - 1; error("RUNAWAY: macro rewrite recursed", 0) end
+        A:QueueMacroRefresh()                  -- the handler's ask, from inside the call
+        local text, miss = realBuild(self, name)
+        depth = depth - 1
+        return text, miss
+    end
+
+    local ok, err = pcall(function() A:RefreshSetMacros() end)
+    A.BuildSetMacroText = realBuild
+    _G.C_Timer = realTimer
+
+    ck(ok == true, "RED CONTROL: a rewrite asked for from inside a rewrite does not recurse"
+       .. (ok and "" or (" -> " .. tostring(err))))
+    ck(maxDepth == 1, "RED CONTROL: …no rewrite ever ran inside another one")
+    ck((A._macroRewriteReentries or 0) > 0, "…the re-entrant asks were REFUSED and counted")
+    ck((A._macroRewriteRefusals or 0) > 0,
+       "…and the follow-up chain hit its depth fuse rather than running forever")
+    ck(A:InMacroRewrite() == false, "…and the latch is down again afterwards")
+
+    ------------------------------------------------------------ REGRESSION PINS
+    local k = slurp("keybind.lua")
+    if k then
+        ck(k:find("InMacroRewrite") ~= nil, "PIN: the rewrite latch exists and is published")
+        ck(k:find("withRewriteLatch") ~= nil, "PIN: …and both rewrite entry points run under it")
+        ck(k:find("local ok, err = pcall%(fn%)") ~= nil,
+           "PIN: …pcall-wrapped, so a raising handler cannot wedge it up")
+    end
+end))
+
+----------------------------------------------------------------------
 -- ARM-4 — the spellbook latch has to be EARNED (Class 5/6)
 --
 -- "`_spellbookIndexed = true` is set BEFORE the API-availability guard and before
@@ -6167,20 +6618,39 @@ print("    repo: " .. ARMORY_DIR)
 print("")
 
 local totalFail, totalCheck = 0, 0
-for _, name in ipairs(ORDER) do
+local function runSuite(name, fnc, label)
     local fails, checks = {}, 0
     local function ck(cond, msg)
         checks = checks + 1
         if not cond then fails[#fails + 1] = msg end
     end
-    local sok, serr = pcall(SUITES[name], ck)
+    local sok, serr = pcall(fnc, ck)
     if not sok then fails[#fails + 1] = "SUITE RAISED: " .. tostring(serr) end
     totalCheck = totalCheck + checks
     totalFail  = totalFail + #fails
 
-    print(string.format("  [%s] %-24s (%d checks)", #fails > 0 and "FAIL" or "PASS", name, checks))
+    print(string.format("  [%s] %-30s (%d checks)", #fails > 0 and "FAIL" or "PASS",
+          name .. (label or ""), checks))
     for _, f in ipairs(fails) do print("        FAIL :: " .. tostring(f)) end
 end
+
+for _, name in ipairs(ORDER) do runSuite(name, SUITES[name]) end
+
+-- ── THE SECOND POSTURE ────────────────────────────────────────────────────────
+-- Class 9's fix shape ends "both dispatch postures must be run". The first pass
+-- above ran every world suite under SYNC dispatch (the doctrine default); this
+-- one replays them under ASYNC, which is what the client does on the builds
+-- where the event really is scheduled. A defect that only shows under one of the
+-- two is still a defect: neither posture is the control.
+print("")
+print("  ── replaying every client-world suite under ASYNC dispatch ──")
+mock.DEFAULT_DISPATCH = "async"
+cold.DEFAULT_DISPATCH = "async"
+for _, name in ipairs(ORDER) do
+    if POSTURE_SUITES[SUITES[name]] then runSuite(name, SUITES[name], " [async]") end
+end
+mock.DEFAULT_DISPATCH = "sync"
+cold.DEFAULT_DISPATCH = "sync"
 
 print("")
 print("############################################################")

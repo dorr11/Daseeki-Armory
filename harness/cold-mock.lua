@@ -31,10 +31,21 @@
 --      TextLeft1 carries the item name. This is the proven live shape (Armory's
 --      own classMask-0 incident; Nexus's title-only chronoboon read), and it is
 --      why a body walk that sums to 0 is indistinguishable from a real zero.
---   3. REQUESTING IS NOT RECEIVING. RequestLoadItemDataByID is COUNTED and does
---      nothing else. The fixture decides when — and whether — the answer ever
---      arrives, because "the server never sent that item this session" is the
---      scenario ARM-3 is about.
+--   3. REQUESTING IS NOT RECEIVING. RequestLoadItemDataByID is COUNTED, and for
+--      an item the client does NOT hold nothing else happens: the fixture decides
+--      when — and whether — the answer ever arrives, because "the server never
+--      sent that item this session" is the scenario ARM-3 is about.
+--      BUT (Class 9, 2026-08-10) for an item the client ALREADY HOLDS the answer
+--      is immediate, and immediate means FROM INSIDE THE REQUEST: the client
+--      dispatches ITEM_DATA_LOAD_RESULT to every registered handler in the
+--      session before RequestLoadItemDataByID returns. That is the whole hazard,
+--      and the state it needs is 3a.
+--   3a. RESIDENT IS NOT RENDERED. `w:residentButUnrendered(id)` is the third
+--      state — the one stats.lua's own comment names: "an item the client thinks
+--      it has cached but whose tooltip has not been built yet". C_Item says
+--      cached, GetItemInfo answers, and the TOOLTIP still renders title-only. It
+--      is the only state in which the addon asks for something the client can
+--      answer in-call, so it is the state the Class 9 fixtures use.
 --   4. DELIVERY IS AN EVENT. w:warmItem(id) fires GET_ITEM_INFO_RECEIVED(id,
 --      true). Code that does not listen does not heal, and the sim will not
 --      heal it by hand. w:warmItem(id, true) delivers SILENTLY, which is how a
@@ -60,6 +71,14 @@ local Cold = {}
 
 Cold.WARM = { profile = "warm" }
 Cold.COLD = { profile = "cold" }
+
+-- ── Dispatch (CLIENT_ASYNC_LESSONS.md Class 9) ────────────────────────────────
+-- SYNC by doctrine: when the client can answer a load request it answers from
+-- inside the call. The runner flips this module-level default to replay every
+-- cold suite under async; every cold.new that does not name a dispatch inherits it.
+Cold.DEFAULT_DISPATCH = "sync"
+Cold.SYNC  = { dispatch = "sync" }
+Cold.ASYNC = { dispatch = "async" }
 
 -- Slot ids in the order core.lua's Addon.SLOTS declares them.
 local SLOT_IDS = { 1, 2, 3, 15, 5, 4, 19, 9, 10, 6, 7, 8, 11, 12, 13, 14, 16, 17, 18 }
@@ -142,8 +161,11 @@ function Cold.new(P, opts)
     local bornWarm = (profile == "warm")
 
     local w = {
-        profile = profile,
+        profile  = profile,
+        dispatch = opts.dispatch or Cold.DEFAULT_DISPATCH,
+        inCall   = 0,      -- depth of client calls we are currently inside
         warm    = {},      -- [itemId] = true once the client holds its data
+        tipCold = {},      -- [itemId] = true when resident but NOT rendered (3a)
         worn    = {},      -- [slotId] = link
         items   = {},      -- [itemId] = definition
         frames  = {},
@@ -162,6 +184,7 @@ function Cold.new(P, opts)
         class = "WARRIOR",
         stats = {
             loadRequests = 0,       -- every RequestLoadItemDataByID
+            inCallEvents = 0,       -- …that the client answered from INSIDE the call
             tooltipScans = 0,       -- every SetInventoryItem
             coldScans    = 0,       -- …that rendered title-only
             talentReads  = 0,       -- every GetTalentInfo
@@ -229,7 +252,10 @@ function Cold.new(P, opts)
 
     ---------------------------------------------------------------- events
     function w:fireEvent(evt, a, b)
-        self.events[#self.events + 1] = { evt = evt, a = a, b = b, at = self.clock }
+        local inCall = (self.inCall or 0) > 0
+        self.events[#self.events + 1] = { evt = evt, a = a, b = b, at = self.clock, inCall = inCall }
+        if inCall then self.stats.inCallEvents = self.stats.inCallEvents + 1 end
+        if self.onEvent then self.onEvent(evt, a, b, inCall) end
         local snap = {}
         for i, f in ipairs(self.frames) do snap[i] = f end
         for _, f in ipairs(snap) do
@@ -276,7 +302,26 @@ function Cold.new(P, opts)
         if not id then return end
         local first = not self.warm[id]
         self.warm[id] = true
+        self.tipCold[id] = nil
         if first and not silent then self:fireEvent("GET_ITEM_INFO_RECEIVED", id, true) end
+    end
+
+    -- STATE 3a (Class 9). The client HOLDS the item — C_Item says cached and
+    -- GetItemInfo answers its name — but the tooltip has not been built, so a
+    -- body walk still reads title-only. This is the only state in which the
+    -- addon asks the client for something it can answer immediately, and
+    -- "immediately" is what dispatches the echo from inside the request.
+    function w:residentButUnrendered(id)
+        if not id then return end
+        self.warm[id]    = true
+        self.tipCold[id] = true
+    end
+
+    -- The tooltip finally gets built. Announces itself, as the client does.
+    function w:renderTooltip(id, silent)
+        if not id then return end
+        self.tipCold[id] = nil
+        if not silent then self:fireEvent("GET_ITEM_INFO_RECEIVED", id, true) end
     end
 
     -- Warm everything currently equipped (and nothing else — an item nobody is
@@ -323,7 +368,10 @@ function Cold.new(P, opts)
         local def = self.items[id]
         if not def then return nil end
         local out = { def.name }
-        if not self.warm[id] then return out end        -- TITLE-ONLY: the Class 4 shape
+        -- TITLE-ONLY: the Class 4 shape. Either the client does not hold the item
+        -- at all, or it holds it and has not built the tooltip yet (state 3a) —
+        -- indistinguishable to a body walk, which is the trap.
+        if not self.warm[id] or self.tipCold[id] then return out end
         out[#out + 1] = "Binds when picked up"
         out[#out + 1] = (def.equipLoc or "INVTYPE_MISC"):gsub("^INVTYPE_", "")
         if def.armor then out[#out + 1] = def.armor .. " Armor" end
@@ -492,11 +540,26 @@ function Cold.new(P, opts)
                 id = idFromLink(id)
                 return w.warm[id] == true
             end,
+            -- CLASS 9. Counted always. Answered ONLY when the client already
+            -- holds the item — and then answered from INSIDE this call under
+            -- sync dispatch, so every handler in the session runs before the
+            -- request returns. An item the client does not hold answers nothing:
+            -- requesting is still not receiving.
             RequestLoadItemDataByID = function(id)
                 id = idFromLink(id)
                 if not id then return end
                 w.stats.loadRequests = w.stats.loadRequests + 1
                 w.loadRequested[id] = (w.loadRequested[id] or 0) + 1
+                if not w.warm[id] then return end
+                local function answer() w:fireEvent("ITEM_DATA_LOAD_RESULT", id, true) end
+                if w.dispatch == "sync" then
+                    w.inCall = (w.inCall or 0) + 1
+                    local ok, err = pcall(answer)
+                    w.inCall = w.inCall - 1
+                    if not ok then error(err, 0) end
+                else
+                    w:after(0, answer)
+                end
             end,
         }
     else
