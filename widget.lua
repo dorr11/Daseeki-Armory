@@ -52,8 +52,13 @@ function Addon:InitWidget()
         self:StopMovingOrSizing()
         SaveWidgetPos(self)
     end)
+    -- EFFECTIVE mode, not the stored one. The stored value can be "chat", which
+    -- is a PLACEMENT that needs Daseeki-Chat's panel: without it the swapper
+    -- falls back to the shipped default (radial) rather than to nothing. For
+    -- "radial" and "dropdown" the effective answer IS the stored one, so those
+    -- two paths are unchanged.
     local function openSwitcher(self)
-        if Addon.db.settings.widget.mode == "dropdown" then
+        if Addon:EffectiveSwapperMode() == "dropdown" then
             Addon:ShowSetDropdown(self)
         else
             Addon:ShowRadial()
@@ -61,7 +66,7 @@ function Addon:InitWidget()
     end
     anchor:SetScript("OnClick", function(self)
         if Addon.db.settings.widget.openTrigger == "hover" then return end  -- hover already opens it
-        if Addon.db.settings.widget.mode == "dropdown" then
+        if Addon:EffectiveSwapperMode() == "dropdown" then
             openSwitcher(self)
         else
             Addon:ToggleRadial()
@@ -182,7 +187,14 @@ function Addon:RefreshWidget()
     local cur = Addon.db.currentSet and Addon.db.sets[Addon.db.currentSet]
     a.icon:SetTexture((cur and cur.icon) or Addon.DEFAULT_ICON)
 
-    if w.show then
+    -- THE "Chat" PLACEMENT: the column docked to the chat panel IS the swapper,
+    -- so the floating anchor button (and its radial, and its flyout) stand down
+    -- while it is up. This branch is reachable ONLY when the mode is "chat" AND
+    -- Daseeki-Chat answers — every other configuration takes the path below
+    -- exactly as it did before.
+    local docked = Addon.ChatDockActive and Addon:ChatDockActive() or false
+
+    if w.show and not docked then
         a:Show()
     else
         a:Hide(); a.radial:Hide()
@@ -191,12 +203,20 @@ function Addon:RefreshWidget()
 
     -- "Always Open" (icon type only): keep the icon flyout permanently shown,
     -- bypassing hover/click entirely.
-    local wantAlwaysOpen = w.show and w.mode == "dropdown" and w.dropdownType ~= "list" and w.dropdownAlwaysOpen
+    local wantAlwaysOpen = (not docked) and w.show and w.mode == "dropdown"
+        and w.dropdownType ~= "list" and w.dropdownAlwaysOpen
     if wantAlwaysOpen then
         Addon:ShowSetIconFlyout(a)
     elseif Addon.HideSetIconFlyout then
         Addon:HideSetIconFlyout()
     end
+
+    -- One refresh beat covers the column too: RefreshWidget is what equip.lua,
+    -- sets.lua and the options pane already call after every swap, add, rename
+    -- and delete, so the docked icons (and the green border on the equipped one)
+    -- follow the same signals the radial's highlight always has. Inert when the
+    -- dock is not active — RefreshChatDock's first line refuses.
+    if Addon.RefreshChatDock then Addon:RefreshChatDock() end
 end
 
 function Addon:SetWidgetShown(show)

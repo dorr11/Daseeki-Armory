@@ -246,6 +246,12 @@ end
 
 -- ── Login ─────────────────────────────────────────────────────────────────────
 function Addon:OnLogin()
+    -- BEFORE InitWidget: the widget asks the dock which mode the swapper is
+    -- effectively in, and the subscription's own first delivery is what makes
+    -- that answer true rather than hopeful. Subscribing is a push registration —
+    -- it never blocks, never polls, and answers "no surface" immediately when
+    -- Daseeki-Chat is absent (see chatdock.lua's rendezvous note).
+    if Addon.InitChatDock  then Addon:InitChatDock()  end
     if Addon.InitWidget    then Addon:InitWidget()    end
     if Addon.RegisterOptions then Addon:RegisterOptions() end
     if Addon.BuildIconList then Addon:BuildIconList() end

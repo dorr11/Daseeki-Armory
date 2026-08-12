@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **The set swapper can live on the Daseeki Chat window.** Set Swapper's
+  *Display Mode* has a third choice, **Chat**. Pick it and your sets become a
+  single vertical column of icons running down the outside of the chat window's
+  right-hand edge, top-aligned with it — the floating swapper button steps aside
+  while the column is up, because the column *is* the swapper. The icons are
+  sized so that **ten sets fit the height of the chat panel exactly**, and they
+  re-size themselves the instant you drag the chat window bigger or smaller.
+  Fewer than ten sets simply fill from the top at that same size; more than ten
+  are all drawn, and the column runs on past the bottom of the panel rather than
+  hiding any of them behind a scrollbar. Clicking an icon equips that set
+  exactly as clicking it anywhere else in Armory always has, combat queueing
+  included.
+- **The set you are wearing gets a green border.** The set Armory last equipped
+  for you is outlined in the theme's green so it reads at a glance. If Armory
+  genuinely does not know which set you are in — a character that has never
+  swapped through Armory, or a "current set" that has since been deleted —
+  **nothing is outlined**. A guess would be worse than an honest blank.
+- **Nothing changes if Daseeki Chat is not there.** With Daseeki Chat not
+  installed, or its chat window switched off, "Chat" has no panel to attach to,
+  so the swapper quietly runs in its normal Radial display instead and the
+  settings page says so in a line under the dropdown. No error, no empty column,
+  nothing created. Radial and Dropdown behave exactly as they always have, and
+  the column appears (and disappears) live if you turn the chat window off and
+  on again — no reload.
+
 ## 1.3.3 — 2026-08-11
 
 ### Fixed

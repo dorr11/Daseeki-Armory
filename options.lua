@@ -362,11 +362,22 @@ function Addon:BuildSetSwapperTab(flow)
         get = function() return w.openTrigger == "hover" and "Hover" or "Click" end,
         set = function(v) w.openTrigger = v:lower() end,
     })
+    -- DISPLAY MODE carries a third choice, "Chat" (owner, 2026-08-12): the sets
+    -- ride a single vertical column anchored outside Daseeki-Chat's panel,
+    -- instead of a floating anchor button. It is a PLACEMENT, so it is stored
+    -- and live-applied exactly like the other two — Addon:RefreshWidget is the
+    -- one apply route, unchanged — and it needs no new config of its own.
     ddRow:Dropdown({
-        width = SWAP_DD, choices = { "Radial", "Dropdown" },
-        get = function() return w.mode == "dropdown" and "Dropdown" or "Radial" end,
+        width = SWAP_DD, choices = { "Radial", "Dropdown", "Chat" },
+        get = function()
+            if w.mode == "dropdown" then return "Dropdown" end
+            if w.mode == "chat" then return "Chat" end
+            return "Radial"
+        end,
         set = function(v)
-            w.mode = (v == "Dropdown") and "dropdown" or "radial"
+            if v == "Dropdown" then w.mode = "dropdown"
+            elseif v == "Chat" then w.mode = "chat"
+            else w.mode = "radial" end
             Addon:RefreshSwapperTab(); Addon:RefreshWidget()
         end,
     })
@@ -447,7 +458,15 @@ function Addon:BuildSetSwapperTab(flow)
             Addon:RefreshWidget()
         end,
     })
-    flow._condRows = { opts = optRow, always = alwaysRow }
+    -- The HONEST row: "Chat" is picked but nothing answers. Without this the
+    -- owner picks a mode and the swapper silently keeps doing what it did — a
+    -- correct fallback that looks like a broken option. Shown ONLY in that exact
+    -- state, so it is never noise.
+    local chatRow  = condRow(flow)
+    local chatNote = chatRow:Label("Chat window not detected — using Radial.", { muted = true })
+    chatRow._note  = chatNote
+
+    flow._condRows = { opts = optRow, always = alwaysRow, chat = chatRow }
 
     Addon:RefreshSwapperTab()
 end
@@ -471,6 +490,12 @@ function Addon:RefreshSwapperTab()
         if c then c.cap:SetShown(isIcon); c.dd:SetShown(isIcon) end
     end
     flow._condRows.always:SetApplicable(isIcon)
+    -- "Chat" picked, nothing to dock to. Read live (the surface can arrive or
+    -- leave mid-session) rather than cached at build time.
+    if flow._condRows.chat then
+        flow._condRows.chat:SetApplicable(
+            w.mode == "chat" and not (Addon.ChatDockAvailable and Addon:ChatDockAvailable()))
+    end
     -- The swapper now lives in the Sets tab's left column, so reflow the OUTER Sets
     -- scroll pane (re-runs the split arrange → re-lays both columns + scroll range)
     -- rather than the column, which has no width to lay itself standalone.

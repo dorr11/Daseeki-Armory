@@ -26,6 +26,20 @@ equip.lua
 keybind.lua
 flyout.lua
 setFlyout.lua
+# chatdock.lua: the set swapper's "Chat" placement — a vertical column of set
+# icons anchored outside Daseeki-Chat's chassis, sized so ten fit the panel.
+# Loads with the other swapper surfaces and BEFORE widget.lua, which asks it
+# which mode the swapper is effectively running in.
+#
+# NO OptionalDeps LINE IS NEEDED FOR IT, on purpose. Daseeki-Chat publishes its
+# attach surface at FILE-LOAD time, and every enabled addon's files execute
+# before PLAYER_LOGIN — which is when Addon:InitChatDock subscribes. So the
+# surface is there in either load order, and the subscription answers
+# immediately with whatever is true at that moment. Declaring a load order would
+# buy nothing and would imply a dependency that does not exist: with
+# Daseeki-Chat absent this file creates no frame at all and the swapper runs in
+# its shipped default mode.
+chatdock.lua
 opie.lua
 slotpopout.lua
 paperdoll.lua
