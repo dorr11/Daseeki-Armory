@@ -6512,6 +6512,416 @@ suite("icon-spellbook-latch", coldWorld({ files = { "iconData.lua" } }, function
 end))
 
 ----------------------------------------------------------------------
+-- THE CHAT DOCK — the set swapper's "Chat" placement (owner, 2026-08-12).
+--
+-- "if the option in armory is 'Chat' for the set swapper i want it to anchor
+--  the sets in a single vertical column on the right side of the chat panel.
+--  size the icons so that 10 sets can fit the panel. the selected set should
+--  have a green border around it. if its unknown what set was chosen last then
+--  ignore the green border."
+--
+-- Every clause above is a check below, plus the postures that are NOT the happy
+-- path: Daseeki-Chat absent, present-but-not-painting, an API mismatch, the
+-- option pointed anywhere else. The Chat side is a MINIMAL IN-SUITE STUB of the
+-- PUBLISHED attach surface — Daseeki-Chat is never imported (its own repo pins
+-- its half of the contract; this suite pins OURS), which is the nexus.lua
+-- precedent applied to a UI seam.
+----------------------------------------------------------------------
+suite("chat-dock", world(function(ck, w, A)
+    ---------------------------------------------------------------- the rig
+    -- core.lua is not loaded by the equip mock, so the three things it owns
+    -- that chatdock.lua reads are supplied here, explicitly.
+    A.DEFAULT_ICON = "default-icon"
+    local COL = { ok = { 0.5, 0.9, 0.5 }, brand = { 1, 0.82, 0 }, inset = { 0, 0, 0 } }
+    function A:Col(token, alpha)
+        local c = COL[token] or { 1, 1, 1 }
+        return c[1], c[2], c[3], alpha or 1
+    end
+    A.db.settings.widget = { show = true, mode = "radial" }
+
+    -- A recording frame stub. Any method not named here is a no-op returning
+    -- the frame; underscore keys are RECORDING fields and read nil when nothing
+    -- wrote them (never auto-stubbed into a truthy function).
+    local frameCount = 0
+    local function newFrame(kind)
+        local f = { _kind = kind, _shown = false, _points = {}, _scripts = {}, _kids = {} }
+        f._impl = {
+            CreateTexture = function(self, _, layer)
+                local t = newFrame("Texture"); t._layer = layer
+                self._kids[#self._kids + 1] = t
+                return t
+            end,
+            SetScript = function(self, k, fn) self._scripts[k] = fn; return self end,
+            GetScript = function(self, k) return self._scripts[k] end,
+            Show = function(self) self._shown = true; return self end,
+            Hide = function(self) self._shown = false; return self end,
+            IsShown = function(self) return self._shown end,
+            SetSize = function(self, a, b) self._w, self._h = a, b; return self end,
+            SetWidth = function(self, a) self._w = a; return self end,
+            SetHeight = function(self, b) self._h = b; return self end,
+            GetWidth = function(self) return self._w end,
+            GetHeight = function(self) return self._h end,
+            ClearAllPoints = function(self) self._points = {}; return self end,
+            SetPoint = function(self, p, rel, rp, x, y)
+                self._points[#self._points + 1] = { p = p, rel = rel, rp = rp, x = x, y = y }
+                return self
+            end,
+            SetParent = function(self, p) self._parent = p; return self end,
+            GetParent = function(self) return self._parent end,
+            SetFrameLevel = function(self, l) self._level = l; return self end,
+            GetFrameLevel = function(self) return self._level or 1 end,
+            SetFrameStrata = function(self, s) self._strata = s; return self end,
+            GetFrameStrata = function(self) return self._strata or "MEDIUM" end,
+            SetTexture = function(self, t) self._tex = t; return self end,
+            SetColorTexture = function(self, r, g, b, a) self._color = { r, g, b, a }; return self end,
+        }
+        return setmetatable(f, { __index = function(t, k)
+            local impl = rawget(t, "_impl")
+            local v = impl and impl[k]
+            if v then return v end
+            if type(k) == "string" and k:sub(1, 1) == "_" then return nil end
+            local nop = function(self) return self end
+            rawset(t, k, nop)
+            return nop
+        end })
+    end
+
+    local savedCF, savedUP, savedGT = _G.CreateFrame, _G.UIParent, _G.GameTooltip
+    _G.CreateFrame = function(kind, name, parent)
+        frameCount = frameCount + 1
+        local f = newFrame(kind)
+        f._name, f._parent = name, parent
+        return f
+    end
+    _G.UIParent    = newFrame("Frame")
+    _G.GameTooltip = newFrame("Frame")
+
+    local function restore()
+        _G.CreateFrame, _G.UIParent, _G.GameTooltip = savedCF, savedUP, savedGT
+    end
+
+    -- THE ATTACH SURFACE STUB: the shape Daseeki-Chat publishes, and nothing of
+    -- Daseeki-Chat itself. `chassis` is the frame a real Chat would hand back.
+    local chassis = newFrame("Frame")
+    chassis:SetFrameStrata("LOW")
+    chassis:SetFrameLevel(3)
+    local function newAttach(api)
+        local S = { API_VERSION = api or 1, subs = {}, avail = false, geom = nil }
+        S.Available = function() return S.avail end
+        S.Surface   = function() return S.avail and chassis or nil end
+        S.Geometry  = function() if not S.avail then return nil end return S.geom end
+        S.Subscribe = function(fn)
+            S.subs[#S.subs + 1] = fn
+            fn(S.Geometry(), "subscribe")
+            return fn
+        end
+        S.Unsubscribe = function(fn)
+            for i = #S.subs, 1, -1 do if S.subs[i] == fn then table.remove(S.subs, i) end end
+            return true
+        end
+        -- The harness's own driver, not part of the contract.
+        S.Say = function(avail, h, why)
+            S.avail = avail and true or false
+            S.geom = avail and { version = 1, frame = chassis, width = 420, height = h,
+                                 left = 100, bottom = 60, edge = 1, placement = "top" } or nil
+            for _, fn in ipairs(S.subs) do fn(S.Geometry(), why or "test") end
+        end
+        return S
+    end
+
+    local fn, lerr = loadfile(P("chatdock.lua"))
+    ck(fn ~= nil, "chatdock.lua compiles" .. (fn and "" or (" -> " .. tostring(lerr))))
+    if not fn then restore(); return end
+    local lok, rerr = pcall(fn, "Daseeki-Armory", A)
+    ck(lok == true, "…and loads over the mock addon" .. (lok and "" or (" -> " .. tostring(rerr))))
+    if not lok then restore(); return end
+
+    ---------------------------------------------------- (a) THE PRESENCE PROBE
+    local absent, why = A:ChatAttachSurface({})
+    ck(absent == nil and type(why) == "string" and why:find("not installed"),
+       "(a) no Daseeki-Chat probes soft, with a readable reason")
+    ck(A:ChatAttachSurface({ DaseekiChatAttach = "nonsense" }) == nil,
+       "(a) a non-table on the global refuses")
+    ck(A:ChatAttachSurface({ DaseekiChatAttach = { API_VERSION = 0,
+        Available = print, Surface = print, Geometry = print,
+        Subscribe = print, Unsubscribe = print } }) == nil,
+       "(a) an older contract version refuses rather than guessing")
+    local partial, pwhy = A:ChatAttachSurface({ DaseekiChatAttach = {
+        API_VERSION = 1, Available = print, Surface = print, Geometry = print } })
+    ck(partial == nil and pwhy and pwhy:find("Subscribe"),
+       "(a) a partial surface names the function it is missing")
+    local good = newAttach(1)
+    ck(A:ChatAttachSurface({ DaseekiChatAttach = good }) == good,
+       "(a) a complete surface is accepted")
+    ck(A:ChatDockAvailable({}) == false, "(a) no surface = not available")
+    ck(A:ChatDockAvailable({ DaseekiChatAttach = good }) == false,
+       "(a) a surface that is not painting = not available (the disabled-view posture)")
+    good.avail = true
+    ck(A:ChatDockAvailable({ DaseekiChatAttach = good }) == true,
+       "(a) …and available once it says so")
+    good.avail = false
+
+    ---------------------------------------------------- (b) THE TEN-FIT MATHS
+    local GAP, SLOTS = A.CHAT_DOCK_GAP, A.CHAT_DOCK_SLOTS
+    ck(SLOTS == 10 and GAP == 2, "(b) the owner's numbers: ten slots, a 2-unit gap")
+    local function fits(h)
+        local s = A:ChatDockIconSize(h)
+        if not s then return false, "no size" end
+        return math.abs(SLOTS * s + (SLOTS - 1) * GAP - h) < 1e-9, s
+    end
+    local ok300, s300 = fits(300)
+    ck(ok300, "(b) TEN ICONS EXACTLY FILL a 300-unit panel")
+    ck(math.abs(s300 - 28.2) < 1e-9, "(b) …at 28.2 units each (300 - 18) / 10")
+    local ok442, s442 = fits(442)
+    ck(ok442, "(b) …and a 442-unit panel too (the maths is not tuned to one height)")
+    ck(math.abs(s442 - 42.4) < 1e-9, "(b) …at 42.4 units each")
+    ck(s442 > s300, "(b) a taller panel means bigger icons, not more of them")
+    ck(A:ChatDockIconSize(nil) == nil, "(b) an unknown height is NOT a zero-height panel")
+    ck(A:ChatDockIconSize(0) == nil and A:ChatDockIconSize(-40) == nil,
+       "(b) a zero or negative height answers nothing")
+    ck(A:ChatDockIconSize("tall") == nil, "(b) …and so does a nonsense value")
+    local tiny, clamped = A:ChatDockIconSize(20)
+    ck(tiny == A.CHAT_DOCK_MIN_ICON and clamped == true,
+       "(b) a panel too short for the rule clamps, and SAYS it clamped")
+
+    ------------------------------------------- (c) WHAT WE KNOW, AND WHAT WE DON'T
+    A.db.sets = {}
+    w:defineSet("1 - DPS",  { [16] = L(101) })
+    w:defineSet("2 - Tank", { [16] = L(102) })
+    w:defineSet("3 - PvP",  { [16] = L(103) })
+    A.db.sets["1 - DPS"].order,  A.db.sets["1 - DPS"].icon  = 1, "icon-dps"
+    A.db.sets["2 - Tank"].order, A.db.sets["2 - Tank"].icon = 2, "icon-tank"
+    A.db.sets["3 - PvP"].order,  A.db.sets["3 - PvP"].icon  = 3, "icon-pvp"
+
+    A.db.currentSet = nil
+    ck(A:ChatDockSelectedSet() == nil, "(c) never swapped = the selection is UNKNOWN")
+    A.db.currentSet = ""
+    ck(A:ChatDockSelectedSet() == nil, "(c) an empty name is unknown, not a set (Class 5)")
+    A.db.currentSet = "A Set That Was Deleted"
+    ck(A:ChatDockSelectedSet() == nil,
+       "(c) a STALE name is unknown too — a pointer to nothing is not knowledge")
+    A.db.currentSet = "2 - Tank"
+    ck(A:ChatDockSelectedSet() == "2 - Tank", "(c) a resolvable name IS the selection")
+
+    ---------------------------------------------------------- (d) THE PLAN
+    local geom = { version = 1, frame = chassis, width = 420, height = 300,
+                   left = 100, bottom = 60, edge = 1, placement = "top" }
+    local plan = A:ChatDockPlan(geom)
+    ck(plan ~= nil, "(d) a plan comes out of a geometry")
+    ck(A:ChatDockPlan(nil) == nil, "(d) …and nothing comes out of no geometry")
+    if plan then
+        ck(plan.count == 3, "(d) one row per set")
+        ck(math.abs(plan.size - s300) < 1e-9, "(d) rows are drawn at the TEN-fit size, not the three-fit one")
+        ck(math.abs(plan.fitHeight - 300) < 1e-9, "(d) …and ten of them would fill the panel exactly")
+        ck(plan.point == "TOPLEFT" and plan.relPoint == "TOPRIGHT",
+           "(d) the column anchors OUTSIDE the panel's right edge")
+        ck(plan.x == 0 and plan.y == 0, "(d) flush, and top-aligned to the panel's top")
+        ck(plan.rows[1].name == "1 - DPS" and plan.rows[3].name == "3 - PvP",
+           "(d) rows follow ARMORY'S set order (Class 8: sorted, never pairs())")
+        ck(plan.rows[1].y == 0, "(d) the first row sits at the top")
+        ck(math.abs(plan.rows[2].y + (plan.size + GAP)) < 1e-9, "(d) each row drops one icon + one gap")
+        ck(math.abs(plan.rows[3].y + 2 * (plan.size + GAP)) < 1e-9, "(d) …and the third drops twice as far")
+        ck(plan.rows[1].icon == "icon-dps", "(d) each row carries its own set icon")
+        local sel = 0
+        for _, r in ipairs(plan.rows) do if r.selected then sel = sel + 1 end end
+        ck(sel == 1 and plan.selected == "2 - Tank" and plan.selectedRow == 2,
+           "(d) EXACTLY ONE row wears the border, and it is the equipped set")
+        ck(plan.overflow == false, "(d) three sets do not overflow a ten-slot column")
+    end
+
+    -- THE OWNER'S EXPLICIT RULE, as its own check.
+    A.db.currentSet = nil
+    local blind = A:ChatDockPlan(geom)
+    local anySel = 0
+    for _, r in ipairs(blind.rows) do if r.selected then anySel = anySel + 1 end end
+    ck(anySel == 0 and blind.selected == nil and blind.selectedRow == nil,
+       "(d) UNKNOWN SELECTION = ZERO borders (the owner's rule, not a default row)")
+
+    -- More sets than slots: every one is drawn, at the ten-fit size, and the
+    -- overflow is FLAGGED rather than silently scrolled.
+    for i = 4, 12 do
+        w:defineSet(("%d - Extra"):format(i), { [16] = L(100 + i) })
+        A.db.sets[("%d - Extra"):format(i)].order = i
+    end
+    local big = A:ChatDockPlan(geom)
+    ck(big.count == 12, "(d) twelve sets draw twelve rows — no invented scroller")
+    ck(math.abs(big.size - s300) < 1e-9, "(d) …still at the ten-fit size (the rule is the SIZE)")
+    ck(big.overflow == true, "(d) …and the column honestly says it runs past the panel")
+    for i = 4, 12 do A.db.sets[("%d - Extra"):format(i)] = nil end
+
+    ---------------------------------------------- (e) THE FALLBACK MATRIX
+    local WORLD_NONE = {}
+    local WORLD_DARK = { DaseekiChatAttach = good }         -- present, not painting
+    good.avail = true
+    local WORLD_LIVE = { DaseekiChatAttach = good }
+    local W = A.db.settings.widget
+
+    W.mode = "radial"
+    ck(A:EffectiveSwapperMode(WORLD_LIVE) == "radial", "(e) RADIAL is radial, surface or not")
+    ck(A:ChatDockActive(WORLD_LIVE) == false, "(e) …and never docks")
+    W.mode = "dropdown"
+    ck(A:EffectiveSwapperMode(WORLD_LIVE) == "dropdown", "(e) DROPDOWN is dropdown, surface or not")
+    ck(A:ChatDockActive(WORLD_LIVE) == false, "(e) …and never docks either")
+    W.mode = "chat"
+    ck(A:EffectiveSwapperMode(WORLD_LIVE) == "chat", "(e) CHAT + a live panel = chat")
+    ck(A:ChatDockActive(WORLD_LIVE) == true, "(e) …and the column is active")
+    good.avail = false
+    ck(A:EffectiveSwapperMode(WORLD_DARK) == A.SWAPPER_FALLBACK_MODE,
+       "(e) CHAT + a panel that is not painting falls back to the DEFAULT mode")
+    ck(A:ChatDockActive(WORLD_DARK) == false, "(e) …with no column")
+    ck(A:EffectiveSwapperMode(WORLD_NONE) == A.SWAPPER_FALLBACK_MODE,
+       "(e) CHAT + no Daseeki-Chat at all falls back the same way")
+    ck(A.SWAPPER_FALLBACK_MODE == "radial",
+       "(e) …and the fallback IS the shipped default, not a third posture")
+    good.avail = true
+    W.show = false
+    ck(A:ChatDockActive(WORLD_LIVE) == false, "(e) the swapper's own Enable still gates the column")
+    W.show = true
+
+    ------------------------------------------------------ (f) THE INERT PIN
+    _G.DaseekiChatAttach = nil
+    W.mode = "radial"
+    local before = frameCount
+    ck(A:RefreshChatDock() == false, "(f) a non-Chat mode refuses to render the column")
+    ck(frameCount == before, "(f) …and CREATES NOTHING (no frame, no texture, no script)")
+    ck(A._chatDock == nil, "(f) the dock frame does not exist at all")
+    W.mode = "chat"
+    ck(A:RefreshChatDock() == false, "(f) Chat mode with no surface refuses too")
+    ck(frameCount == before, "(f) …and still creates nothing")
+    local subOk, subWhy = A:InitChatDock()
+    ck(subOk == false and type(subWhy) == "string",
+       "(f) subscribing with no Daseeki-Chat fails soft, with a reason")
+    ck(A._chatDockSubscribed == false, "(f) …and leaves no subscription behind")
+
+    ----------------------------------------------------- (g) THE LIVE COLUMN
+    _G.DaseekiChatAttach = good
+    good.avail = false
+    ck(A:InitChatDock() == true, "(g) the subscription registers against a real surface")
+    ck(#good.subs == 1, "(g) exactly one listener")
+    ck(A:InitChatDock() == true and #good.subs == 1, "(g) …and re-initialising never doubles it")
+    ck(A._chatDock == nil or A._chatDock._shown == false,
+       "(g) the arrival delivery for a dark panel drew nothing")
+
+    -- THE PANEL ARRIVES. No poll asked for it: the surface pushed.
+    A.db.currentSet = "2 - Tank"
+    good.Say(true, 300, "enable")
+    local D = A._chatDock
+    ck(type(D) == "table" and D._shown == true, "(g) the column appears the moment the panel does")
+    ck(D._parent == chassis, "(g) …parented to the chassis, so it moves with it for free")
+    local pt = D._points[1]
+    ck(pt and pt.p == "TOPLEFT" and pt.rp == "TOPRIGHT" and pt.rel == chassis,
+       "(g) …anchored outside the panel's right edge, top-aligned")
+    ck((D._level or 0) > chassis:GetFrameLevel(), "(g) …and above it, never under its art")
+
+    local shownBtns, borders, borderName = 0, 0, nil
+    local function census()
+        shownBtns, borders, borderName = 0, 0, nil
+        for _, b in ipairs(D.btns or {}) do
+            if b._shown then
+                shownBtns = shownBtns + 1
+                if b.edges and b.edges.top._shown then
+                    borders = borders + 1; borderName = b._name
+                end
+            end
+        end
+    end
+    census()
+    ck(shownBtns == 3, "(g) one icon per set, in one column")
+    ck(borders == 1 and borderName == "2 - Tank",
+       "(g) EXACTLY ONE green border, on the equipped set")
+    local edge = D.btns[2].edges.top._color
+    ck(edge and math.abs(edge[1] - 0.5) < 1e-6 and math.abs(edge[2] - 0.9) < 1e-6
+        and math.abs(edge[3] - 0.5) < 1e-6,
+       "(g) …drawn in the theme's GREEN token, not a hardcoded colour")
+    ck(D.btns[2].edges.top._h == A.CHAT_DOCK_BORDER, "(g) …at the specified thickness")
+    ck(math.abs((D.btns[1]._w or 0) - s300) < 1e-9 and math.abs((D.btns[1]._h or 0) - s300) < 1e-9,
+       "(g) icons are square, at the ten-fit size")
+
+    -- THE UNKNOWN-SELECTION RULE, through the real render path.
+    A.db.currentSet = nil
+    A:RefreshChatDock()
+    census()
+    ck(shownBtns == 3 and borders == 0,
+       "(g) with the selection unknown the icons are all there and NOT ONE wears a border")
+    A.db.currentSet = "2 - Tank"
+    A:RefreshChatDock()
+
+    -- LIVE RESIZE: the panel announces a new height, the icons re-fit. No timer
+    -- ran, nothing polled — the announce IS the beat.
+    good.Say(true, 500, "reflow")
+    local want500 = A:ChatDockIconSize(500)
+    census()
+    ck(shownBtns == 3, "(g) a resize keeps every icon")
+    ck(math.abs((D.btns[1]._w or 0) - want500) < 1e-9,
+       "(g) …and re-sizes them to fit ten in the NEW height")
+    ck(math.abs(want500 * SLOTS + (SLOTS - 1) * GAP - 500) < 1e-9,
+       "(g) …which is still exactly ten to the panel")
+    ck(math.abs((D.btns[2]._points[1].y or 0) + (want500 + GAP)) < 1e-9,
+       "(g) …with the row pitch following the new size")
+
+    -- THE CLICK IS THE SWAPPER'S OWN VERB.
+    local realEquip, gotName = A.EquipSet, nil
+    A.EquipSet = function(_, name) gotName = name end
+    D.btns[3]:GetScript("OnClick")(D.btns[3])
+    A.EquipSet = realEquip
+    ck(gotName == "3 - PvP", "(g) clicking an icon calls Addon:EquipSet with that set — nothing new")
+
+    -- …and for real, through the unkind client, so the reuse is not just a name.
+    w:setWorn(16, L(999))
+    A.db.currentSet = nil
+    D.btns[1]:GetScript("OnClick")(D.btns[1])
+    w:settle()
+    ck(A.db.currentSet == "1 - DPS",
+       "(g) a real click really swaps the set through the real equip engine")
+
+    -- THE PANEL GOES AWAY (view disabled / addon unloading its view).
+    good.Say(false, nil, "disable")
+    ck(D._shown == false, "(g) the column is put away when the panel stops painting")
+    ck(A:ChatDockAvailable() == false, "(g) …and the surface honestly reports unavailable")
+    good.Say(true, 300, "enable")
+    ck(D._shown == true, "(g) …and comes back when it returns, with no reload")
+
+    ------------------------------------------------- (h) THE WIRING, IN SOURCE
+    local function slurp(rel)
+        local h = io.open(P(rel), "r")
+        if not h then return nil end
+        local s = h:read("*a"); h:close(); return s
+    end
+    local ws = slurp("widget.lua")
+    ck(ws ~= nil, "(h) widget.lua is readable")
+    if ws then
+        ck(ws:find("EffectiveSwapperMode", 1, true) ~= nil,
+           "(h) the widget reads the EFFECTIVE mode, so 'chat' without a panel falls back")
+        ck(ws:find("RefreshChatDock", 1, true) ~= nil,
+           "(h) …and the one refresh beat every swap already runs re-paints the column")
+        ck(ws:find('w.mode == "dropdown"') == nil or ws:find("EffectiveSwapperMode") ~= nil,
+           "(h) …and no open-path still reads the raw stored mode")
+    end
+    local os_ = slurp("options.lua")
+    ck(os_ ~= nil, "(h) options.lua is readable")
+    if os_ then
+        ck(os_:find('"Radial", "Dropdown", "Chat"', 1, true) ~= nil,
+           "(h) the Display Mode dropdown offers Chat beside the two it always had")
+        ck(os_:find('w.mode = "chat"', 1, true) ~= nil, "(h) …and stores it on the SAME setting")
+        ck(os_:find("ChatDockAvailable", 1, true) ~= nil,
+           "(h) …and the pane says so when Chat is picked but nothing answers")
+    end
+    local toc = slurp("Daseeki-Armory.toc")
+    ck(toc ~= nil, "(h) the .toc is readable")
+    if toc then
+        ck(toc:find("\nchatdock%.lua") ~= nil, "(h) chatdock.lua ships")
+        local deps = toc:match("## OptionalDeps:([^\r\n]*)") or ""
+        ck(deps:find("Daseeki%-Chat") == nil,
+           "(h) NO OptionalDeps on Daseeki-Chat — the rendezvous does not need a load order")
+    end
+
+    ------------------------------------------------------------ leave it clean
+    _G.DaseekiChatAttach = nil
+    A.db.settings.widget.mode = "radial"
+    restore()
+end))
+
+----------------------------------------------------------------------
 -- Every shipped file compiles (loadfile gate)
 ----------------------------------------------------------------------
 suite("loadfile-all-files", function(ck)
