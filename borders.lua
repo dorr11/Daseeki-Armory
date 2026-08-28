@@ -95,10 +95,55 @@
     the paper-doll pressed/highlight states, the empty-slot artwork — is untouched;
     this file only ever drew the rarity cue.
 
-    Deliberately SELF-CONTAINED (one toggle; a small glow factory; one event) so the
-    long-term move into Daseeki-UI is a file transplant. The pure geometry/color layer
-    (Addon.Borders) touches NO WoW API at load, which is what lets the headless harness
-    gate the glow constants the way Bags gates its own.
+    ── WHEN IT PAINTS (1.3.4, the owner's cold-login report) ────────────────────
+    Owner, 2026-08-28, with a screenshot of an open character frame and not one
+    coloured slot: "item frame coloring not working until i change a piece of armor
+    (seems only fires on update of state?)". That is exactly what it was.
+
+    1.3.3 painted from three places and every one of them is a MUTATION: the
+    PLAYER_LOGIN leg (InitBorders' own trailing call), PLAYER_ENTERING_WORLD, and
+    PLAYER_EQUIPMENT_CHANGED. Nothing painted because the state was merely being
+    LOOKED AT for the first time, and — the part with teeth — nothing repainted when
+    the client finally learned what the player was wearing.
+
+    THE COLD READ IS THE DEFECT (CLIENT_ASYNC_LESSONS.md Class 4). Both login paints
+    run while the item cache may still be empty. GetInventoryItemQuality resolves
+    through that same cache: the client knows there is a LINK in the slot long before
+    it can tell you the item's quality, and until it can, the call answers nil. nil is
+    indistinguishable from "empty slot" to the shipped painter, so it hid the halo and
+    then had no trigger left that could ever bring it back. The first PLAYER_EQUIPMENT_-
+    CHANGED of the session repainted from a by-then-warm cache and the borders appeared
+    — "only fires on update of state", precisely as reported. This is the same shape
+    keybind.lua's ARM-3 note records for macro bodies ("item names are not always
+    cached at login") and stats.lua's for stat rows, and it gets the same repair, not a
+    timer: COUNT what could not be resolved, and while that count is > 0 repaint on
+    GET_ITEM_INFO_RECEIVED / ITEM_DATA_LOAD_RESULT. At 0 the watcher unregisters, so a
+    warm client pays nothing at all. There is NO polling anywhere in this file.
+
+    THE SECOND HOLE IS THE ONE THE REFERENCE NEVER HAD (Class 2 — watch the OBJECT,
+    not only the event). CII drives the character sheet from a post-hook on
+    ToggleCharacter: its equipped borders are refreshed BECAUSE THE SHEET OPENED. We
+    replaced the addon and did not replace that trigger, so a paint that went wrong
+    while the sheet was closed stayed wrong when it opened. CharacterFrame's OnShow now
+    repaints, alongside paperdoll.lua's existing hook on the same frame.
+
+    WE DO NOT GATE THE WORK BEHIND VISIBILITY, and that is a deliberate divergence from
+    the reference, which unregisters its event while the sheet is hidden. A paint is
+    nineteen SetVertexColor/Show calls on textures that already exist; withholding it
+    while the frame is hidden would buy nothing measurable and would re-open the very
+    hole being closed here (a state change nobody painted, on a surface nobody looked
+    at yet). Paint always; OnShow is a CORRECTNESS trigger, not a work gate.
+
+    UNIT_INVENTORY_CHANGED joins the set for parity with slotpopout.lua's POPOUT_EVENTS
+    and with the reference's own character-sheet event. Its arg1 is a UNIT, while
+    PLAYER_EQUIPMENT_CHANGED's is a SLOT NUMBER and PLAYER_ENTERING_WORLD's is a
+    BOOLEAN — ARM-6's defect was a "player"-only filter applied to all three, so the
+    filter here is applied to the one unit-scoped event and nowhere else.
+
+    Deliberately SELF-CONTAINED (one toggle; a small glow factory; two small event
+    frames) so the long-term move into Daseeki-UI is a file transplant. The pure
+    geometry/color layer (Addon.Borders) touches NO WoW API at load, which is what lets
+    the headless harness gate the glow constants the way Bags gates its own.
 --]]
 
 local _, Addon = ...
@@ -293,18 +338,156 @@ local function applyGlow(f, quality, minQuality)
     end
 end
 
+-- ── The trigger set, as data ──────────────────────────────────────────────────
+-- Published so the harness can gate it (slotpopout.lua's POPOUT_EVENTS idiom).
+-- The arg1 of each is noted because they DISAGREE, and ARM-6's defect was one
+-- filter applied to all three.
+Addon.BORDER_EVENTS = {
+    "PLAYER_EQUIPMENT_CHANGED", -- arg1 = SLOT NUMBER
+    "PLAYER_ENTERING_WORLD",    -- arg1 = isInitialLogin (boolean)
+    "UNIT_INVENTORY_CHANGED",   -- arg1 = unit
+}
+
+-- The DELIVERY events — subscribed only while some equipped slot is unresolved,
+-- unsubscribed the moment none is. This is the repair for the cold login; it is
+-- not a poller and there is no timer behind it.
+Addon.BORDER_WARM_EVENTS = {
+    "GET_ITEM_INFO_RECEIVED",
+    "ITEM_DATA_LOAD_RESULT",
+}
+
+-- ── Resolving one equipped slot ───────────────────────────────────────────────
+-- THREE ANSWERS, not two (Class 4: an empty read is not an empty answer):
+--   nil, nil   the slot is PROVABLY EMPTY — no link at all, nothing to wait for
+--   q,   nil   a real quality, poor (0) included
+--   nil, id    the slot HOLDS an item the client cannot describe yet; `id` is what
+--              to ask the client for, or `true` when even the id is unavailable
+--
+-- Nil-checks are explicit throughout: quality 0 is Poor, it is a real answer, and
+-- it is truthy-zero's twin (Class 5) — `q or fallback` would silently discard it.
+-- GetItemInfo off the link is a SECOND WITNESS on the same cache rather than a
+-- different one; it costs nothing and it covers the builds where only one of the
+-- two answers early.
+local function slotQuality(slotId)
+    local link = GetInventoryItemLink and GetInventoryItemLink("player", slotId)
+    if not link then return nil, nil end
+    local q = GetInventoryItemQuality and GetInventoryItemQuality("player", slotId)
+    if q == nil and GetItemInfo then q = select(3, GetItemInfo(link)) end
+    if q ~= nil then return q, nil end
+    local id = GetInventoryItemID and GetInventoryItemID("player", slotId)
+    return nil, (id or true)
+end
+Addon.SlotQualityFor = function(_, slotId) return slotQuality(slotId) end
+
+-- ── The warm watch (keybind.lua UpdateMacroWarmWatch, same shape) ──────────────
+function Addon:UpdateBorderWarmWatch()
+    local want = (Addon._borderMissing or 0) > 0
+    if want then
+        if not Addon._borderWarmFrame then
+            local f = CreateFrame("Frame")
+            f:SetScript("OnEvent", function()
+                -- Class 9: this is our OWN paint's echo, arriving from inside the
+                -- load request it made. Record it; the paint acts on it once.
+                if Addon:InBorderPaint() then Addon._borderPaintEcho = true; return end
+                if (Addon._borderMissing or 0) > 0 then Addon:UpdateSlotBorders() end
+            end)
+            Addon._borderWarmFrame = f
+        end
+        if not Addon._borderWatching then
+            -- RegisterEvent raises on an event a build does not know and the TOC
+            -- spans three interface versions, so each one is guarded.
+            for _, e in ipairs(Addon.BORDER_WARM_EVENTS) do
+                pcall(Addon._borderWarmFrame.RegisterEvent, Addon._borderWarmFrame, e)
+            end
+            Addon._borderWatching = true
+        end
+    elseif Addon._borderWatching then
+        Addon._borderWarmFrame:UnregisterAllEvents()
+        Addon._borderWatching = false
+    end
+end
+
 -- ── Equipped paper-doll slots ─────────────────────────────────────────────────
 -- Spec §3, the GetInventoryItemQuality path: EVERY quality borders, poor (near-black)
--- and common (white) included. An empty slot returns nil and stays unbordered.
-function Addon:UpdateSlotBorders()
+-- and common (white) included. An empty slot returns nil and stays unbordered — and
+-- so does a slot the client cannot yet describe, which is why the second return of
+-- slotQuality exists: that one is COUNTED, and the count is what earns the repaint.
+
+-- ── THE PAINT LATCH (CLIENT_ASYNC_LESSONS.md Class 9, 2026-08-10) ─────────────
+-- The paint's own client call is C_Item.RequestLoadItemDataByID, and for an item the
+-- client already holds it answers FROM INSIDE THE REQUEST: every
+-- GET_ITEM_INFO_RECEIVED / ITEM_DATA_LOAD_RESULT handler in the session runs before
+-- the request returns, this file's included. Armed before the sweep, released when it
+-- returns, pcall-protected so an error cannot wedge it. While it is up an arriving
+-- answer is our own echo — recorded, not acted on — and the paint folds it into
+-- exactly ONE bounded follow-up on the way out, which is also the re-entry fuse.
+local painting = false
+local followups = 0
+local MAX_PAINT_FOLLOWUPS = 2
+
+-- Published so a peer module's handler can tell OUR echo from a real one.
+function Addon:InBorderPaint() return painting end
+
+local function paintSlotBorders()
     local on = bordersEnabled()
+    local missing, coldIds = 0, nil
     for slotId, glow in pairs(Addon._slotGlows or {}) do
         if on then
-            applyGlow(glow, GetInventoryItemQuality("player", slotId), Borders.EQUIPPED_MIN_QUALITY)
+            local q, coldId = slotQuality(slotId)
+            if coldId ~= nil then
+                missing = missing + 1
+                if type(coldId) == "number" then
+                    coldIds = coldIds or {}
+                    coldIds[#coldIds + 1] = coldId
+                end
+            end
+            applyGlow(glow, q, Borders.EQUIPPED_MIN_QUALITY)
         else
             glow:Hide()
         end
     end
+
+    -- PUBLISHED, AND THE WATCH ARMED, BEFORE THE FIRST CLIENT CALL BELOW. A client
+    -- that answers the request from inside it finds a counter and a subscription
+    -- that already describe THIS paint rather than the previous one.
+    Addon._borderMissing = missing
+    Addon:UpdateBorderWarmWatch()
+
+    if coldIds then
+        table.sort(coldIds)                       -- Class 8: deterministic order
+        local CI = _G.C_Item
+        if CI and CI.RequestLoadItemDataByID then
+            for _, id in ipairs(coldIds) do pcall(CI.RequestLoadItemDataByID, id) end
+        end
+    end
+end
+
+function Addon:UpdateSlotBorders()
+    if painting then
+        Addon._borderPaintReentries = (Addon._borderPaintReentries or 0) + 1
+        Addon._borderPaintEcho = true
+        return
+    end
+    painting = true
+    Addon._borderPaintEcho = nil
+    local ok, err = pcall(paintSlotBorders)
+    painting = false
+
+    local echo = Addon._borderPaintEcho
+    Addon._borderPaintEcho = nil
+    if echo then
+        -- The client answered inside our own paint. Act on it now, with the counter
+        -- published and the watch armed — once, and under the fuse.
+        if followups < MAX_PAINT_FOLLOWUPS then
+            followups = followups + 1
+            local fok, ferr = pcall(function() Addon:UpdateSlotBorders() end)
+            followups = followups - 1
+            if not fok and ok then error(ferr, 0) end
+        else
+            Addon._borderPaintRefusals = (Addon._borderPaintRefusals or 0) + 1
+        end
+    end
+    if not ok then error(err, 0) end
 end
 
 -- ── Flyout decorator: glow the lead buttons by item quality ───────────────────
@@ -342,10 +525,25 @@ function Addon:InitBorders()
     end
 
     local ev = CreateFrame("Frame")
-    ev:RegisterEvent("PLAYER_EQUIPMENT_CHANGED")
-    ev:RegisterEvent("PLAYER_ENTERING_WORLD")
-    ev:SetScript("OnEvent", function() Addon:UpdateSlotBorders() end)
+    for _, e in ipairs(Addon.BORDER_EVENTS) do pcall(ev.RegisterEvent, ev, e) end
+    ev:SetScript("OnEvent", function(_, event, arg1)
+        -- ARM-6's lesson (slotpopout.lua): arg1 is a SLOT NUMBER on
+        -- PLAYER_EQUIPMENT_CHANGED and a BOOLEAN on PLAYER_ENTERING_WORLD, so a
+        -- "player"-only unit filter applied to all three registers the events and
+        -- then drops two of them. It is applied to the ONE unit-scoped event.
+        if event == "UNIT_INVENTORY_CHANGED" and arg1 ~= nil and arg1 ~= "player" then return end
+        Addon:UpdateSlotBorders()
+    end)
     Addon._bordersEv = ev
+
+    -- CLASS 2 — watch the OBJECT, not only the event. This is the trigger the
+    -- replaced reference had and we did not: its equipped borders refresh because
+    -- the SHEET OPENED. paperdoll.lua already hooks this same frame's OnShow for the
+    -- char-pane button, so the hook is the established shape here. It is idempotent:
+    -- a repaint of an already-correct set of slots writes the same colours back.
+    if _G.CharacterFrame and _G.CharacterFrame.HookScript then
+        _G.CharacterFrame:HookScript("OnShow", function() Addon:UpdateSlotBorders() end)
+    end
 
     Addon:UpdateSlotBorders()
 end
