@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### Fixed
+
+- **The quality colours on your equipped slots no longer wait for you to change
+  a piece of gear.** They were only ever painted when something *happened* — you
+  logged in, you zoned, you swapped an item — and the login paint ran early
+  enough that the game often could not yet say what any of your gear was. The
+  game answers "I don't know" the same way it answers "that slot is empty", so
+  Armory took it at its word and left every slot bare, with nothing left that
+  could change its mind. The first item you swapped repainted the lot from a
+  by-then-loaded cache, and the colours appeared. Now Armory notices which slots
+  the game could not describe yet, asks it for them, and colours each one the
+  moment the answer arrives — no gear change, no reload, and no timer ticking
+  away in the background. Once every slot has been answered for it stops
+  listening entirely, so a character whose gear is already loaded costs nothing.
+- **Opening the character sheet repaints it.** The colours are now refreshed
+  whenever the sheet opens, not only when something changes, so anything that
+  went stale while the window was shut is right by the time you see it.
+
 ### Added
 
 - **The set swapper can live on the Daseeki Chat window.** Set Swapper's

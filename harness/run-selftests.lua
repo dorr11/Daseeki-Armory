@@ -6512,6 +6512,293 @@ suite("icon-spellbook-latch", coldWorld({ files = { "iconData.lua" } }, function
 end))
 
 ----------------------------------------------------------------------
+-- ARM-B — THE EQUIPPED BORDERS THAT ONLY PAINTED ON A CHANGE (owner, 2026-08-28)
+--
+-- "item frame coloring not working until i change a piece of armor (seems only
+--  fires on update of state?)" — with a screenshot of an open character frame and
+-- not one coloured slot.
+--
+-- THE TRIGGER INVENTORY AS SHIPPED IN 1.3.3, complete:
+--   * InitBorders' own trailing UpdateSlotBorders, on the PLAYER_LOGIN leg
+--   * PLAYER_ENTERING_WORLD  -> UpdateSlotBorders
+--   * PLAYER_EQUIPMENT_CHANGED -> UpdateSlotBorders
+--   * equip.lua:1018 (after an equip pass) and options.lua (the toggle)
+-- Every one of them is a MUTATION. Nothing painted because the sheet was being
+-- LOOKED AT, and — the half with teeth — nothing repainted when the client finally
+-- learned what the player was wearing.
+--
+-- THE COLD READ IS THE DEFECT (Class 4). Both login paints run while the item
+-- cache can still be empty, and GetInventoryItemQuality resolves through that same
+-- cache: the LINK is in the slot, the quality is not there yet, and the call
+-- answers nil. nil is indistinguishable from "empty slot" to the shipped painter,
+-- so it hid the halo — and then held no trigger that could ever bring it back. The
+-- session's first PLAYER_EQUIPMENT_CHANGED repainted from a by-then-warm cache and
+-- the borders appeared. "Only fires on update of state", exactly.
+--
+-- THE SECOND HOLE is the trigger the replaced reference HAD and we did not:
+-- CII_BEHAVIOR_SPEC §4.1 drives the character sheet from a post-hook on
+-- ToggleCharacter — its equipped borders refresh BECAUSE THE SHEET OPENED.
+--
+-- borders.lua is driven FOR REAL here: loaded over the cold world, InitBorders run
+-- against real `Character<slot>Slot` button globals, events delivered to the
+-- handlers it actually installed, and the glow textures read back by colour.
+----------------------------------------------------------------------
+suite("border-cold-paint", coldWorld({ files = { "borders.lua" } }, function(ck, w, A)
+    ---------------------------------------------------------------- the rig
+    -- The slot model core.lua owns (the cold world loads neither core.lua nor the
+    -- toggle it defaults). Four slots: three worn at three different qualities,
+    -- one left EMPTY as the provably-empty control.
+    A.SLOTS = {
+        { id = 1,  name = "Head",      slotName = "HeadSlot" },
+        { id = 5,  name = "Chest",     slotName = "ChestSlot" },
+        { id = 19, name = "Tabard",    slotName = "TabardSlot" },
+        { id = 16, name = "Main Hand", slotName = "MainHandSlot" },
+    }
+    A.db.settings.charWindow = { qualityBorders = true }
+
+    local HELM  = w:defineItem(7001, { name = "Cold Helm",  equipLoc = "INVTYPE_HEAD",   quality = 4 })
+    local CHEST = w:defineItem(7002, { name = "Cold Chest", equipLoc = "INVTYPE_CHEST",  quality = 2 })
+    local MH    = w:defineItem(7003, { name = "Cold Sword", equipLoc = "INVTYPE_WEAPON", quality = 0 })
+    w:equip(1, HELM); w:equip(5, CHEST); w:equip(16, MH)   -- slot 19 stays empty
+
+    w:buildPaperDoll(A.SLOTS)
+    local B = A.Borders
+    ck(type(B) == "table", "borders.lua published its pure layer over the cold world")
+
+    -- Read a slot's halo the way the screen does: is it up, and what colour is it.
+    local function halo(slotId)
+        local f = A._slotGlows and A._slotGlows[slotId]
+        if not f then return nil end
+        return f:IsShown(), f._glow
+    end
+    local function tint(slotId)
+        local shown, g = halo(slotId)
+        if not (shown and g) then return nil end
+        return g:GetVertexColor()
+    end
+
+    -- ── (a) THE TRIGGER SET, AS DATA ───────────────────────────────────────
+    local EV, WARM = A.BORDER_EVENTS, A.BORDER_WARM_EVENTS
+    ck(type(EV) == "table", "(a) the paint trigger set is declared as data")
+    ck(type(WARM) == "table", "(a) …and so is the delivery set it repairs cold reads from")
+    local have = {}
+    for _, e in ipairs(EV or {}) do have[e] = true end
+    for _, e in ipairs(WARM or {}) do have[e] = true end
+    ck(have.PLAYER_EQUIPMENT_CHANGED == true, "(a) PLAYER_EQUIPMENT_CHANGED is still in the set")
+    ck(have.PLAYER_ENTERING_WORLD == true,    "(a) PLAYER_ENTERING_WORLD is still in the set")
+    ck(have.UNIT_INVENTORY_CHANGED == true,
+       "(a) UNIT_INVENTORY_CHANGED joins it — the reference's own character-sheet event")
+    ck(have.GET_ITEM_INFO_RECEIVED == true,
+       "(a) ARM-B: GET_ITEM_INFO_RECEIVED is subscribable — the cold login can be repaired")
+    ck(have.ITEM_DATA_LOAD_RESULT == true, "(a) …and its sibling delivery event with it")
+
+    -- THE 1.3.3 SET, VERBATIM, AS THE RED CONTROL. Not one entry is a delivery
+    -- event, which is why a cold login could never heal.
+    local SHIPPED_133 = { "PLAYER_EQUIPMENT_CHANGED", "PLAYER_ENTERING_WORLD" }
+    local shipped = {}
+    for _, e in ipairs(SHIPPED_133) do shipped[e] = true end
+    ck(shipped.GET_ITEM_INFO_RECEIVED == nil and shipped.ITEM_DATA_LOAD_RESULT == nil,
+       "(a) RED: the 1.3.3 set holds NO delivery event — nothing could repaint a cold read")
+    ck(shipped.UNIT_INVENTORY_CHANGED == nil, "(a) RED: …and no sheet event either")
+
+    -- ── (b0) THE WARM LOGIN, AS THE CONTROL ────────────────────────────────
+    -- Where the client CAN answer at login the borders were always right — which
+    -- is exactly why the owner saw them appear the moment he changed a piece.
+    -- Pinned so the repair can never become "paint late" instead of "paint now,
+    -- and repair what could not be painted".
+    do
+        w:warmItem(HELM, true); w:warmItem(CHEST, true); w:warmItem(MH, true)  -- silent: no events
+        local W = { SLOTS = A.SLOTS,
+                    db = { settings = { charWindow = { qualityBorders = true } } } }
+        local wfn = loadfile(P("borders.lua"))
+        ck(wfn ~= nil and pcall(wfn, "Daseeki-Armory", W) == true, "(b0) a warm-login instance loads")
+        W:InitBorders()
+        ck(W._slotGlows[1]:IsShown() == true,
+           "(b0) a login the client CAN answer paints before any equipment change")
+        local wr = W._slotGlows[1]._glow:GetVertexColor()
+        local wer = B.QualityRGB(4)
+        ck(wr ~= nil and near(wr, wer), "(b0) …in the right colour, straight away")
+        ck(W._borderMissing == 0, "(b0) …with nothing unresolved")
+        ck(W._borderWatching ~= true, "(b0) …so a warm client subscribes to nothing and pays nothing")
+        w.warm[HELM], w.warm[CHEST], w.warm[MH] = nil, nil, nil   -- back to cold for (b)
+    end
+
+    -- ── (b) THE COLD LOGIN — THE OWNER'S SCREENSHOT ────────────────────────
+    -- Nothing has been delivered. The client knows what is in every slot and can
+    -- describe none of it.
+    ck(GetInventoryItemLink("player", 1) ~= nil, "(b) the client HAS a link for the head slot")
+    ck(GetInventoryItemQuality("player", 1) == nil,
+       "(b) RED: …and the ONE call 1.3.3 painted from answers nil for it")
+    ck(B.ShouldShow(nil, true, B.EQUIPPED_MIN_QUALITY) == false,
+       "(b) RED: …so the shipped painter hid the halo, as if the slot were empty")
+
+    A:InitBorders()
+    ck(type(A._slotGlows) == "table", "(b) InitBorders built a halo per paper-doll button")
+    ck(A._slotGlows[1] ~= nil and A._slotGlows[16] ~= nil, "(b) …including the weapon slots")
+    ck(select(1, halo(1)) == false, "(b) THE DEFECT REPRODUCED: the head slot is unpainted at login")
+    ck(select(1, halo(5)) == false, "(b) …and the chest slot")
+
+    -- THE FIX'S FIRST HALF: the unpaintable slots are COUNTED, not forgotten, and
+    -- an empty slot is not one of them.
+    ck(A._borderMissing == 3,
+       "(b) three worn-but-undescribable slots are counted (" .. tostring(A._borderMissing) .. ")")
+    ck(select(2, A:SlotQualityFor(19)) == nil,
+       "(b) …while the EMPTY tabard slot is provably empty, not unresolved")
+    ck(w:isRegistered("GET_ITEM_INFO_RECEIVED") == true,
+       "(b) …and a delivery watcher is up while the count is > 0")
+    ck(w:loadsFor(HELM) >= 1, "(b) …after asking the client for what it could not describe")
+    ck(w:loadsFor(CHEST) >= 1 and w:loadsFor(MH) >= 1, "(b) …for every cold slot, not just the first")
+
+    -- ── (c) THE DELIVERY — THE BORDERS APPEAR WITH NO GEAR CHANGE ──────────
+    -- Nothing re-fires in game: no equipment changed, no zone changed, the sheet
+    -- was already open. The delivery event is the ONLY thing that happens.
+    w:warmItem(HELM)
+    local r, g, b, a = tint(1)
+    local er, eg, eb = B.QualityRGB(4)
+    ck(r ~= nil, "(c) THE FIX: the head slot paints on GET_ITEM_INFO_RECEIVED alone")
+    ck(near(r, er) and near(g, eg) and near(b, eb), "(c) …in the item's own epic purple")
+    ck(near(a, B.GLOW_ALPHA), "(c) …at the shipped glow alpha, unchanged")
+    ck(A._borderMissing == 2, "(c) two slots remain unresolved, so the watch stays up")
+    ck(w:isRegistered("GET_ITEM_INFO_RECEIVED") == true, "(c) …and it does")
+    ck(select(1, halo(5)) == false, "(c) …with the still-cold chest slot honestly unpainted")
+
+    w:warmItem(CHEST)
+    local cr = tint(5)
+    local cer = B.QualityRGB(2)
+    ck(cr ~= nil and near(cr, cer), "(c) the chest slot follows on its own delivery")
+
+    w:warmItem(MH)
+    local mr, mg, mb = tint(16)
+    ck(mr ~= nil, "(c) POOR (quality 0) paints too — the equipped floor is every quality")
+    ck(near(mr, 0.1) and near(mg, 0.1) and near(mb, 0.1), "(c) …in the spec §3 near-black tint")
+    ck(select(2, A:SlotQualityFor(16)) == nil and select(1, A:SlotQualityFor(16)) == 0,
+       "(c) …and quality 0 is read as an ANSWER, never as 'no answer' (Class 5)")
+
+    ck(A._borderMissing == 0, "(c) nothing is unresolved once the client has answered for everything")
+    ck(w:isRegistered("GET_ITEM_INFO_RECEIVED") == false,
+       "(c) …so the watcher unregisters itself — a warm client pays nothing")
+    ck(select(1, halo(19)) == false, "(c) …and the empty tabard slot is still unbordered")
+
+    -- ── (d) THE SHEET OPENING IS A TRIGGER (Class 2) ───────────────────────
+    -- The reference's own path, which we did not carry over. State moves while the
+    -- sheet is hidden and NOTHING announces it; the open must be enough.
+    local LEGEND = w:defineItem(7004, { name = "Cold Blade", equipLoc = "INVTYPE_WEAPON", quality = 5 })
+    w:warmItem(LEGEND, true)                    -- delivered SILENTLY: no event at all
+    w.worn[16] = cold.link(LEGEND)              -- swapped with nothing announcing it
+    local stale = tint(16)
+    ck(stale ~= nil and near(stale, 0.1),
+       "(d) RED: with nothing announced the weapon slot still shows the OLD tint")
+    w:openCharacterFrame()
+    local lr = tint(16)
+    local ler = B.QualityRGB(5)
+    ck(lr ~= nil and near(lr, ler),
+       "(d) THE FIX: opening the character sheet repaints it (legendary orange)")
+
+    -- ── (e) THE EQUIPMENT PATH IS UNCHANGED, AND ARM-6's FILTER LESSON ─────
+    local function repaintsWith(...)
+        A._slotGlows[1]._glow._color = nil
+        local ev = A._bordersEv
+        ev:GetScript("OnEvent")(ev, ...)
+        return A._slotGlows[1]._glow._color ~= nil
+    end
+    ck(repaintsWith("PLAYER_EQUIPMENT_CHANGED", 16) == true,
+       "(e) PLAYER_EQUIPMENT_CHANGED (arg1 = a SLOT NUMBER) still repaints — pinned")
+    ck(repaintsWith("PLAYER_ENTERING_WORLD", true) == true,
+       "(e) PLAYER_ENTERING_WORLD (arg1 = a BOOLEAN) still repaints — pinned")
+    ck(repaintsWith("UNIT_INVENTORY_CHANGED", "player") == true,
+       "(e) UNIT_INVENTORY_CHANGED for the player repaints")
+    ck(repaintsWith("UNIT_INVENTORY_CHANGED", "party1") == false,
+       "(e) …and another unit's inventory does not — the filter is on the unit event ALONE")
+
+    -- ── (f) THE TOGGLE STILL WINS, AND TAKES THE WATCH DOWN WITH IT ────────
+    A.db.settings.charWindow.qualityBorders = false
+    A:UpdateSlotBorders()
+    ck(select(1, halo(1)) == false, "(f) the toggle off hides every halo, as it always did")
+    ck(A._borderMissing == 0 and A._borderWatching == false,
+       "(f) …and a disabled surface subscribes to nothing")
+    A.db.settings.charWindow.qualityBorders = true
+    A:UpdateSlotBorders()
+    ck(select(1, halo(1)) == true, "(f) …and turning it back on repaints immediately")
+
+    -- ── (g) NO POLLING (the owner's constraint, pinned in source) ──────────
+    local src = slurp("borders.lua")
+    ck(src ~= nil, "(g) borders.lua is readable")
+    if src then
+        ck(src:find("C_Timer") == nil, "(g) borders.lua contains no timer at all")
+        ck(src:find("OnUpdate") == nil, "(g) …no OnUpdate")
+        ck(src:find("NewTicker") == nil, "(g) …and no ticker: the repair is the event, not a poll")
+        ck(src:find("HookScript%(\"OnShow\"") ~= nil, "(g) PIN: the sheet's OnShow is hooked")
+        ck(src:find("_borderMissing") ~= nil, "(g) PIN: the unresolved counter exists")
+        ck(src:find("UpdateBorderWarmWatch") ~= nil, "(g) PIN: …with a watcher driven off it")
+        ck(src:find("RequestLoadItemDataByID") ~= nil, "(g) PIN: …and the client is asked")
+        ck(src:find("GetInventoryItemLink") ~= nil,
+           "(g) PIN: the link is consulted, so nil quality is not read as an empty slot")
+    end
+
+    -- ── (h) CLASS 9: THE ANSWER THAT ARRIVES INSIDE THE ASK ────────────────
+    -- The paint's own client call is RequestLoadItemDataByID. A client that holds
+    -- the item answers it from INSIDE the request, running every delivery handler
+    -- in the session — this file's included — before the request returns, while the
+    -- paint that made it is still mid-sweep. A second, cold instance is driven
+    -- against exactly that client.
+    do
+        local C = { SLOTS = A.SLOTS,
+                    db = { settings = { charWindow = { qualityBorders = true } } } }
+        local cfn = loadfile(P("borders.lua"))
+        ck(cfn ~= nil and pcall(cfn, "Daseeki-Armory", C) == true, "(h) a second, cold instance loads")
+
+        -- Cool everything: this login knows nothing again.
+        w.warm[HELM], w.warm[CHEST], w.warm[MH] = nil, nil, nil
+        w.worn[16] = cold.link(MH)
+
+        local realReq = _G.C_Item.RequestLoadItemDataByID
+        _G.C_Item.RequestLoadItemDataByID = function(id)
+            -- THE UNKIND CLIENT: it holds the item after all, and says so from
+            -- inside the ask rather than on a later frame.
+            w.warm[id] = true
+            w.inCall = (w.inCall or 0) + 1
+            local ok, err = pcall(function() w:fireEvent("GET_ITEM_INFO_RECEIVED", id, true) end)
+            w.inCall = w.inCall - 1
+            if not ok then error(err, 0) end
+        end
+
+        -- THE WITNESS. Recorded at the instant the client answers, from inside the
+        -- ask: how many echoes arrived mid-paint, and was the latch up to catch
+        -- each one. Without the latch the handler's `missing > 0` gate is TRUE at
+        -- that moment (the count is published before the request, on purpose), so
+        -- it would re-enter the sweep that is still running.
+        local sawInCall, latchUp, gateOpen = 0, true, false
+        w.onEvent = function(evt, _, _, inCall)
+            if inCall and evt == "GET_ITEM_INFO_RECEIVED" then
+                sawInCall = sawInCall + 1
+                if not C:InBorderPaint() then latchUp = false end
+                if (C._borderMissing or 0) > 0 then gateOpen = true end
+            end
+        end
+
+        C:InitBorders()
+        w.onEvent = nil
+        _G.C_Item.RequestLoadItemDataByID = realReq
+
+        ck(sawInCall >= 1,
+           "(h) the echo really did arrive from INSIDE the paint (" .. sawInCall .. " in-call)")
+        ck(gateOpen == true,
+           "(h) RED: …with the handler's own gate open at that instant — it would have re-entered")
+        ck(latchUp == true, "(h) THE LATCH: …and it was up for every one of them, so it did not")
+        ck(C:InBorderPaint() == false, "(h) …and released on the way out")
+        ck((C._borderPaintRefusals or 0) == 0, "(h) …without the depth fuse ever having to refuse")
+        ck(C._borderMissing == 0, "(h) THE FIX: the in-call answer is not dropped — nothing stays unresolved")
+        ck(C._borderWatching == false, "(h) …and the watch comes down rather than being left armed")
+        local hf = C._slotGlows[1]
+        ck(hf:IsShown() == true, "(h) …with the head slot painted from the echo it folded in")
+        local hr = hf._glow:GetVertexColor()
+        local her = B.QualityRGB(4)
+        ck(hr ~= nil and near(hr, her),
+           "(h) …in the right colour, so the latch did not swallow the work")
+    end
+end))
+
+----------------------------------------------------------------------
 -- THE CHAT DOCK — the set swapper's "Chat" placement (owner, 2026-08-12).
 --
 -- "if the option in armory is 'Chat' for the set swapper i want it to anchor

@@ -23,10 +23,15 @@
 -- The unkind profile here is COLD, and it is the default:
 --
 --   1. ITEM DATA IS ABSENT UNTIL ASKED FOR AND DELIVERED. A cold item's
---      GetItemInfo answers nil, GetItemStats answers nil, and
---      C_Item.IsItemDataCachedByID answers false. The LINK is still there —
---      the client knows what is in the slot, it just cannot tell you about it.
+--      GetItemInfo answers nil, GetItemStats answers nil,
+--      GetInventoryItemQuality answers nil, and C_Item.IsItemDataCachedByID
+--      answers false. The LINK is still there — the client knows what is in the
+--      slot, it just cannot tell you about it.
 --      That asymmetry is the whole Class 4 trap: everything looks readable.
+--      GetInventoryItemQuality is on the COLD side of that line on purpose: it
+--      resolves through the same item cache GetItemInfo does, so a slot with a
+--      link in it still answers nil for its quality until the data lands. That
+--      is the axis the 1.3.4 equipped-border defect lives on (borders.lua).
 --   2. A COLD TOOLTIP RENDERS ITS TITLE AND NOTHING ELSE. NumLines() == 1 and
 --      TextLeft1 carries the item name. This is the proven live shape (Armory's
 --      own classMask-0 incident; Nexus's title-only chronoboon read), and it is
@@ -395,7 +400,8 @@ function Cold.new(P, opts)
         "C_Item", "C_Timer", "C_Container", "CreateFrame", "GetTime", "print",
         "UIParent", "WorldFrame", "DaseekiArmory",
         "GetInventoryItemLink", "GetInventoryItemID", "GetInventoryItemTexture",
-        "GetInventorySlotInfo", "IsInventoryItemLocked",
+        "GetInventoryItemQuality",
+        "GetInventorySlotInfo", "IsInventoryItemLocked", "CharacterFrame",
         "GetItemInfo", "GetItemInfoInstant", "GetItemStats",
         "GetNumTalentTabs", "GetNumTalents", "GetTalentInfo", "GetTalentTabInfo",
         "GetNumSpellTabs", "GetSpellTabInfo", "GetSpellBookItemName",
@@ -441,13 +447,74 @@ function Cold.new(P, opts)
     G.BOOKTYPE_SPELL = "spell"
 
     ------------------------------------------------------------ frames
+    -- A drawn REGION (texture / fontstring). Not registered in w.frames — it has
+    -- no events — but it records everything a paint writes to it, which is how a
+    -- fixture grades a colour rather than a call count.
+    local function newRegion(layer, sublevel)
+        local t = { _layer = layer, _sublevel = sublevel, _shown = true }
+        function t:SetTexture(v)      self._tex = v end
+        function t:GetTexture()       return self._tex end
+        function t:SetBlendMode(v)    self._blend = v end
+        function t:SetVertexColor(r, g, b, a) self._color = { r, g, b, a } end
+        function t:GetVertexColor()
+            local c = self._color
+            if not c then return nil end
+            return c[1], c[2], c[3], c[4]
+        end
+        function t:SetColorTexture(r, g, b, a) self._color = { r, g, b, a } end
+        function t:SetDesaturated(v)  self._desat = v end
+        function t:SetTexCoord()      end
+        function t:SetAllPoints()     end
+        function t:SetSize(a, b)      self._w, self._h = a, b end
+        function t:SetWidth(a)        self._w = a end
+        function t:SetHeight(b)       self._h = b end
+        function t:GetWidth()         return self._w end
+        function t:GetHeight()        return self._h end
+        function t:SetPoint()         end
+        function t:ClearAllPoints()   end
+        function t:SetText(v)         self._text = v end
+        function t:GetText()          return self._text end
+        function t:SetDrawLayer(l, s) self._layer, self._sublevel = l, s end
+        function t:Show() self._shown = true end
+        function t:Hide() self._shown = false end
+        function t:IsShown() return self._shown and true or false end
+        return t
+    end
+
     local function newFrame(name)
-        local f = { _events = {}, _script = nil, _attrs = {}, _name = name }
+        local f = { _events = {}, _script = nil, _attrs = {}, _name = name,
+                    _scripts = {}, _hooks = {}, _kids = {} }
         function f:RegisterEvent(e)   self._events[e] = true end
         function f:UnregisterEvent(e) self._events[e] = nil  end
         function f:UnregisterAllEvents() self._events = {} end
-        function f:SetScript(k, fn)   if k == "OnEvent" then self._script = fn end end
-        function f:HookScript() end
+        -- _script stays the OnEvent slot the dispatcher reads; _scripts carries
+        -- every handler by name, so an OnShow/OnClick can be driven too.
+        function f:SetScript(k, fn)
+            self._scripts[k] = fn
+            if k == "OnEvent" then self._script = fn end
+        end
+        function f:GetScript(k) return self._scripts[k] end
+        function f:HookScript(k, fn)
+            self._hooks[k] = self._hooks[k] or {}
+            self._hooks[k][#self._hooks[k] + 1] = fn
+        end
+        -- Fire a script and every hook posted after it, in order — what the client
+        -- does when the frame is shown, clicked, etc.
+        function f:RunScript(k, ...)
+            local s = self._scripts[k]
+            if s then s(self, ...) end
+            for _, h in ipairs(self._hooks[k] or {}) do h(self, ...) end
+        end
+        function f:CreateTexture(_, layer, _, sublevel)
+            local t = newRegion(layer, sublevel)
+            self._kids[#self._kids + 1] = t
+            return t
+        end
+        function f:CreateFontString(_, layer)
+            local t = newRegion(layer)
+            self._kids[#self._kids + 1] = t
+            return t
+        end
         function f:GetName()          return self._name end
         function f:SetAttribute(k, v) self._attrs[k] = v end
         function f:GetAttribute(k)    return self._attrs[k] end
@@ -455,17 +522,25 @@ function Cold.new(P, opts)
         function f:Show() self._shown = true end
         function f:Hide() self._shown = false end
         function f:IsShown() return self._shown and true or false end
-        function f:SetWidth() end
-        function f:SetHeight() end
-        function f:SetSize() end
+        function f:SetWidth(a)  self._w = a end
+        function f:SetHeight(b) self._h = b end
+        function f:SetSize(a, b) self._w, self._h = a, b end
+        function f:GetWidth()  return self._w end
+        function f:GetHeight() return self._h end
         function f:SetPoint() end
         function f:ClearAllPoints() end
-        function f:SetFrameStrata() end
+        function f:SetParent(p) self._parent = p end
+        function f:GetParent()  return self._parent end
+        function f:SetFrameLevel(l) self._level = l end
+        function f:GetFrameLevel()  return self._level or 1 end
+        function f:SetFrameStrata(s) self._strata = s end
+        function f:GetFrameStrata()  return self._strata or "MEDIUM" end
         function f:EnableMouse() end
         function f:Raise() end
         w.frames[#w.frames + 1] = f
         return f
     end
+    w.newFrame = function(_, name) return newFrame(name) end
 
     ------------------------------------------------------------ the scanning tooltip
     -- A GameTooltip with the readback surface the scraper uses: NumLines() plus
@@ -583,7 +658,8 @@ function Cold.new(P, opts)
         local def = id and w.items[id]
         if not def then return nil end
         if not w.warm[id] then return nil end            -- cold: the name is not here yet
-        return def.name, (type(link) == "number" and Cold.link(link) or link), 3, 66, 60,
+        return def.name, (type(link) == "number" and Cold.link(link) or link),
+               def.quality or 3, 66, 60,
                "Armor", "Misc", 1, def.equipLoc, "Interface\\Icons\\INV_Misc_QuestionMark"
     end
 
@@ -605,8 +681,61 @@ function Cold.new(P, opts)
     G.GetInventoryItemTexture = function(_, slotId)
         return w.worn[slotId] and "Interface\\Icons\\INV_Misc_QuestionMark" or nil
     end
+    -- THE COLD SIDE OF THE LINE. A slot with a link in it still cannot tell you
+    -- its quality until the item data lands: this call resolves through the same
+    -- cache GetItemInfo does. nil here is indistinguishable from "empty slot" to a
+    -- caller that does not also check the link — which is the whole Class 4 trap,
+    -- and is exactly how the equipped borders went unpainted at login before 1.3.4.
+    G.GetInventoryItemQuality = function(_, slotId)
+        local id = idFromLink(w.worn[slotId])
+        local def = id and w.items[id]
+        if not def then return nil end                   -- empty slot (or unknown item)
+        if not w.warm[id] then return nil end            -- cold: the quality is not here yet
+        return def.quality or 3
+    end
     G.GetInventorySlotInfo    = function(nm) return 1, "Interface\\PaperDoll\\" .. tostring(nm) end
     G.IsInventoryItemLocked   = function() return false end
+
+    -- ── THE PAPER DOLL ────────────────────────────────────────────────────────
+    -- Blizzard's own equipment buttons, under the global names the addon looks
+    -- them up by (`Character<slotName>`), plus the CharacterFrame that owns them.
+    -- Sized 37 because that is the template size the glow geometry is a ratio of.
+    -- Every global created here records what it displaced, so teardown restores it.
+    function w:buildPaperDoll(slots, buttonSize)
+        local made = {}
+        local function claim(name, value)
+            if extraGlobals[name] == nil then extraGlobals[name] = { value = G[name] } end
+            G[name] = value
+            return value
+        end
+        local cf = newFrame("CharacterFrame")
+        cf:SetFrameLevel(1)
+        cf._shown = false
+        claim("CharacterFrame", cf)
+        self.characterFrame = cf
+        for _, s in ipairs(slots) do
+            if s.slotName then
+                local b = newFrame("Character" .. s.slotName)
+                b:SetSize(buttonSize or 37, buttonSize or 37)
+                b:SetFrameLevel(2)
+                b._shown = true
+                claim("Character" .. s.slotName, b)
+                made[s.id] = b
+            end
+        end
+        self.slotButtons = made
+        -- Open the sheet the way the client does: the frame shows, then OnShow and
+        -- every hook posted onto it run.
+        function self:openCharacterFrame()
+            cf._shown = true
+            cf:RunScript("OnShow")
+        end
+        function self:closeCharacterFrame()
+            cf._shown = false
+            cf:RunScript("OnHide")
+        end
+        return made
+    end
     G.C_Container = {
         GetContainerNumSlots = function() return 0 end,
         GetContainerItemLink = function() return nil end,
